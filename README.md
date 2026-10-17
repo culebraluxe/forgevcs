@@ -4,20 +4,22 @@ Source-control engine for CulebraLuxe, built on [Scion](https://github.com/Carte
 — Carter's source-control engine, vendored read-only as `upstream/`.
 
 **Status:** W0–W3 accepted (upstream baseline, service shell, Postgres port, object storage).
-W4 parts 1–3 delivered (engine wiring, auth seam, business façade) and W5 delivered
-(WorkspaceService over Scion's working copy); residual gaps are recorded in
-`docs/W4-engine-wiring.md` §8.6 and `docs/W5-workspace-service.md` §7. See `docs/` for the
-binding record; `docs/adr/0001-infrastructure-stack.md`, `docs/adr/0002-engine-wiring.md` and
-`docs/adr/0003-workspace-service.md` are the decisions of authority.
+W4 parts 1–3 delivered (engine wiring, auth seam, business façade), W5 delivered
+(WorkspaceService over Scion's working copy) and W6 delivered (Scion/Culebra A/B authorization);
+residual gaps are recorded in `docs/W4-engine-wiring.md` §8.6, `docs/W5-workspace-service.md` §7
+and `docs/W6-authorization-ab.md` §6. See `docs/` for the binding record;
+`docs/adr/0001-infrastructure-stack.md` … `docs/adr/0004-authorization-ab.md` are the decisions
+of authority.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| `crates/forgevcs-service` | The Axum service. `http.rs` serves `/health`, `/ready`, `/version`, the auth seam (`/auth/token`, `/auth/whoami`) and merges Scion's `/healthz`, `/readyz`, `/metrics` unmodified; `facade.rs` serves `/repos/{repo}/init`, `/push`, `/pull`, `/refs`, `/commits`, `/changesets/{id}`, `/file`, `/tree`, `/diff`, `/merge-base` and the `/workspaces…` routes; `workspace.rs` is the WorkspaceService over `scion-wc`; `engine.rs` boots the Scion `ServerApp` on Neon (metadata + objects), its private Unix-socket gRPC surface, and publishes a readiness snapshot |
+| `crates/forgevcs-service` | The Axum service. `http.rs` serves `/health`, `/ready`, `/version`, the auth seam (`/auth/token`, `/auth/whoami`) and merges Scion's `/healthz`, `/readyz`, `/metrics` unmodified; `facade.rs` serves `/repos/{repo}/init`, `/push`, `/pull`, `/refs`, `/commits`, `/changesets/{id}`, `/file`, `/tree`, `/diff`, `/merge-base` and the `/workspaces…` routes; `workspace.rs` is the WorkspaceService over `scion-wc`; `authz.rs` is the Scion/Culebra A/B gate; `engine.rs` boots the Scion `ServerApp` on Neon (metadata + objects), its private Unix-socket gRPC surface, and publishes a readiness snapshot |
 | `acl.toml` | The policy file the engine loads (deny-by-default; agents only — ADR-0002 D4) |
 | `upstream/` | Vendored Scion at `e0ffadf9`. A **separate cargo workspace** (`exclude = ["upstream"]` at the root) with its own gate. Read-only: adapt at the edges, do not rewrite |
-| `docs/` | `adr/0001-infrastructure-stack.md`, `adr/0002-engine-wiring.md`, `adr/0003-workspace-service.md`, `BASELINE.md` (W0), `W1-service-shell.md`, `W2-postgres-port.md`, `W3-object-storage.md`, `W4-engine-wiring.md`, `W5-workspace-service.md` |
+| `docs/` | `adr/0001-infrastructure-stack.md` … `adr/0004-authorization-ab.md`, `BASELINE.md` (W0), `W1-service-shell.md`, `W2-postgres-port.md`, `W3-object-storage.md`, `W4-engine-wiring.md`, `W5-workspace-service.md`, `W6-authorization-ab.md` |
+| `migrations/` | ForgeVCS-owned tables; `0001_forgevcs_auth_decisions.sql` is the W6 A/B decision log |
 | `Dockerfile.vercel` | The deploy artefact: release build, non-root uid 10001, listens on `$PORT` |
 
 ## Upstream provenance and licence
@@ -126,6 +128,18 @@ Workspace IDs live only in the process that created them; a restart answers 404 
 creates another from a ref or changeset. `scripts/w5-acceptance.py` proves the work order's
 disposal property: destroy the workspace, recreate it, and the submitted file is still there.
 
+**Authorization A/B.** Every business request runs `AuthorizationService` after the token is
+verified. `FORGEVCS_AUTH_MODE` selects `SCION_ONLY` (default), `SHADOW_COMPARE`, `DUAL_ENFORCE`
+or `CULEBRA_ONLY` (accepted, not served). Shadow records the Culebra decision and keeps Scion's;
+dual requires both. Culebra is read from the existing `auth_identity → app_user → … → authority`
+tables on the same Neon database, and each evaluated request is appended to
+`forgevcs_auth_decisions`. See `docs/W6-authorization-ab.md`.
+
+```sh
+FORGEVCS_AUTH_MODE=SHADOW_COMPARE scripts/w6-authz-smoke.sh
+# shadow refs 200, dual refs 403, two persisted decision rows, invalid mode /ready 503
+```
+
 ## Build and test
 
 ```sh
@@ -139,6 +153,7 @@ scripts/engine-smoke.sh                 # boot against the live Neon branch and 
 python3 scripts/w4-acceptance.py --base http://127.0.0.1:3000 --token "$TOKEN" --repo forgevcs-smoke
 python3 scripts/w5-acceptance.py --base http://127.0.0.1:3000 --token "$TOKEN" --repo forgevcs-workspaces
                                         # the same clients against any deployment (W8)
+scripts/w6-authz-smoke.sh               # shadow 200 / dual 403 / persisted decisions
 
 scripts/gate.sh                         # the vendored upstream gate (T-core) — must exit 0
                                         # detached, one log per run:
@@ -176,6 +191,7 @@ back to the Neon-injected equivalents:
 | --- | --- | --- |
 | `FORGEVCS_DATABASE_URL` | `DATABASE_URL` | Must be `postgres://` |
 | `FORGEVCS_BUCKET` | `FORGEVCS_S3_BUCKET` | Bucket is **branch-scoped** on Neon |
+| `FORGEVCS_AUTH_MODE` | — | `SCION_ONLY` (default), `SHADOW_COMPARE`, `DUAL_ENFORCE` or `CULEBRA_ONLY` |
 | `FORGEVCS_AWS_REGION` | `AWS_REGION` | Object Storage supports four AWS regions |
 | `FORGEVCS_AWS_ENDPOINT_URL_S3` | `AWS_ENDPOINT_URL_S3` | Rejected if orphaned without a bucket |
 | `PORT` | — | Default `3000`; Vercel injects it |

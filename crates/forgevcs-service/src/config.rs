@@ -60,6 +60,8 @@ pub struct Config {
     /// (`$FORGEVCS_SERVICE_PRINCIPALS`). These are the agent identities — Maestro, OpenCode,
     /// importers — that policy refers to as `service:<name>`.
     pub service_principals: Option<String>,
+    /// Authorization A/B mode (`$FORGEVCS_AUTH_MODE`; `SCION_ONLY` by default).
+    pub auth_mode: Option<String>,
 }
 
 impl Config {
@@ -90,6 +92,7 @@ impl Config {
             signing_key: get(&["FORGEVCS_SIGNING_KEY_PATH"]).map(PathBuf::from),
             github_client_id: get(&["FORGEVCS_GITHUB_CLIENT_ID"]),
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
+            auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
         }
     }
 
@@ -132,6 +135,17 @@ impl Config {
             return Err("object-storage credentials are half-configured: set both \
                  FORGEVCS_AWS_ACCESS_KEY_ID and FORGEVCS_AWS_SECRET_ACCESS_KEY"
                 .to_owned());
+        }
+        if let Some(mode) = &self.auth_mode
+            && !matches!(
+                mode.as_str(),
+                "SCION_ONLY" | "SHADOW_COMPARE" | "DUAL_ENFORCE" | "CULEBRA_ONLY"
+            )
+        {
+            return Err(format!(
+                "FORGEVCS_AUTH_MODE must be SCION_ONLY, SHADOW_COMPARE, DUAL_ENFORCE or \
+                 CULEBRA_ONLY, got {mode:?}"
+            ));
         }
         Ok(())
     }
@@ -280,6 +294,26 @@ mod tests {
             ("AWS_ENDPOINT_URL_S3", "https://s3.example"),
         ]);
         assert_eq!(cfg.s3_config().expect("configured").key_prefix, "");
+    }
+
+    #[test]
+    fn auth_mode_accepts_only_the_four_modes() {
+        let unset = config(&[]);
+        assert!(unset.auth_mode.is_none());
+
+        for mode in [
+            "SCION_ONLY",
+            "SHADOW_COMPARE",
+            "DUAL_ENFORCE",
+            "CULEBRA_ONLY",
+        ] {
+            let cfg = config(&[("FORGEVCS_AUTH_MODE", mode)]);
+            assert_eq!(cfg.validate(), Ok(()), "{mode}");
+            assert_eq!(cfg.auth_mode.as_deref(), Some(mode));
+        }
+
+        let cfg = config(&[("FORGEVCS_AUTH_MODE", "SCION_AND_CULEBRA")]);
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

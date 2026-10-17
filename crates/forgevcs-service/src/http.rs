@@ -19,6 +19,7 @@ use scion_server::{handlers, interceptor};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::authz::AuthorizationService;
 use crate::config::{self, Config};
 use crate::engine::{Engine, Engines};
 use crate::facade;
@@ -37,6 +38,8 @@ pub struct AppState {
     pub repo: String,
     /// The process configuration, so `POST /repos/{repo}/init` can boot another engine.
     pub config: Config,
+    /// The Scion/Culebra authorization A/B harness (W6).
+    pub authz: Arc<AuthorizationService>,
 }
 
 impl AppState {
@@ -335,6 +338,7 @@ mod tests {
             ready: Arc::new(StubReadiness),
             engines,
             repo: config.repo().to_owned(),
+            authz: Arc::new(AuthorizationService::from_config(&config).await),
             config,
         }))
     }
@@ -426,6 +430,7 @@ mod tests {
             ready,
             engines,
             repo: config.repo().to_owned(),
+            authz: Arc::new(AuthorizationService::from_config(&config).await),
             config,
         }));
         let (status, _, body) = send(

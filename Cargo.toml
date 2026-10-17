@@ -50,6 +50,9 @@ hex = "=0.4.3"
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 tempfile = "=3.27.0"
 uuid = { version = "=1.28.0", features = ["v4"] }
+deadpool-postgres = "=0.14.2"
+tokio-postgres = "=0.7.18"
+tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring"] }
 anyhow = "=1.0.104"
 tracing = "=0.1.44"
 

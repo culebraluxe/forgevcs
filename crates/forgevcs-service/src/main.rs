@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use scion_obs::{LogFormat, init_logging};
 
+use forgevcs_service::authz::AuthorizationService;
 use forgevcs_service::config::{self, Config};
 use forgevcs_service::engine::{EngineHealth, Engines};
 use forgevcs_service::http::{AppState, SERVICE, router};
@@ -29,6 +30,7 @@ async fn main() -> anyhow::Result<()> {
     // process stays up (ADR-0002 D5) but never claims to be ready without Neon.
     let engines = Arc::new(Engines::boot(&config).await);
     let ready = EngineHealth::start(config.clone(), Arc::clone(&engines)).await;
+    let authz = Arc::new(AuthorizationService::from_config(&config).await);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(
@@ -45,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
         engines,
         repo,
         config,
+        authz,
     });
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown())

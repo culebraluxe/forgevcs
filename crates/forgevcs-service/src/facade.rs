@@ -48,6 +48,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tonic::Status;
 
+use crate::authz::Action;
+
 use crate::engine::Engine;
 use crate::http::{
     AppState, SERVICE, authenticate, caller_request, error_response, status_response,
@@ -175,6 +177,30 @@ fn parse_change_id(raw: &str) -> Result<Vec<u8>, String> {
 /// Authorization is `write` on `/` under the current policy. There is no dedicated
 /// `admin.repos` permission yet (ADR-0002 D6), and the check runs on the verifier engine's
 /// policy because the target engine does not exist until after it.
+/// Run the Scion/Culebra A/B decision for one request (W6). Scion is authoritative in the
+/// default mode; see `authz.rs` for the combination rules.
+async fn authorize(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    action: Action,
+    path: Option<&str>,
+    ref_name: Option<&str>,
+) -> Result<(), Response> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    match state
+        .authz
+        .authorize(&policy, &caller.principal, repo, action, path, ref_name)
+        .await
+    {
+        Ok(decision) if decision.allow => Ok(()),
+        Ok(decision) => Err(status_response(Status::permission_denied(decision.reason))),
+        Err(status) => Err(status_response(status)),
+    }
+}
+
 pub(crate) async fn init(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
@@ -192,6 +218,19 @@ pub(crate) async fn init(
         Ok(value) => value,
         Err(response) => return response,
     };
+    if let Err(response) = authorize(
+        &state,
+        &auth_engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = auth_engine.context();
     if !app
         .policy
@@ -297,6 +336,19 @@ pub(crate) async fn refs(
         Ok(engine) => engine,
         Err(response) => return response,
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     match list_refs(&engine, &caller).await {
         Ok(refs) => (
             StatusCode::OK,
@@ -474,6 +526,19 @@ pub(crate) async fn commits(
         Ok(query) => query,
         Err(rejection) => return bad_query(rejection),
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some(query.path.as_deref().unwrap_or("/")),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     match resolve_and_log(
         &engine,
         &caller,
@@ -631,6 +696,19 @@ pub(crate) async fn pull(
         Ok(body) => body,
         Err(rejection) => return bad_json(rejection),
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some(body.path.as_deref().unwrap_or("/")),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let history = resolve_and_log(
         &engine,
         &caller,
@@ -769,6 +847,19 @@ pub(crate) async fn changeset(
             return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
         }
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let response = match handlers::query::get_changesets(
         &app,
@@ -846,6 +937,19 @@ pub(crate) async fn file(
         }
     };
     let path = query.path;
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some(&path),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let mut stream = match handlers::query::read_path(
         &app,
@@ -917,6 +1021,23 @@ pub(crate) async fn tree(
         Ok(query) => query,
         Err(rejection) => return bad_query(rejection),
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some(if query.path.is_empty() {
+            "/"
+        } else {
+            query.path.as_str()
+        }),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let changeset = match parse_id(&query.changeset, "changeset") {
         Ok(id) => id,
         Err(message) => {
@@ -1023,6 +1144,19 @@ pub(crate) async fn diff(
         .filter(|path| !path.is_empty())
         .map(|path| path.as_bytes().to_vec())
         .collect();
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let mut stream = match handlers::query::diff(
         &app,
@@ -1099,6 +1233,19 @@ pub(crate) async fn merge_base(
             return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
         }
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let response = match handlers::query::merge_base(
         &app,
@@ -1450,6 +1597,20 @@ pub(crate) async fn push(
         allow_empty,
     } = body;
 
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some("/"),
+        Some(&ref_name),
+    )
+    .await
+    {
+        return response;
+    }
+
     let mut uploads = Vec::with_capacity(objects.len());
     for object in objects {
         match object.into_proto() {
@@ -1692,6 +1853,19 @@ pub(crate) async fn workspace_create(
     if let Err(response) = require_root_read(&engine, &caller) {
         return response;
     }
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return bad_json(rejection),
@@ -1737,6 +1911,19 @@ pub(crate) async fn workspace_status(
     if let Err(response) = require_root_read(&engine, &caller) {
         return response;
     }
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let policy = app.policy.current();
     let result = engine
@@ -1762,6 +1949,19 @@ pub(crate) async fn workspace_materialize(
         Err(response) => return response,
     };
     if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
         return response;
     }
     let Json(body) = match body {
@@ -1795,6 +1995,19 @@ pub(crate) async fn workspace_read_file(
         Ok(query) => query,
         Err(rejection) => return bad_query(rejection),
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some(&query.path),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let policy = app.policy.current();
     let result = engine
@@ -1838,6 +2051,19 @@ pub(crate) async fn workspace_write_file(
             );
         }
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some(&query.path),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let policy = app.policy.current();
     let result = engine
@@ -1873,6 +2099,19 @@ pub(crate) async fn workspace_delete_file(
         Ok(query) => query,
         Err(rejection) => return bad_query(rejection),
     };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some(&query.path),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let policy = app.policy.current();
     let result = engine
@@ -1902,6 +2141,19 @@ pub(crate) async fn workspace_diff(
         Err(rejection) => return bad_query(rejection),
     };
     if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
         return response;
     }
     let app = engine.context();
@@ -1954,6 +2206,19 @@ pub(crate) async fn workspace_submit(
         .author
         .as_deref()
         .unwrap_or("ForgeVCS workspace <workspace@example.test>");
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some("/"),
+        Some(ref_name),
+    )
+    .await
+    {
+        return response;
+    }
     let app = engine.context();
     let policy = app.policy.current();
     let result = engine
@@ -1988,6 +2253,19 @@ pub(crate) async fn workspace_destroy(
         Err(response) => return response,
     };
     if let Err(response) = require_root_write(&engine, &caller) {
+        return response;
+    }
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Write,
+        Some("/"),
+        None,
+    )
+    .await
+    {
         return response;
     }
     match engine.workspaces().destroy(&id).await {

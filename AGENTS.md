@@ -38,9 +38,13 @@ Unix-socket gRPC surface (ADR-0003); `POST/GET/PUT/DELETE /repos/{repo}/workspac
 create/materialize/status/read/write/delete/diff/submit/destroy. Workspaces are disposable
 temp directories; canonical history stays in Neon. `scripts/w5-acceptance.py` passes 17 checks
 (create → write → diff → submit → destroy → recreate; history survives), the service has 30
-tests, clippy is 0, and the upstream gate is 1343. See `docs/W5-workspace-service.md`. The
-Postgres port does not change the default build: it lives behind `--features postgres`, and the
-object-storage additions are additive.
+tests, clippy is 0, and the upstream gate is 1343. See `docs/W5-workspace-service.md`. **W6 —
+authorization A/B — PASS (2026-10-17)**: every business request evaluates Scion and, in shadow or
+dual mode, the CulebraLuxe auth tables; `forgevcs_auth_decisions` records both results and the
+final decision. `SCION_ONLY` is the default; `SHADOW_COMPARE` allows what Scion allows and records
+mismatches; `DUAL_ENFORCE` requires both. `scripts/w6-authz-smoke.sh` proves 200/403 plus persisted
+rows. See `docs/W6-authorization-ab.md` and ADR-0004. The Postgres port does not change the default
+build: it lives behind `--features postgres`, and the object-storage additions are additive.
 
 **Find out where things stand with one command, not by reading logs.**
 `scripts/gate-status.sh` prints one JSON line and exits 0 pass / 1 fail / 2 running / 3 never
@@ -73,6 +77,10 @@ Read these before changing anything, in this order:
    [`docs/W5-workspace-service.md`](docs/W5-workspace-service.md) — the WorkspaceService
    decision (internal Unix-socket gRPC, disposable temp-directory workspaces, external policy
    checks) and the 17-check live acceptance.
+8. [`docs/adr/0004-authorization-ab.md`](docs/adr/0004-authorization-ab.md) +
+   [`docs/W6-authorization-ab.md`](docs/W6-authorization-ab.md) — the Scion/Culebra A/B gate,
+   its modes and provisional authority mapping, the persisted decision table, and the live
+   shadow/dual acceptance.
 
 ## Hard rules
 
