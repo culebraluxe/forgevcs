@@ -219,11 +219,23 @@ gate is re-run and recorded here whenever the vendored code changes. The bar doe
 | W0 baseline | `FORGESC-SCION-UPSTREAM-BASELINE` | exit 0 | 1337 | pristine `e0ffadf9`, 195 result lines |
 | W1 service shell | `w1-service-shell` | exit 0 | 1337 | no vendored file touched — the service is its own workspace |
 | W2 Postgres port | `w2-postgres-port` | **exit 0** | **1341** | +4 `dialect` unit tests; the 1337 are unchanged |
+| W3 object storage | `w3-object-storage` | **exit 0** | **1343** | +2 `blob_store_suite_extended` runs (mem, instrumented mem); the 1341 are unchanged |
 
 W2 detail: 1341 passed / 0 failed across all targets, `cargo clippy -- -D warnings` clean,
 `cargo fmt --all --check` clean, `check-layers.sh` passed. The `postgres` feature changes are
 inert in the default build, which is exactly why the count is 1337 + the new dialect tests
 rather than a shifted baseline. Run log: `~/Library/Logs/forgevcs/gate-w2-postgres-port.log`
-(`GATE_EXIT=0`). Re-run with `scripts/gate.sh`, which writes one durable log per run and
-records the commit and dirty-state it ran against.
+(`GATE_EXIT=0`). W3 detail: 1343 passed / 0 failed across all targets, `cargo fmt --all -- --check` clean,
+`cargo build --workspace --all-targets` clean, `check-layers.sh` passed. The vendored delta is
+one new suite entry point (`blob_store_suite_extended`) plus two in-memory runs of it — no
+existing case changed, which is why the count is 1341 + 2 and not a shifted baseline.
+Separately, the blob contract was accepted against the real Neon bucket:
+`neon_blob_conformance` 3/3 in 28.62 s (`docs/W3-object-storage.md` §8). Run log:
+`~/Library/Logs/forgevcs/gate-20261017-041523.log` (`GATE_EXIT=0`, commit `141a7e0`,
+`dirty 0`, target dir `/Users/Shared/dev/build/forgevcs`).
+
+Re-run with `scripts/gate.sh`, which writes one durable log per run and records the commit and
+dirty-state it ran against. **Ask for the verdict with `scripts/gate-status.sh`** — it prints
+one JSON line and exits 0/1/2/3, so nobody has to watch a log, and a session that lost its
+context can recover the state in a single read.
 

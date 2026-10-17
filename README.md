@@ -51,6 +51,12 @@ cargo build --release --locked          # what the container runs
 scripts/gate.sh                         # the vendored upstream gate (T-core) — must exit 0
                                         # detached, one log per run:
                                         #   tail -3 ~/Library/Logs/forgevcs/latest.log
+# Do not tail logs to find out where a run stands — ask, in one read and one exit code:
+scripts/gate-status.sh                  # 0 pass, 1 fail, 2 still running, 3 never run
+# The machine-wide ~/.cargo/config.toml points every checkout at one shared target dir, so
+# concurrent lanes block on its lock ("Blocking waiting for file lock on build directory").
+# Give the gate its own dir and it runs unattended instead; the log records which one.
+CARGO_TARGET_DIR=/Users/Shared/dev/build/forgevcs scripts/gate.sh
 upstream/scripts/check.sh               # the same gate, in the foreground, if you want to watch
 upstream/scripts/check-layers.sh        # module-boundary check
 

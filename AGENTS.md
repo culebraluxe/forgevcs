@@ -18,9 +18,15 @@ that way — they hold live Neon credentials (`neon env pull` writes them, and r
 them on every run).
 
 **Workstream state.** W0 baseline PASS; W1 service shell PASS (tag `w1-service-shell`);
-**W2 Postgres port PASS (2026-10-17)** — `meta_store_suite` 20/20 against Neon, both dialects'
-unit tests 15/15, vendored gate green. See `docs/W2-postgres-port.md`. W3 object storage is
-next; the port lives behind `--features postgres` so the default build stays upstream-identical.
+W2 Postgres port PASS (2026-10-17); **W3 object storage PASS (2026-10-17, tag
+`w3-object-storage`)** — the blob contract green against the real Neon bucket
+(`neon_blob_conformance` 3/3, 28.62 s) and the vendored gate re-run at **1343** passed /
+0 failed. See `docs/W3-object-storage.md`. Neither port changes the default build: Postgres
+lives behind `--features postgres`, and the object-storage additions are additive.
+
+**Find out where things stand with one command, not by reading logs.**
+`scripts/gate-status.sh` prints one JSON line and exits 0 pass / 1 fail / 2 running / 3 never
+run. A session that lost its context starts there.
 
 Read these before changing anything, in this order:
 
@@ -37,8 +43,9 @@ Read these before changing anything, in this order:
    Postgres/Neon: the dialect seam, the acceptance command, and the four findings that only
    running the suite found.
 5. [`docs/W3-object-storage.md`](docs/W3-object-storage.md) — the object-storage work
-   order mapped clause-by-clause onto the vendored source, including what is **already
-   implemented** and must not be rebuilt.
+   order mapped clause-by-clause onto the vendored source (§1 says what is **already
+   implemented** and must not be rebuilt), and §8 what W3 actually added: the extended blob
+   suite, `Config::s3_config()`, and the Neon acceptance run.
 
 ## Hard rules
 
@@ -81,6 +88,14 @@ Gate on **T-core**. Do **not** gate on `check.sh --full`: it is red upstream at 
 baseline SHA on one test at one hardcoded seed (`docs/BASELINE.md`, "T-full result"), so
 T-full's rule is "no *new* failures versus that known set of one".
 
-…plus the relevant Neon conformance run (`meta_store_suite` / `blob_store_suite` via their
-crate test binaries) once a Neon backend exists.
+**Never wait on a log.** `scripts/gate.sh` runs detached and writes one log per run;
+`./scripts/gate-status.sh` answers "pass / fail / running / never run" from that log in one
+read, with an exit code you can trust in a script. That is the whole protocol: start the run,
+do something else, ask once.
+
+…plus the relevant Neon conformance run once a Neon backend exists — both are wired and
+recorded: `meta_store_suite` via `cargo test -p scion-store-crdb --features postgres
+--test neon_conformance`, and `blob_store_suite` / `blob_store_suite_extended` via
+`cargo test -p forgevcs-service --test neon_blob_conformance` (skips and passes when the
+object-storage variables are unset, so it is safe in a plain `cargo test`).
 
