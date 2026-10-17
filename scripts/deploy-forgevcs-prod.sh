@@ -31,8 +31,9 @@ DEPLOY_OUT="$(vc deploy --prod --yes)"
 printf '%s\n' "$DEPLOY_OUT" | tail -8
 
 DEPLOY_URL="$(printf '%s\n' "$DEPLOY_OUT" |
-  sed -n 's/^[[:space:]]*Production[[:space:]]*//p' | tail -1)"
-[[ -n "$DEPLOY_URL" ]] || fail "Deploy did not report a production URL."
+  grep -oE 'https://[^[:space:]]+\.vercel\.app' | head -1)"
+[[ -n "$DEPLOY_URL" ]] || DEPLOY_URL="$URL"
+printf 'Deployment: %s\n' "$DEPLOY_URL"
 
 printf '\nWaiting for the production alias to answer /ready...\n'
 READY=0
