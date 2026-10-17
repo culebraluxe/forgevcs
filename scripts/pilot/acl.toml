@@ -1,0 +1,28 @@
+# ForgeVCS pilot policy — LOCAL multi-agent test only.
+#
+# This is acl.toml with the three throwaway pilot principals added. It is loaded by
+# scripts/agent-pilot.sh through FORGEVCS_POLICY_PATH; it is NOT the policy the service
+# ships with, so the hosted deployment is unchanged.
+#
+# Why a separate file: FORGEVCS_SERVICE_PRINCIPALS configures which identities can mint a
+# token; acl.toml decides what those identities may do. The pilot principals must be named
+# here or every request is PERMISSION_DENIED, which is the deny-by-default contract.
+#
+# Phase 1 keeps the shipped shape on purpose — one `agents` group, read/write on `/`.
+# That makes the pilot's isolation check meaningful: agent-a CAN read agent-b's repository,
+# which records the per-repository ACL gap instead of hiding it.
+
+version = 1
+
+[groups]
+agents = ["service:agent-a", "service:agent-b", "service:agent-c", "service:forgevcs-workspace"]
+
+# The `/` rule is required by the parser and is the fallback for every path.
+[[paths]]
+prefix = "/"
+read = ["group:agents"]
+write = ["group:agents"]
+
+[refs]
+"main" = { update = ["group:agents"] }
+"refs/heads/*" = { update = ["group:agents"] }
