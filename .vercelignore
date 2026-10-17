@@ -1,0 +1,17 @@
+# Vercel CLI upload exclusions for the separate ForgeVCS project.
+#
+# The Docker build needs Cargo.toml, Cargo.lock, rust-toolchain.toml, crates/, upstream/,
+# acl.toml and Dockerfile.vercel. Everything here is local-only: history, build output,
+# credentials, docs and operator scripts. `.dockerignore` separately keeps the same paths
+# out of the container build context.
+.git
+.vercel
+.neon
+target
+upstream/target
+docs
+scripts
+.env
+.env.*
+node_modules
+*.log

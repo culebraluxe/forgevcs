@@ -8,6 +8,14 @@
     }
   },
   "rewrites": [
-    { "source": "/(.*)", "destination": { "service": "forgevcs" } }
-  ]
+    {
+      "source": "/(.*)",
+      "destination": {
+        "service": "forgevcs"
+      }
+    }
+  ],
+  "git": {
+    "deploymentEnabled": false
+  }
 }

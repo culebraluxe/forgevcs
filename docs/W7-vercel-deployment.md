@@ -78,6 +78,8 @@ authoritative copies.
 ## 4. Acceptance
 
 ```sh
+scripts/deploy-forgevcs-prod.sh --smoke
+# or, for a manual inspection:
 vercel deploy --prod --yes
 vercel curl https://culebraluxe-forgevcs.vercel.app/health
 vercel curl https://culebraluxe-forgevcs.vercel.app/ready
@@ -116,7 +118,31 @@ platform "successful" message.
    domains; `vercel curl` and the automation-bypass header reach it. The public custom domain is
    not configured yet.
 
-## 6. Remaining gaps
+## 6. Relationship to the main application release path
+
+CulebraLuxe already has a mature production path in the `lane-deep` tree
+(`docs/agent/DEV-OPS-RELEASE.md`, `scripts/deploy-prod.sh`): one Vercel project
+(`culebraluxe-web-fp`), a local Docker compile (`devops/Dockerfile.build`), a tiny runtime image
+(`devops/Dockerfile.runtime`), `framework=container`, a pinned CLI, then live 200 checks and a
+printed rollback line. ForgeVCS **reuses the conventions, not the project**:
+
+- **Separate project remains required** by ADR-0001 and the work order. A ForgeVCS deploy must not
+  be able to roll back, exhaust build capacity for, or change the environment of
+  `culebraluxe-web-fp`; the website and the source-control engine are different failure domains.
+- **CLI-only deploys.** `vercel.json` sets `"git": {"deploymentEnabled": false}`, like the main app;
+  the release path is a named script, not a push.
+- **Release guard.** `scripts/deploy-forgevcs-prod.sh` enforces clean `main`, a pinned CLI, the
+  named project/team, then waits for `/ready` and checks `/health`, `/ready`, `/version`; `--smoke`
+  runs the W8 acceptance. It prints the rollback path.
+- **Upload hygiene.** `.vercelignore` excludes history, build output, credentials, docs and local
+  scripts from the Vercel upload; `.dockerignore` does the same for the build context.
+- **Current image build is remote.** Vercel builds `Dockerfile.vercel` (about 4–6 minutes). The main
+  app instead compiles locally and ships a runtime-only image. If ForgeVCS build minutes become a
+  constraint, the same `Dockerfile.build → stage → framework=container` pattern can replace the
+  remote build without changing the guard/check script. That is a deliberate later optimization,
+  not a reason to merge projects.
+
+## 7. Remaining gaps
 
 - **Custom domain** `forgesc.culebraluxe.com` (or `forgevcs.culebraluxe.com`) is not attached;
   the generated `culebraluxe-forgevcs.vercel.app` is the current address.
