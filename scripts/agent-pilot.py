@@ -25,8 +25,9 @@ What it proves, in order:
   merge        the merge handler produces a two-parent changeset for the two lane heads
   rebase       a fresh changeset is replayed onto main and then landed
   merge-land   a stale-base changeset merges into the tip and lands as one linear changeset
-  conflicts    explicit Merge and rebase-on-Land both refuse with 409 and a structured report
-               (paths, kinds, entries, hunks); resolution is explicit content plus land
+  conflicts    explicit Merge and rebase-on-Land both refuse with 409 and a structured report;
+               conflict-context returns the three readable sides (base/ours/theirs) in one call
+               and resolution is explicit content plus land
 
 It never invents identities: the principals and secrets come from
 FORGEVCS_SERVICE_PRINCIPALS, which scripts/agent-pilot.sh sets before booting the engine.
@@ -723,6 +724,23 @@ def main() -> int:
         ),
         str(conflicts)[:300],
     )
+    merge_context = lead.call(
+        "POST",
+        f"/repos/{merge_repo}/conflict-context",
+        {"a": side_one, "b": side_two},
+    )
+    merge_side = next(
+        (item for item in merge_context["conflicts"] if item["path"] == "m/conflict.txt"),
+        None,
+    )
+    lead.check(
+        "context(merge): base/ours/theirs are readable in one call",
+        merge_side is not None
+        and merge_side["versions"]["base"]["present"] is False
+        and base64.b64decode(merge_side["versions"]["ours"]["data"]) == CONTENT_A
+        and base64.b64decode(merge_side["versions"]["theirs"]["data"]) == CONTENT_B,
+        str(merge_side)[:300],
+    )
 
     # Conflict site 2: Land's automatic rebase, which is the ordinary push path.
     land_base, _ = main_target(lead, merge_repo)
@@ -769,6 +787,29 @@ def main() -> int:
             for item in late_conflicts
         ),
         str(late_conflicts)[:300],
+    )
+    conflict_tip, _ = main_target(lead, merge_repo)
+    land_context = lead.call(
+        "POST",
+        f"/repos/{merge_repo}/conflict-context",
+        {"changeset": late_side, "onto": conflict_tip},
+    )
+    land_side_context = next(
+        (
+            item
+            for item in land_context["conflicts"]
+            if item["path"] == "m/land-conflict.txt"
+        ),
+        None,
+    )
+    lead.check(
+        "context(land): the rebase sides are base=parent, ours=tip, theirs=head",
+        land_context["orientation"] == "rebase"
+        and land_side_context is not None
+        and land_side_context["versions"]["base"]["present"] is False
+        and base64.b64decode(land_side_context["versions"]["ours"]["data"]) == CONTENT_A
+        and base64.b64decode(land_side_context["versions"]["theirs"]["data"]) == CONTENT_B,
+        str(land_context)[:300],
     )
 
     # Resolution today is explicit content plus land: the server never writes conflict markers.

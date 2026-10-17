@@ -82,26 +82,67 @@ the full report, `ref_version_mismatch`, `already_landed`, limits, subcodes and 
 So the two conflict *sites* are (1) explicit merge and (2) every ordinary push that loses the ref
 race and has to rebase. Site 2 is the one ten agents will hit constantly, and it is now observable.
 
+## 2a. Sequential landing is the model — the advanced pieces are conditional
+
+The intended agent loop is the simple one: **A lands, then B lands, then C lands.** Land already
+implements exactly that. It serializes the ref with a version CAS; a loser rebases its linear
+stack onto the new tip and retries (`land.rs:110`), which is the cherry-pick behaviour this
+workflow needs. Three agents that arrive at once are handled by retry, not by a lock, and the
+pilot measured it (CAS attempts 2 and 3, all `Committed`). No distributed lock, no merge commit
+and no rebase UI is required for the common case.
+
+Consequences for the roadmap — the advanced items are not on the critical path:
+
+- **Two-parent landing** matters only if the team wants merge *commits* (lane topology retained)
+  or lane-to-lane merges. A trunk-linear landing flow never needs it; `merge-land` covers the
+  "integrate this head" case as a squash.
+- **Recursive merge base** matters only once history contains merges: lane-to-lane merges, or
+  imported Git repositories (M1 interop). A workflow that only lands onto the trunk has one best
+  common ancestor by construction and can never criss-cross.
+- **Rename detection** is the one engine gap that does bite the simple model: rebasing an edit
+  onto a lane that renamed the same file is a false `modify_delete` conflict even though the
+  workflow is purely sequential. It is the highest-value engine fix for the simple model.
+
+## 2b. Resolution contract (shipped)
+
+`POST /repos/{repo}/conflict-context` accepts either the merge pair (`{"a","b"}`) or the rebase
+pair (`{"changeset","onto"}`) and returns the complete diff3 bundle:
+
+| Field | Meaning |
+| --- | --- |
+| `orientation` | `merge` or `rebase` |
+| `base`, `ours`, `theirs` | changeset ids: unique merge base / `a` / `b`, or the changeset's parent / `onto` / the changeset |
+| `conflicts[]` | per path: `kind`, `hunks`, the three `entries`, and `versions` — base/ours/theirs bytes, with `{"present": false}` for an absent side |
+| `clean_entries[]` | paths that merged cleanly, already resolved |
+
+Recipe an agent follows: push/land → `409` with `details.report` → `conflict-context` with the
+same arguments → choose bytes for each conflicting path → push the resolved changeset
+(`mode:"land"`) → done. The server never writes markers; `versions` are capped at 1 MiB, and a
+larger side is described by `size` for a `/file` read.
+
 ## 3. What is missing, in dependency order
 
 | # | Gap | Today | Impact at 10 agents × 8 h | Where it lives |
 | --- | --- | --- | --- | --- |
-| 1 | No two-parent landing | `merge-land` squashes the merge result into one linear commit; merge lineage lives only in the returned `merge_changeset` | history cannot show *why* a change landed (merge vs direct); audit and bisect get weaker | upstream `land.rs` / façade policy |
-| 2 | No resolution workflow | conflict report is data; base/ours/theirs must be fetched by hand (`merge-base` + `/file`); resolution = write bytes + land | every agent re-invents the same recipe; one wrong step silently resolves the wrong side | façade + client contract |
-| 3 | Criss-cross histories | `AMBIGUOUS_MERGE_BASE` (SPEC line 1479, future row line 1757) | long-lived agent lanes that merge each other will eventually criss-cross; merges start failing | merge engine version bump |
-| 4 | No rename/copy detection | renames are delete + add; merge treats them as such (SPEC line 1756, future row) | moving a file in one lane while another edits it becomes a false `modify_delete` conflict | derived type + merge engine version bump |
+| 1 | No two-parent landing | `merge-land` squashes the merge result into one linear commit | **conditional**: only if merge-commit topology is wanted; trunk-linear landing never needs it | upstream `land.rs` / façade policy |
+| 2 | Resolution workflow | conflict-context endpoint shipped this commit; the recipe is in §2b | none for the simple model; an agent still chooses the bytes | façade + client contract |
+| 3 | Criss-cross histories | `AMBIGUOUS_MERGE_BASE` (SPEC line 1479, future row line 1757) | **conditional**: only if merges exist (lane-to-lane or imported Git); trunk-linear history cannot criss-cross | merge engine version bump |
+| 4 | No rename/copy detection | renames are delete + add; merge treats them as such (SPEC line 1756, future row) | **bites the simple model**: a rename in one lane plus an edit in another is a false `modify_delete` conflict during land's rebase | derived type + merge engine version bump |
 | 5 | Merge-aware policy | merge needs `write` on every delta path; conflict payload is filtered by `read` (write.rs:69) | a path an agent may write but not read produces a filtered/hidden conflict — the agent cannot see what it must decide | policy model |
 | 6 | No merge observability | no conflict/land metrics, no traces; only logs | cannot answer "how often do agents conflict, on what, and how long does it take" during the migration | server + Vercel |
 | 7 | Large/binary content | `merge_max_text_bytes` turns large text into `binary` conflict; binary = whole-file ours/theirs | agent must resolve whole files by hand | engine limits / UX |
 | 8 | Scale evidence | single-process pilot, 6 repos, seconds | no error-rate/latency data for ten agents | soak + hosted |
+
+Rows 1 and 3 are conditional on the topology decision in §2a; row 4 is the one the simple
+sequential model needs. Row 2 is resolved by this commit.
 
 ## 4. Adapt at the edges, or grow the engine?
 
 The project's hard rule is that `upstream/` is vendored Scion: adapt it at the edges, do not
 rewrite its behaviour, and keep its gate green. That splits the roadmap cleanly:
 
-- **Edge (ForgeVCS, this repo):** merge-land, conflict payload, conflict-context endpoint,
-  retry/idempotency, metrics, resolution contract, soak harness. No upstream change.
+- **Edge (ForgeVCS, this repo):** merge-land, structured conflict payload and conflict-context
+  (shipped), retry/idempotency, metrics, soak harness. No upstream change.
 - **Engine version (Scion semantics):** two-parent landing, recursive merge base, rename
   detection. These change merge semantics and need the SPEC's engine-version mechanism and
   differential tests against the reference model — they belong upstream, vendored as a new
@@ -135,17 +176,17 @@ renames alone remove most agent-move conflicts.
 
 ## 6. Recommended order
 
-1. **Conflict context endpoint + resolution contract** (gap 2, no upstream change): return the
-   conflict report already in the 409, plus the base/ours/theirs changesets so a client can read
-   all three sides; document the resolution recipe (`base = merge-base(a,b)` → read sides →
-   write resolved content → land). This unblocks real agents now.
-2. **Merge-land hardening**: re-merge if the tip moved between resolve and land (retry loop),
-   idempotency via a caller-supplied change id, and a metric per landing.
-3. **Two-parent land** (gap 1) as the first engine-version bump; then `merge-land` can choose
-   merge-commit vs squash explicitly.
-4. **Recursive merge base** (gap 3) — the largest robustness win for ten agents.
-5. **Rename detection** (gap 4), then merge/conflict metrics and the soak run (gaps 6, 8), then
-   per-repository ACL (gap 5) and repository deletion.
+1. **Resolution contract — shipped** (gap 2): `conflict-context` plus the recipe in §2b.
+2. **Rename detection** (gap 4) — the one engine fix the simple sequential model needs; it
+   removes the false `modify_delete` conflicts that rebase-on-land creates after a file move.
+3. **Merge/conflict metrics and the N-agent soak** (gaps 6, 8): run real DeepSeek agents and
+   record conflict rate, land retries, and latency.
+4. **Two-parent land** (gap 1) only if merge-commit topology is wanted; then `merge-land` can
+   choose merge-commit vs squash explicitly.
+5. **Recursive merge base** (gap 3) when lane-to-lane merges or imported Git history exist; then
+   Git mirror/import interop.
+6. **Repository deletion, merge-aware policy, rate limits** (gaps 5 and the M1 P0 list).
 
-The first item is the one that makes the system usable by real agents; the fourth is the one that
-makes it *robust* at the scale that broke git.
+The simple model needs items 1–3. Items 4–5 are real but conditional on the topology decision;
+they are not prerequisites for ten agents landing sequentially, which is the workflow the
+migration starts with.

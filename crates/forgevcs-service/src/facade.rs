@@ -39,9 +39,10 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
 use prost::Message as _;
-use scion_core::ObjectId;
+use scion_core::{ConflictReport, EntryInfo, ErrorPayload, ObjectId};
 use scion_object::{Canonical, RepoPath};
-use scion_proto::{convert, status_from_error, v1};
+use scion_proto::{convert, error_from_status, status_from_error, v1};
+use scion_server::AppContext;
 use scion_server::context::CallerCtx;
 use scion_server::handlers;
 use serde::Deserialize;
@@ -1562,6 +1563,19 @@ pub(crate) struct MergeLandBody {
     change_id: Option<String>,
 }
 
+/// `POST /repos/{repo}/conflict-context` — the three readable sides of a refused merge/rebase.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConflictContextBody {
+    #[serde(default)]
+    a: Option<String>,
+    #[serde(default)]
+    b: Option<String>,
+    #[serde(default)]
+    changeset: Option<String>,
+    #[serde(default)]
+    onto: Option<String>,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -2287,6 +2301,360 @@ pub(crate) async fn merge_land(
                 "version": landed.version,
             },
             "landed": landed_json(&landed.landed),
+        })),
+    )
+        .into_response()
+}
+
+/// Largest version body embedded in a conflict-context response; larger side is described by
+/// `size` and left for a `/file` read.
+const MAX_CONTEXT_BYTES: usize = 1 << 20;
+
+fn entry_info_json(entry: Option<&EntryInfo>) -> Value {
+    match entry {
+        None => Value::Null,
+        Some(entry) => json!({
+            "mode": entry.mode as u8,
+            "id": entry.id.to_text(),
+            "size": entry.size,
+        }),
+    }
+}
+
+fn version_json(data: Option<Vec<u8>>) -> Value {
+    match data {
+        None => json!({ "present": false }),
+        Some(bytes) if bytes.len() > MAX_CONTEXT_BYTES => json!({
+            "present": true,
+            "size": bytes.len(),
+            "truncated": true,
+        }),
+        Some(bytes) => json!({
+            "present": true,
+            "size": bytes.len(),
+            "data": BASE64.encode(&bytes),
+        }),
+    }
+}
+
+/// Read one path at one changeset; `None` when the path is not in that tree.
+async fn read_version(
+    app: &Arc<AppContext>,
+    caller: &CallerCtx,
+    changeset: Option<&ObjectId>,
+    path: &[u8],
+) -> Result<Option<Vec<u8>>, Status> {
+    let Some(changeset) = changeset else {
+        return Ok(None);
+    };
+    let mut stream = match handlers::query::read_path(
+        app,
+        caller_request(
+            v1::ReadPathRequest {
+                changeset: convert::id_bytes(changeset),
+                path: path.to_vec(),
+            },
+            caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) if status.code() == tonic::Code::NotFound => return Ok(None),
+        Err(status) => return Err(status),
+    };
+    let mut data = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        data.extend_from_slice(&chunk.data);
+    }
+    Ok(Some(data))
+}
+
+async fn changeset_parents(
+    app: &Arc<AppContext>,
+    caller: &CallerCtx,
+    id: &ObjectId,
+) -> Result<Vec<ObjectId>, Status> {
+    let response = handlers::query::get_changesets(
+        app,
+        caller_request(
+            v1::GetChangesetsRequest {
+                ids: vec![convert::id_bytes(id)],
+            },
+            caller,
+        ),
+    )
+    .await?
+    .into_inner();
+    let item = response
+        .items
+        .first()
+        .ok_or_else(|| Status::not_found(format!("changeset {id} not found")))?;
+    if item.status != v1::ItemStatus::Ok as i32 {
+        return Err(Status::not_found(format!("changeset {id} not found")));
+    }
+    match &item.view {
+        Some(v1::changeset_item::View::FilteredView(view)) => view
+            .parents
+            .iter()
+            .map(|raw| ObjectId::from_bytes(raw).map_err(|error| status_from_error(&error)))
+            .collect(),
+        Some(v1::changeset_item::View::Encoded(bytes)) => {
+            let changeset =
+                scion_object::Changeset::decode(bytes).map_err(|error| status_from_error(&error))?;
+            Ok(changeset.parents)
+        }
+        None => Err(Status::not_found(format!("changeset {id} has no view"))),
+    }
+}
+
+fn conflict_report_of(status: &Status) -> Option<ConflictReport> {
+    if status.code() != tonic::Code::FailedPrecondition && status.code() != tonic::Code::Aborted {
+        return None;
+    }
+    match error_from_status(status).payload {
+        ErrorPayload::MergeConflict(report) => Some(*report),
+        _ => None,
+    }
+}
+
+fn conflict_hunks_json(conflict: &scion_core::Conflict) -> Value {
+    json!(conflict
+        .hunks
+        .iter()
+        .map(|hunk| json!({
+            "base":   { "start": hunk.base.start,   "end": hunk.base.end },
+            "ours":   { "start": hunk.ours.start,   "end": hunk.ours.end },
+            "theirs": { "start": hunk.theirs.start, "end": hunk.theirs.end },
+        }))
+        .collect::<Vec<_>>())
+}
+
+/// `POST /repos/{repo}/conflict-context` — the three sides of a refused merge or rebase.
+///
+/// A `409 conflict` from `merge`, `merge-land`, `rebase` or a contended `land` carries the
+/// conflict report (path, kind, entries, hunks) but not the bytes. Resolving a conflict needs
+/// the three versions, and the base changeset is not in the report:
+///
+/// - **merge** (`{"a":"…","b":"…"}`): base is the unique merge base, ours is `a`, theirs is `b`;
+/// - **rebase/land** (`{"changeset":"…","onto":"…"}`): base is the changeset's parent, ours is
+///   `onto` (the ref tip), theirs is the changeset being replayed.
+///
+/// This endpoint re-runs the operation to obtain the same deterministic report, then reads each
+/// conflicting path at all three changesets under the caller's read policy. The result is the
+/// complete diff3 bundle an agent needs: `base`, `ours`, `theirs` per conflict (absent sides are
+/// `{"present": false}`), plus the entries and hunks. The server still never writes markers: the
+/// agent chooses bytes and lands them.
+///
+/// A clean run returns `clean: true` and the operation's changeset; that changeset is
+/// unreferenced unless the caller lands it, so a context call is safe to repeat.
+pub(crate) async fn conflict_context(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<ConflictContextBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let app = engine.context();
+
+    let (orientation, base, ours, theirs, report, clean_changeset) =
+        if let (Some(raw_a), Some(raw_b)) = (body.a.as_deref(), body.b.as_deref()) {
+            let a = match parse_id(raw_a, "a") {
+                Ok(id) => id,
+                Err(message) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                }
+            };
+            let b = match parse_id(raw_b, "b") {
+                Ok(id) => id,
+                Err(message) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                }
+            };
+            let bases = match handlers::query::merge_base(
+                &app,
+                caller_request(
+                    v1::MergeBaseRequest {
+                        a: convert::id_bytes(&a),
+                        b: convert::id_bytes(&b),
+                    },
+                    &caller,
+                ),
+            )
+            .await
+            {
+                Ok(response) => response.into_inner().bases,
+                Err(status) => return status_response(status),
+            };
+            let base = match bases.as_slice() {
+                [] => None,
+                [one] => match ObjectId::from_bytes(one) {
+                    Ok(id) => Some(id),
+                    Err(error) => return status_response(status_from_error(&error)),
+                },
+                _ => {
+                    return error_response(
+                        StatusCode::CONFLICT,
+                        "conflict",
+                        "the two changesets have more than one best common ancestor",
+                    );
+                }
+            };
+            let merged = handlers::write::merge(
+                &app,
+                caller_request(
+                    v1::MergeRequest {
+                        a: convert::id_bytes(&a),
+                        b: convert::id_bytes(&b),
+                        meta_fields: Some(merge_land_meta(
+                            "ForgeVCS conflict context <conflict@example.test>",
+                            "conflict context",
+                        )),
+                        change_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+                    },
+                    &caller,
+                ),
+            )
+            .await;
+            match merged {
+                Ok(response) => (
+                    "merge",
+                    base,
+                    a,
+                    b,
+                    None,
+                    Some(id_text(&response.into_inner().changeset_id)),
+                ),
+                Err(status) => match conflict_report_of(&status) {
+                    Some(report) => ("merge", base, a, b, Some(report), None),
+                    None => return status_response(status),
+                },
+            }
+        } else if let (Some(raw_changeset), Some(raw_onto)) =
+            (body.changeset.as_deref(), body.onto.as_deref())
+        {
+            let changeset = match parse_id(raw_changeset, "changeset") {
+                Ok(id) => id,
+                Err(message) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                }
+            };
+            let onto = match parse_id(raw_onto, "onto") {
+                Ok(id) => id,
+                Err(message) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                }
+            };
+            let parents = match changeset_parents(&app, &caller, &changeset).await {
+                Ok(parents) => parents,
+                Err(status) => return status_response(status),
+            };
+            let [parent] = parents.as_slice() else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "rebase context requires a single-parent changeset",
+                );
+            };
+            let rebased = handlers::write::rebase(
+                &app,
+                caller_request(
+                    v1::RebaseRequest {
+                        changeset: convert::id_bytes(&changeset),
+                        onto: convert::id_bytes(&onto),
+                    },
+                    &caller,
+                ),
+            )
+            .await;
+            match rebased {
+                Ok(response) => (
+                    "rebase",
+                    Some(*parent),
+                    onto,
+                    changeset,
+                    None,
+                    Some(id_text(&response.into_inner().changeset_id)),
+                ),
+                Err(status) => match conflict_report_of(&status) {
+                    Some(report) => ("rebase", Some(*parent), onto, changeset, Some(report), None),
+                    None => return status_response(status),
+                },
+            }
+        } else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "provide a+b (merge) or changeset+onto (rebase)",
+            );
+        };
+
+    let mut conflicts = Vec::new();
+    let mut clean_entries = Vec::new();
+    if let Some(report) = &report {
+        for conflict in &report.conflicts {
+            let base_data = match read_version(&app, &caller, base.as_ref(), &conflict.path).await {
+                Ok(data) => data,
+                Err(status) => return status_response(status),
+            };
+            let ours_data = match read_version(&app, &caller, Some(&ours), &conflict.path).await {
+                Ok(data) => data,
+                Err(status) => return status_response(status),
+            };
+            let theirs_data = match read_version(&app, &caller, Some(&theirs), &conflict.path).await {
+                Ok(data) => data,
+                Err(status) => return status_response(status),
+            };
+            conflicts.push(json!({
+                "path": String::from_utf8_lossy(&conflict.path).into_owned(),
+                "kind": conflict.kind.as_str(),
+                "hunks": conflict_hunks_json(conflict),
+                "entries": {
+                    "base": entry_info_json(conflict.base.as_ref()),
+                    "ours": entry_info_json(conflict.ours.as_ref()),
+                    "theirs": entry_info_json(conflict.theirs.as_ref()),
+                },
+                "versions": {
+                    "base": version_json(base_data),
+                    "ours": version_json(ours_data),
+                    "theirs": version_json(theirs_data),
+                },
+            }));
+        }
+        for clean in &report.clean_entries {
+            clean_entries.push(json!({
+                "path": String::from_utf8_lossy(&clean.path).into_owned(),
+                "entry": entry_info_json(clean.entry.as_ref()),
+            }));
+        }
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "service": SERVICE,
+            "status": "ok",
+            "repo": repo,
+            "orientation": orientation,
+            "base": base.map(|id| json!({ "changeset": id.to_text() })).unwrap_or(Value::Null),
+            "ours": { "changeset": ours.to_text() },
+            "theirs": { "changeset": theirs.to_text() },
+            "clean": report.is_none(),
+            "changeset": clean_changeset.map(|id| json!({ "id": id })).unwrap_or(Value::Null),
+            "conflicts": conflicts,
+            "clean_entries": clean_entries,
         })),
     )
         .into_response()

@@ -165,6 +165,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/merge", post(facade::merge))
         .route("/repos/{repo}/land", post(facade::land))
         .route("/repos/{repo}/merge-land", post(facade::merge_land))
+        .route(
+            "/repos/{repo}/conflict-context",
+            post(facade::conflict_context),
+        )
         .route("/repos/{repo}/workspaces", post(facade::workspace_create))
         .route(
             "/repos/{repo}/workspaces/{id}",

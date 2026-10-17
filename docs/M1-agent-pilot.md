@@ -27,7 +27,7 @@ repository deletion endpoint, so see "Cleanup" below.
 The merge path itself is analysed in `docs/M1-merge-analysis.md`: the inherited Scion model,
 the conflict sites the pilot exercises, and the ordered work to grow it.
 
-## Result — 2026-10-17, PASS 38/38
+## Result — 2026-10-17, PASS 40/40
 
 ```text
 identity      each principal mints a token; /auth/whoami names it
@@ -45,8 +45,10 @@ rebase        a fresh changeset was replayed onto main and landed
 merge-land    a stale-base changeset merged into main and landed as one linear changeset
 conflict(m)   explicit Merge over the same added path: 409, details carry path and add_add
 conflict(l)   Land's rebase-on-contention: 409, details carry path and add_add
+context(merge) base/ours/theirs readable in one call for the merge pair
+context(land)  base=parent, ours=tip, theirs=head readable in one call for the rebase pair
 resolution    explicit content + land; the server never writes conflict markers
-OK  38 checks passed across 3 agents and 6 repositories
+OK  40 checks passed across 3 agents and 6 repositories
 ```
 
 The engine log carries the mechanism, not just the verdict. In the shared-repository round the
@@ -73,8 +75,9 @@ recovers by landing on the new tip.
 | `POST /repos/{repo}/merge` | `WriteService.Merge` | Produce a merge changeset from two changesets |
 | `POST /repos/{repo}/land` | `WriteService.Land` | Publish an existing changeset on a ref (linear stack, rebased on contention) |
 | `POST /repos/{repo}/merge-land` | Merge + CreateChangeset + Land | Merge a head into the ref tip and publish the result as one linear changeset (the v1 Land stack is linear, so a two-parent merge head cannot be landed directly) |
+| `POST /repos/{repo}/conflict-context` | Merge/Rebase + `read_path` | The three readable sides of a refused merge or rebase as one diff3 bundle (`versions.base/ours/theirs`, entries, hunks) |
 
-All five go through the vendored handlers with the caller's `CallerCtx`, so policy, conflict
+All six go through the vendored handlers with the caller's `CallerCtx`, so policy, conflict
 payloads and land semantics stay upstream. The façade only adds the JSON shapes. Merge conflicts
 are returned with their `ErrorDetail` payload as `details` (paths, kinds, entries, hunks) instead
 of a bare `{"code":"conflict"}`.
@@ -109,8 +112,9 @@ across agents; the isolation is in history, not directories.
 - Explicit `merge`, `rebase` and `merge-land` endpoints are reachable and return real changesets;
   `merge-land` integrates a stale-base changeset with a merge result.
 - Both conflict sites are observable: explicit `Merge` and Land's automatic rebase return `409`
-  with the structured `details.report` (path, kind, base/ours/theirs entries, hunks). A chosen
-  resolution lands as an ordinary changeset.
+  with the structured `details.report` (path, kind, base/ours/theirs entries, hunks), and
+  `conflict-context` returns the three readable versions in one call. A chosen resolution lands
+  as an ordinary changeset.
 - Retry recovery: the loser can land on the new tip, with no half-applied state.
 
 ## What this does not prove
@@ -162,6 +166,7 @@ fifth run on, `-team` repositories:
 - `agent-pilot-2610171747424fcf` — stopped at a transient `503` during init
 - `agent-pilot-261017174823f50f` — passing 31-check run
 - `agent-pilot-26101719085177b6` — passing 38-check run (`-a`, `-b`, `-c`, `-shared`, `-team`, `-merge`)
+- `agent-pilot-26101719263382f3` — passing 40-check run (adds `conflict-context`)
 
 Repositories are rows in the Scion metadata tables plus object keys in the bucket; deleting one
 means every Scion table row for its `repo_id` plus the object keys (the same reviewed
@@ -169,10 +174,10 @@ destructive path `docs/W4-engine-wiring.md` §8.6 records as absent).
 
 ## Next
 
-1. Conflict-context endpoint plus the documented resolution recipe: the 409 already carries the
-   report; add the base/ours/theirs changesets so an agent can read all three sides in one call.
-2. Harden `merge-land`: re-merge when the tip moves between resolve and land, and accept a
-   caller-supplied change id for idempotent retries.
-3. Two-parent landing as the first engine-version bump (see `docs/M1-merge-analysis.md` §5A).
-4. Recursive merge base for criss-cross histories — the largest robustness win for ten agents.
-5. Then repository deletion, real DeepSeek agents, per-repository ACL and the N-agent soak.
+1. Rename detection — the one engine fix the simple sequential model needs (a rename plus an
+   edit in another lane currently lands as a false `modify_delete` conflict).
+2. Merge/conflict metrics and the N-agent soak with real DeepSeek agents.
+3. Harden `merge-land` (re-merge when the tip moves; caller-supplied change id) and then decide
+   whether two-parent landing (`docs/M1-merge-analysis.md` §5A) is wanted for topology.
+4. Recursive merge base only when lane-to-lane merges or imported Git history exist.
+5. Then repository deletion, per-repository ACL and the remaining M1 P0 list.
