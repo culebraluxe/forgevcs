@@ -69,7 +69,7 @@ arrived as `{"code":"conflict"}` with no paths, kinds or hunks. **Fixed in this 
 `status_response` now decodes the `ErrorDetail` and returns `details` — `merge_conflict` with
 the full report, `ref_version_mismatch`, `already_landed`, limits, subcodes and candidates.
 
-## 2. What the pilot observed (38/38 green)
+## 2. What the pilot observed (41/41 green)
 
 | Observation | Result |
 | --- | --- |
@@ -78,6 +78,7 @@ the full report, `ref_version_mismatch`, `already_landed`, limits, subcodes and 
 | `Land` whose automatic rebase conflicts | `409` with the same structured report (this is the ordinary push path) |
 | landing a two-parent merge head | `400 invalid_argument` (`merge_in_stack`) — recorded, not a failure |
 | resolution | explicit content + land: the agent chooses the bytes and lands a normal changeset; the server never writes markers |
+| conflict-context | the three readable sides (`base`/`ours`/`theirs`) come back in one call for both merge and rebase orientation |
 
 So the two conflict *sites* are (1) explicit merge and (2) every ordinary push that loses the ref
 race and has to rebase. Site 2 is the one ten agents will hit constantly, and it is now observable.

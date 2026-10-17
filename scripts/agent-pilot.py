@@ -213,18 +213,26 @@ def main() -> int:
             print(f"FAIL  malformed --agents entry: {item}", file=sys.stderr)
             return 2
         agents.append((principal.strip(), secret.strip()))
-    if len(agents) != 3:
-        print("FAIL  this pilot expects exactly three agents", file=sys.stderr)
+    worker_names = [principal for principal, _ in agents if principal != "devops"]
+    if "devops" not in {principal for principal, _ in agents} or len(worker_names) != 3:
+        print(
+            "FAIL  --agents must name agent-a, agent-b, agent-c and devops",
+            file=sys.stderr,
+        )
         return 2
 
     stamp = time.strftime("%y%m%d%H%M%S") + secrets.token_hex(2)
-    repos = {principal: f"agent-pilot-{stamp}-{principal.split('-')[-1]}" for principal, _ in agents}
+    repos = {
+        principal: f"agent-pilot-{stamp}-{principal.split('-')[-1]}"
+        for principal in worker_names
+    }
     shared_repo = f"agent-pilot-{stamp}-shared"
     created = [*repos.values(), shared_repo]
 
     base = args.base
     tokens = {principal: mint(base, principal, secret) for principal, secret in agents}
     clients = {principal: Client(base, token) for principal, token in tokens.items()}
+    devops = clients["devops"]
 
     print(f"INFO  engine {base}")
     print(f"INFO  agents {', '.join(tokens)}")
@@ -241,10 +249,10 @@ def main() -> int:
 
     # --- one repository per agent --------------------------------------------------------
     for principal, repo in repos.items():
-        init_repo(clients[principal], repo)
+        init_repo(devops, repo)
 
     # --- isolation today (recorded, not graded) -------------------------------------------
-    first, second = agents[0][0], agents[1][0]
+    first, second = worker_names[0], worker_names[1]
     status, _ = clients[first].status("GET", f"/repos/{repos[second]}/refs")
     print(
         f"INFO  isolation-today: {first} read {second}'s repo refs "
@@ -256,7 +264,7 @@ def main() -> int:
     before = {principal: main_target(clients[principal], repo)[1] for principal, repo in repos.items()}
 
     def independent_chain(index: int) -> None:
-        principal = agents[index][0]
+        principal = worker_names[index]
         client = clients[principal]
         repo = repos[principal]
         target, _ = main_target(client, repo)
@@ -292,12 +300,12 @@ def main() -> int:
         )
 
     # --- one shared ref: disjoint paths must all land ------------------------------------
-    init_repo(clients[first], shared_repo)
+    init_repo(devops, shared_repo)
     parent, version = main_target(clients[first], shared_repo)
     barrier = threading.Barrier(3)
 
     def shared_disjoint(index: int) -> tuple[str, int]:
-        principal = agents[index][0]
+        principal = worker_names[index]
         barrier.wait(timeout=60)
         _, target, landed_version = land(
             clients[principal],
@@ -322,7 +330,7 @@ def main() -> int:
     )
     clients[first].check(
         "shared-ref: final tree carries every agent's file",
-        {f"{principal}.txt" for principal, _ in agents} <= paths,
+        {f"{principal}.txt" for principal in worker_names} <= paths,
         f"tip {tip} paths {sorted(paths)}",
     )
     clients[first].check(
@@ -336,7 +344,7 @@ def main() -> int:
     barrier = threading.Barrier(2)
 
     def shared_collision(index: int, content, blob: str, data: str):
-        principal = agents[index][0]
+        principal = worker_names[index]
         barrier.wait(timeout=60)
         return clients[principal].status(
             "POST",
@@ -381,8 +389,8 @@ def main() -> int:
     )
 
     # --- recovery: the loser lands on the winner's tip -----------------------------------
-    loser = agents[loser_index][0]
-    winner = agents[winner_index][0]
+    loser = worker_names[loser_index]
+    winner = worker_names[winner_index]
     loser_content = CONTENT_A if loser_index == 0 else CONTENT_B
     loser_blob = BLOB_A if loser_index == 0 else BLOB_B
     loser_data = B64_A if loser_index == 0 else B64_B
@@ -408,7 +416,7 @@ def main() -> int:
 
     # --- workspaces, concurrently, one per agent -----------------------------------------
     def workspace_round(index: int) -> str:
-        principal = agents[index][0]
+        principal = worker_names[index]
         client = clients[principal]
         repo = repos[principal]
         created = client.call("POST", f"/repos/{repo}/workspaces", {"ref": DEFAULT_REF})
@@ -430,7 +438,7 @@ def main() -> int:
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
         workspace_changesets = list(pool.map(workspace_round, range(3)))
     for index, changeset in enumerate(workspace_changesets):
-        principal = agents[index][0]
+        principal = worker_names[index]
         clients[principal].check(
             f"workspaces: {principal} submitted a changeset",
             bool(changeset),
@@ -446,15 +454,15 @@ def main() -> int:
     team_repo = f"agent-pilot-{stamp}-team"
     created.append(team_repo)
     lead = clients[first]
-    init_repo(lead, team_repo)
+    init_repo(devops, team_repo)
     base, base_version = main_target(lead, team_repo)
     letter = {"agent-a": "a", "agent-b": "b", "agent-c": "c"}
-    ref_of = {principal: f"agent/{letter[principal]}" for principal, _ in agents}
+    ref_of = {principal: f"agent/{letter[principal]}" for principal in worker_names}
 
     # Stage one changeset per agent (mode "none" creates it without touching a ref), then the
     # `admin.refs` seat provisions one lane ref per agent.
     staged = {}
-    for principal, _ in agents:
+    for principal in worker_names:
         staged[principal] = clients[principal].call(
             "POST",
             f"/repos/{team_repo}/push",
@@ -468,8 +476,8 @@ def main() -> int:
                 mode="none",
             ),
         )["changeset"]["id"]
-    for principal, _ in agents:
-        lead.call(
+    for principal in worker_names:
+        devops.call(
             "POST",
             f"/repos/{team_repo}/refs",
             {
@@ -488,7 +496,7 @@ def main() -> int:
     # Each agent advances its own lane ref. Every agent can write "/" and passes the shared
     # push pre-check, so the landing is what proves the ref rule does the scoping.
     heads = {}
-    for principal, _ in agents:
+    for principal in worker_names:
         ref = ref_of[principal]
         target, version = next(
             (row["target"], row["version"])
@@ -516,8 +524,8 @@ def main() -> int:
         heads[principal] = pushed["ref"]["target"]
 
     # The cross-agent write: agent-b cannot advance agent-a's lane ref.
-    intruder = agents[1][0]
-    owner = agents[0][0]
+    intruder = worker_names[1]
+    owner = worker_names[0]
     target_of_owner, _ = next(
         (row["target"], row["version"])
         for row in lead.call("GET", f"/repos/{team_repo}/refs")["refs"]
@@ -544,7 +552,7 @@ def main() -> int:
 
     # Integration is `land`: Land rebases a lane's linear stack onto main and commits. Land
     # agent-b's lane, then agent-a's; both agents' files must coexist on main.
-    for principal, _ in agents[:2]:
+    for principal in worker_names[:2]:
         landed = lead.call(
             "POST",
             f"/repos/{team_repo}/land",
@@ -558,7 +566,7 @@ def main() -> int:
     main_tip, _ = main_target(lead, team_repo)
     integrated = {
         f"{letter[principal]}/{name}.txt"
-        for principal, _ in agents[:2]
+        for principal in worker_names[:2]
         for name in ("lane", "two")
     }
     present = {
@@ -579,7 +587,7 @@ def main() -> int:
         f"/repos/{team_repo}/merge",
         {
             "a": heads[owner],
-            "b": heads[agents[1][0]],
+            "b": heads[worker_names[1]],
             "meta": {
                 "author": "ForgeVCS agent pilot <pilot@example.test>",
                 "message": "merge agent-a and agent-b lanes",
@@ -603,7 +611,7 @@ def main() -> int:
     )
 
     # Explicit rebase: replay a fresh changeset onto the current main tip, then land it.
-    other = agents[2][0]
+    other = worker_names[2]
     rebase_seed = clients[other].call(
         "POST",
         f"/repos/{team_repo}/push",
@@ -645,7 +653,7 @@ def main() -> int:
     # Land's automatic rebase (the path every ordinary push takes).
     merge_repo = f"agent-pilot-{stamp}-merge"
     created.append(merge_repo)
-    init_repo(lead, merge_repo)
+    init_repo(devops, merge_repo)
     tip0, _ = main_target(lead, merge_repo)
 
     first_land = clients[first].call(
@@ -692,7 +700,7 @@ def main() -> int:
         f"/repos/{merge_repo}/push",
         push_body(base_tip, "m/conflict.txt", BLOB_A, len(CONTENT_A), B64_A, "side one", mode="none"),
     )["changeset"]["id"]
-    side_two = clients[agents[2][0]].call(
+    side_two = clients[worker_names[2]].call(
         "POST",
         f"/repos/{merge_repo}/push",
         push_body(base_tip, "m/conflict.txt", BLOB_B, len(CONTENT_B), B64_B, "side two", mode="none"),
@@ -757,7 +765,7 @@ def main() -> int:
             mode="none",
         ),
     )["changeset"]["id"]
-    late_side = clients[agents[2][0]].call(
+    late_side = clients[worker_names[2]].call(
         "POST",
         f"/repos/{merge_repo}/push",
         push_body(

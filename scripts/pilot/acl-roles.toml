@@ -1,0 +1,31 @@
+# ForgeVCS pilot policy — the strict authority matrix (LOCAL test only).
+#
+# Loaded by scripts/role-pilot.sh, which proves the DevOps/worker split:
+#
+#   worker            checkout, read, diff, merge-base, push to its own lane ref
+#   devops (admin)    create repository, provision refs, advance `main`
+#
+# A worker cannot create a repository (façade gate on `admin.refs`), cannot create refs
+# (upstream CreateRef requires `admin.refs`), and cannot advance `main` (ref rule). There is
+# no repository deletion endpoint yet; when one is built it must take the same `admin.refs`
+# seat, not a worker permission.
+
+version = 1
+
+[groups]
+agents = ["service:agent-a", "service:devops", "service:forgevcs-workspace"]
+agent-a = ["service:agent-a"]
+devops = ["service:devops"]
+provisioner = ["service:devops"]
+
+[[paths]]
+prefix = "/"
+read = ["group:agents"]
+write = ["group:agents"]
+
+[refs]
+"main" = { update = ["group:devops"] }
+"lane/a" = { update = ["group:agent-a"] }
+
+[admin]
+refs = ["group:provisioner"]

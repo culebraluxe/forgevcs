@@ -284,6 +284,22 @@ pub(crate) async fn init(
     }
 
     let created = state.engine_for(&repo).is_none();
+    // Repository lifecycle is a DevOps seat, not a worker permission: workers check in, read
+    // and merge-base, but creating (and, when implemented, deleting) a repository needs the
+    // single `admin.refs` seat. `admin.refs` is the closest existing upstream permission to a
+    // DevOps capability; a dedicated `admin.repos` permit would be an engine-version change.
+    if created
+        && !app
+            .policy
+            .current()
+            .can_admin(&caller.principal, scion_policy::AdminPerm::Refs)
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "creating a repository requires the DevOps seat (admin.refs)",
+        );
+    }
     let engine = if created {
         match state.engines.get_or_boot(&state.config, &repo).await {
             Ok(engine) => engine,

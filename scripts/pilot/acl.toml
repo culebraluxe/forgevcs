@@ -15,17 +15,27 @@
 # collide over. Paths stay readable/writable by all agents because a real codebase shares
 # files across agents; isolation is in history, not in directories.
 #
-# `admin.refs` is the provisioning seat: CreateRef is the only way to make a ref, so one
-# principal (agent-a, the lead) creates the three lane refs once. Agents cannot create refs.
+# `admin.refs` is both the provisioning seat (CreateRef) and the repository-lifecycle seat:
+# the façade now refuses `POST /repos/{repo}/init` to a principal without `admin.refs`, so
+# only the DevOps principal can create a repository. This collaboration pilot keeps `main`
+# writable by the trio so it can measure merge/land mechanics; the strict authority matrix is
+# scripts/pilot/acl-roles.toml and scripts/role-pilot.sh.
 
 version = 1
 
 [groups]
-agents = ["service:agent-a", "service:agent-b", "service:agent-c", "service:forgevcs-workspace"]
+agents = [
+    "service:agent-a",
+    "service:agent-b",
+    "service:agent-c",
+    "service:devops",
+    "service:forgevcs-workspace",
+]
 agent-a = ["service:agent-a"]
 agent-b = ["service:agent-b"]
 agent-c = ["service:agent-c"]
-provisioner = ["service:agent-a"]
+devops = ["service:devops"]
+provisioner = ["service:devops"]
 
 # The `/` rule is required by the parser and is the fallback for every path.
 [[paths]]

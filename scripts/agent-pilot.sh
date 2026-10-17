@@ -39,8 +39,10 @@ export PORT="${PORT:-3998}"
 SECRET_A="pilot-agent-a-secret"
 SECRET_B="pilot-agent-b-secret"
 SECRET_C="pilot-agent-c-secret"
+# The DevOps seat: the only principal that may create a repository (and, later, delete one).
+SECRET_DEVOPS="pilot-devops-secret"
 hash_of() { printf '%s' "$1" | shasum -a 256 | cut -d' ' -f1; }
-export FORGEVCS_SERVICE_PRINCIPALS="agent-a=$(hash_of "$SECRET_A"),agent-b=$(hash_of "$SECRET_B"),agent-c=$(hash_of "$SECRET_C")"
+export FORGEVCS_SERVICE_PRINCIPALS="agent-a=$(hash_of "$SECRET_A"),agent-b=$(hash_of "$SECRET_B"),agent-c=$(hash_of "$SECRET_C"),devops=$(hash_of "$SECRET_DEVOPS")"
 
 BASE="http://127.0.0.1:$PORT"
 LOG="${TMPDIR:-/tmp}/forgevcs-agent-pilot-$PORT.log"
@@ -69,7 +71,7 @@ fi
 printf 'engine ready on %s\n\n' "$BASE"
 python3 "$ROOT/scripts/agent-pilot.py" \
   --base "$BASE" \
-  --agents "agent-a=$SECRET_A,agent-b=$SECRET_B,agent-c=$SECRET_C"
+  --agents "agent-a=$SECRET_A,agent-b=$SECRET_B,agent-c=$SECRET_C,devops=$SECRET_DEVOPS"
 RC=$?
 
 if [ "$RC" -ne 0 ]; then

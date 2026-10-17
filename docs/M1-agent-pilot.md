@@ -17,7 +17,7 @@ PORT=4100 scripts/agent-pilot.sh
 
 The script builds the service, boots it with `FORGEVCS_SERVICE_PRINCIPALS=agent-a/b/c`, and
 drives `scripts/agent-pilot.py`. It loads `scripts/pilot/acl.toml` — a local policy that names
-the three pilot principals and their lane refs — so the committed `acl.toml` and the hosted
+the three worker principals, the DevOps seat and their lane refs — so the committed `acl.toml` and the hosted
 deployment's policy are unchanged. The principals are throwaway deterministic secrets; no
 deployment configuration is touched.
 
@@ -27,10 +27,11 @@ repository deletion endpoint, so see "Cleanup" below.
 The merge path itself is analysed in `docs/M1-merge-analysis.md`: the inherited Scion model,
 the conflict sites the pilot exercises, and the ordered work to grow it.
 
-## Result — 2026-10-17, PASS 40/40
+## Result — 2026-10-17, PASS 41/41
 
 ```text
-identity      each principal mints a token; /auth/whoami names it
+identity      each worker and the DevOps seat mint a token; /auth/whoami names each
+lifecycle     the DevOps seat creates the repositories; worker creation is proven in role-pilot
 isolation     INFO agent-a read agent-b's repo refs (HTTP 200) — recorded gap, not a failure
 independent   three agents advanced three separate repositories by 3 changesets
 shared-ref    three disjoint pushes to one ref all landed; the tree carries every file
@@ -48,7 +49,7 @@ conflict(l)   Land's rebase-on-contention: 409, details carry path and add_add
 context(merge) base/ours/theirs readable in one call for the merge pair
 context(land)  base=parent, ours=tip, theirs=head readable in one call for the rebase pair
 resolution    explicit content + land; the server never writes conflict markers
-OK  40 checks passed across 3 agents and 6 repositories
+OK  41 checks passed across 3 agents, the DevOps seat and 6 repositories
 ```
 
 The engine log carries the mechanism, not just the verdict. In the shared-repository round the
@@ -167,6 +168,7 @@ fifth run on, `-team` repositories:
 - `agent-pilot-261017174823f50f` — passing 31-check run
 - `agent-pilot-26101719085177b6` — passing 38-check run (`-a`, `-b`, `-c`, `-shared`, `-team`, `-merge`)
 - `agent-pilot-26101719263382f3` — passing 40-check run (adds `conflict-context`)
+- `agent-pilot-261017194653bceb` — passing 41-check run (repositories created by the DevOps seat)
 
 Repositories are rows in the Scion metadata tables plus object keys in the bucket; deleting one
 means every Scion table row for its `repo_id` plus the object keys (the same reviewed
@@ -174,10 +176,12 @@ destructive path `docs/W4-engine-wiring.md` §8.6 records as absent).
 
 ## Next
 
-1. Rename detection — the one engine fix the simple sequential model needs (a rename plus an
-   edit in another lane currently lands as a false `modify_delete` conflict).
+1. Rename detection — designed in `docs/M1-rename-detection.md`; the one engine fix the
+   simple sequential model needs (a rename plus an edit in another lane currently lands as a
+   false `modify_delete` conflict).
 2. Merge/conflict metrics and the N-agent soak with real DeepSeek agents.
 3. Harden `merge-land` (re-merge when the tip moves; caller-supplied change id) and then decide
    whether two-parent landing (`docs/M1-merge-analysis.md` §5A) is wanted for topology.
 4. Recursive merge base only when lane-to-lane merges or imported Git history exist.
-5. Then repository deletion, per-repository ACL and the remaining M1 P0 list.
+5. Then repository deletion (gated on the DevOps seat, per `docs/M1-roles.md`),
+   per-repository ACL and the remaining M1 P0 list.
