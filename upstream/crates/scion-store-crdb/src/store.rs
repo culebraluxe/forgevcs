@@ -400,6 +400,19 @@ impl CrdbMetaStore {
         Ok(())
     }
 
+    /// ForgeVCS addition (ADR-0002 D5): a cheap liveness probe for `/ready`.
+    ///
+    /// One read-write transaction whose only statement is `SELECT 1`. Using the store's own
+    /// pool means a database that accepts connections but rejects work still reports unhealthy,
+    /// which a byte-level `connect` probe would not catch. No rows are written or read.
+    pub async fn ping(&self) -> Result<()> {
+        self.txn("ping", false, |c| async move {
+            c.simple_query("SELECT 1").await?;
+            Ok(())
+        })
+        .await
+    }
+
     /// `CREATE DATABASE scion_test_<rand>`, connect and migrate (tests; PLAN 3.3). The base URL
     /// names any existing database (e.g. `defaultdb`) and is used without TLS. Under the
     /// `postgres` feature the connection is TLS (Neon rejects plaintext), using the webpki

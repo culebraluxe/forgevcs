@@ -18,10 +18,24 @@ path = "src/main.rs"
 scion-obs = { workspace = true }
 scion-store = { workspace = true }
 scion-store-s3 = { workspace = true }
+scion-store-crdb = { workspace = true, features = ["postgres"] }
+scion-config = { workspace = true }
+scion-auth = { workspace = true }
+scion-policy = { workspace = true }
+scion-server = { workspace = true }
+scion-proto = { workspace = true }
+scion-object = { workspace = true }
+scion-core = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+futures = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 

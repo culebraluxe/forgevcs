@@ -1,0 +1,31 @@
+# ForgeVCS policy (upstream SPEC 6.2; ADR-0002 D4).
+#
+# Deny by default: without a rule naming a principal, nothing can be read or written. The only
+# identities this file grants anything to are the machine principals in `[groups].agents` —
+# Maestro and an OpenCode harness — which is the M0 contract: bots use the service, humans
+# arrive with W5's workspace and W6's delegation.
+#
+# The principals themselves are configured in FORGEVCS_SERVICE_PRINCIPALS
+# (`name=<sha256 of secret>`), so rotating a secret does not touch this file.
+
+version = 1
+
+[groups]
+agents = ["service:maestro", "service:opencode"]
+
+# The `/` rule is required by the parser and is the fallback for every path.
+[[paths]]
+prefix = "/"
+read = ["group:agents"]
+write = ["group:agents"]
+
+# Refs: agents may advance any branch but not force it. Deletion of refs is `admin.refs`,
+# which stays empty (nobody has it) until W5 models repository lifecycle.
+#
+# `main` is an exact rule, not a pattern: upstream bootstraps the root changeset on the ref
+# literally named `main` (`RefName::main()`), and `"refs/heads/*"` does not match it. Without
+# this line a freshly bootstrapped repository has a ref that nobody may advance, so every
+# first push is PERMISSION_DENIED.
+[refs]
+"main" = { update = ["group:agents"] }
+"refs/heads/*" = { update = ["group:agents"] }

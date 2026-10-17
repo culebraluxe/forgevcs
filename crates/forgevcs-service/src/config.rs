@@ -6,6 +6,7 @@
 //! binary runs unchanged against local MinIO, a Neon bucket, or real S3.
 
 use std::env;
+use std::path::PathBuf;
 
 use scion_store_s3::S3Config;
 
@@ -14,6 +15,15 @@ pub const UPSTREAM_COMMIT: &str = "e0ffadf9c755f1b99812df5beffcabdebcb38c19";
 
 /// Default listen port; Vercel supplies `$PORT`.
 const DEFAULT_PORT: u16 = 3000;
+
+/// Default repository name when `$FORGEVCS_REPO` is unset.
+pub const DEFAULT_REPO: &str = "forgevcs";
+
+/// Default metadata pool size (upstream's SPEC 6.5 default).
+const DEFAULT_MAX_CONNECTIONS: u16 = 64;
+
+/// Default policy file, relative to the working directory.
+const DEFAULT_POLICY_PATH: &str = "acl.toml";
 
 /// Resolved process configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -34,6 +44,22 @@ pub struct Config {
     pub secret_key: Option<String>,
     /// Prefix every object key is written under (`$FORGEVCS_KEY_PREFIX`; empty by default).
     pub key_prefix: Option<String>,
+    /// Repository this process serves (`$FORGEVCS_REPO`; `forgevcs` by default). ADR-0002 D3:
+    /// one engine per repository, this is the one booted at startup.
+    pub repo: Option<String>,
+    /// Metadata pool size (`$FORGEVCS_DB_MAX_CONNECTIONS`; 64 by default).
+    pub max_connections: Option<u16>,
+    /// `acl.toml` path (`$FORGEVCS_POLICY_PATH`; `acl.toml` in the working directory).
+    pub policy_path: Option<PathBuf>,
+    /// PKCS#8 PEM Ed25519 signing key (`$FORGEVCS_SIGNING_KEY_PATH`). Absent means the engine
+    /// generates an ephemeral key and tokens die with the process (ADR-0002 D5).
+    pub signing_key: Option<PathBuf>,
+    /// GitHub OAuth App client id (`$FORGEVCS_GITHUB_CLIENT_ID`), used by `AuthService.Login`.
+    pub github_client_id: Option<String>,
+    /// Service principals, comma-separated `name=<sha256 hex>`
+    /// (`$FORGEVCS_SERVICE_PRINCIPALS`). These are the agent identities — Maestro, OpenCode,
+    /// importers — that policy refers to as `service:<name>`.
+    pub service_principals: Option<String>,
 }
 
 impl Config {
@@ -57,7 +83,36 @@ impl Config {
             access_key: get(&["FORGEVCS_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]),
             secret_key: get(&["FORGEVCS_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]),
             key_prefix: get(&["FORGEVCS_KEY_PREFIX"]),
+            repo: get(&["FORGEVCS_REPO"]),
+            max_connections: get(&["FORGEVCS_DB_MAX_CONNECTIONS"])
+                .and_then(|raw| raw.parse::<u16>().ok()),
+            policy_path: get(&["FORGEVCS_POLICY_PATH"]).map(PathBuf::from),
+            signing_key: get(&["FORGEVCS_SIGNING_KEY_PATH"]).map(PathBuf::from),
+            github_client_id: get(&["FORGEVCS_GITHUB_CLIENT_ID"]),
+            service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
         }
+    }
+
+    /// The repository this process serves (ADR-0002 D3).
+    pub fn repo(&self) -> &str {
+        self.repo.as_deref().unwrap_or(DEFAULT_REPO)
+    }
+
+    /// Metadata pool size.
+    pub fn max_connections(&self) -> usize {
+        usize::from(self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
+    }
+
+    /// The `acl.toml` to load.
+    pub fn policy_path(&self) -> PathBuf {
+        self.policy_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_POLICY_PATH))
+    }
+
+    /// Signing-key paths, in signing-then-verify order.
+    pub fn signing_keys(&self) -> Vec<PathBuf> {
+        self.signing_key.iter().cloned().collect()
     }
 
     /// Reject configurations that cannot be served, with a reason suitable for

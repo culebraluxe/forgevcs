@@ -18,11 +18,23 @@ that way — they hold live Neon credentials (`neon env pull` writes them, and r
 them on every run).
 
 **Workstream state.** W0 baseline PASS; W1 service shell PASS (tag `w1-service-shell`);
-W2 Postgres port PASS (2026-10-17); **W3 object storage PASS (2026-10-17, tag
-`w3-object-storage`)** — the blob contract green against the real Neon bucket
-(`neon_blob_conformance` 3/3, 28.62 s) and the vendored gate re-run at **1343** passed /
-0 failed. See `docs/W3-object-storage.md`. Neither port changes the default build: Postgres
-lives behind `--features postgres`, and the object-storage additions are additive.
+W2 Postgres port PASS (2026-10-17); W3 object storage PASS (2026-10-17, tag
+`w3-object-storage`); **W4 part 1 — engine wiring — PASS (2026-10-17)**: the service boots
+the Scion engine on Neon and `/ready` is 200 only with `SELECT 1` + bucket `HEAD` answering;
+`cargo clippy … -D warnings` 0, `cargo test -p forgevcs-service --lib --bins` 21 passed, live
+smoke on `forgevcs-ci` green. **W4 part 2 — auth seam — PASS (2026-10-17)**: `POST
+/auth/token` mints real Scion tokens for configured service principals and `GET /auth/whoami`
+spends them through `interceptor::authenticate`, so every later façade call starts from a
+verified `CallerCtx`. **W4 part 3 — business façade — PASS (2026-10-17)**: `POST
+/repos/{repo}/init|push|pull` and `GET /repos/{repo}/refs|commits|changesets/{id}|file|tree|diff|merge-base`
+map JSON onto the vendored handlers in-process; `cargo test -p forgevcs-service --lib --bins` 30
+passed, clippy 0, the upstream gate is unchanged at 1343, and `scripts/engine-smoke.sh` runs the
+20-check `scripts/w4-acceptance.py` client against Neon (A → B, parent, history, both file
+versions, tree, diff, merge-base) and exits 0. Repository deletion, restart recovery for
+non-default repos, human login, and the gRPC layers the façade skips are the open W4 gaps
+(`docs/W4-engine-wiring.md` §8.6). See `docs/W4-engine-wiring.md`. The Postgres port does not
+change the default build: it lives behind `--features postgres`, and the object-storage
+additions are additive.
 
 **Find out where things stand with one command, not by reading logs.**
 `scripts/gate-status.sh` prints one JSON line and exits 0 pass / 1 fail / 2 running / 3 never
@@ -46,6 +58,11 @@ Read these before changing anything, in this order:
    order mapped clause-by-clause onto the vendored source (§1 says what is **already
    implemented** and must not be rebuilt), and §8 what W3 actually added: the extended blob
    suite, `Config::s3_config()`, and the Neon acceptance run.
+6. [`docs/adr/0002-engine-wiring.md`](docs/adr/0002-engine-wiring.md) +
+   [`docs/W4-engine-wiring.md`](docs/W4-engine-wiring.md) — how the engine is wired into the
+   service (D3 engine registry, D4 in-process handlers, D5 readiness, D6 table split) and the
+   live acceptance run, including the three findings that cost time (TLS, `Arc` coercion,
+   the required `/` policy rule).
 
 ## Hard rules
 

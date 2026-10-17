@@ -1,8 +1,12 @@
 //! ForgeVCS service library: the pieces an integration test or another bin can reuse.
 //!
-//! The HTTP wiring stays in `main.rs` (W1 served it from a single binary). Only the
-//! environment configuration lives here, because W3 has to drive the *same*
-//! [`config::Config::s3_config`] the deployed service uses — a test that re-implements the
-//! variable mapping would prove nothing about the service.
+//! The engine wiring ([`engine`]), the HTTP surface ([`http`]) and the business façade
+//! ([`facade`]) live here rather than in the binary, so tests drive the identical router and
+//! `Config` the deployed service uses — a test that re-implemented the variable mapping or the
+//! routes would prove nothing about the service. `main.rs` keeps startup, shutdown and the
+//! `axum::serve` call.
 
 pub mod config;
+pub mod engine;
+pub mod facade;
+pub mod http;

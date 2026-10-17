@@ -12,7 +12,9 @@ pub mod handlers;
 
 mod app;
 mod errors;
-mod interceptor;
+// ForgeVCS addition: the bearer interceptor is the authentication seam the HTTP façade calls
+// in-process (ADR-0002 D4), so the module has to be reachable. No behaviour changes.
+pub mod interceptor;
 mod jobs;
 mod logging;
 mod ratelimit;
