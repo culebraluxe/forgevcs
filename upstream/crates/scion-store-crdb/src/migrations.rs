@@ -160,3 +160,12 @@ ALTER TABLE changesets ADD COLUMN IF NOT EXISTS fp_merges INT8 NULL;
 "#,
     ),
 ];
+
+/// [`MIGRATIONS`] adapted to the active dialect ([`crate::dialect::ACTIVE`]): the identical
+/// statements on CockroachDB, `TEXT`/`BYTEA`/identity spellings on PostgreSQL.
+pub fn migrations() -> Vec<(&'static str, String)> {
+    MIGRATIONS
+        .iter()
+        .map(|&(name, sql)| (name, crate::dialect::ACTIVE.migration(sql)))
+        .collect()
+}

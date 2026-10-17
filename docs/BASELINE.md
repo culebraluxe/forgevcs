@@ -207,3 +207,23 @@ Still open:
 3. **Docker daemon** for T-external (Cockroach + MinIO), if we want the third tier before
    Neon exists at all.
 
+## Post-baseline gate record
+
+Everything above records the **pristine** upstream tree. Every workstream after W0 modifies
+the vendored tree, and a green gate is only evidence for the tree it ran against — so the
+gate is re-run and recorded here whenever the vendored code changes. The bar does not move:
+`scripts/check.sh` must exit 0, and the passing count may only grow.
+
+| workstream | tag | gate | tests passed | note |
+| --- | --- | --- | --- | --- |
+| W0 baseline | `FORGESC-SCION-UPSTREAM-BASELINE` | exit 0 | 1337 | pristine `e0ffadf9`, 195 result lines |
+| W1 service shell | `w1-service-shell` | exit 0 | 1337 | no vendored file touched — the service is its own workspace |
+| W2 Postgres port | `w2-postgres-port` | **exit 0** | **1341** | +4 `dialect` unit tests; the 1337 are unchanged |
+
+W2 detail: 1341 passed / 0 failed across all targets, `cargo clippy -- -D warnings` clean,
+`cargo fmt --all --check` clean, `check-layers.sh` passed. The `postgres` feature changes are
+inert in the default build, which is exactly why the count is 1337 + the new dialect tests
+rather than a shifted baseline. Run log: `~/Library/Logs/forgevcs/gate-w2-postgres-port.log`
+(`GATE_EXIT=0`). Re-run with `scripts/gate.sh`, which writes one durable log per run and
+records the commit and dirty-state it ran against.
+

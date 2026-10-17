@@ -11,10 +11,17 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# PostgreSQL/Neon dialect (ADR-0001 §7.1): TEXT/BYTEA migrations, standard upserts, no
+# follower reads, no Cockroach-only session options.
+postgres = ["dep:webpki-roots"]
+
 [dependencies]
 scion-core = { workspace = true }
 scion-object = { workspace = true }
 scion-store = { workspace = true }
+webpki-roots = { workspace = true, optional = true }
 tokio-postgres = { workspace = true }
 deadpool-postgres = { workspace = true }
 tokio-postgres-rustls = { workspace = true }

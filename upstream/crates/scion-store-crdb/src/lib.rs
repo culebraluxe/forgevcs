@@ -4,9 +4,11 @@
 #![warn(missing_docs)]
 
 mod config;
+pub mod dialect;
 mod migrations;
 mod store;
 
 pub use config::{CrdbConfig, test_url};
-pub use migrations::MIGRATIONS;
+pub use migrations::{MIGRATIONS, migrations};
+
 pub use store::CrdbMetaStore;

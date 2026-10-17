@@ -20,21 +20,44 @@ decision of authority.
 
 - Upstream: `CarterT27/scion` @ `e0ffadf9c755f1b99812df5beffcabdebcb38c19`, tagged
   `FORGESC-SCION-UPSTREAM-BASELINE` in the source repo.
-- Vendored **with no source modifications**: `rsync -a --exclude .git --exclude target`, so
-  only VCS metadata and build output were dropped. No file in `upstream/` was edited.
+- Vendored with `rsync -a --exclude .git --exclude target`, so only VCS metadata and build
+  output were dropped.
 - Scion is **Apache-2.0**; its licence is retained at `upstream/LICENSE` and mirrored at
   `LICENSE`. Copyright remains with Scion's authors.
-- Changes to vendored code, when they start, are listed here. As of W1 there are none:
-  W2 adds `upstream/crates/scion-store-crdb/src/dialect.rs` behind a `postgres` feature,
-  per ADR-0001 §7.1.
+- **Modifications to vendored code.** W1 had none. W2 (ADR-0001 §7.1) adds the PostgreSQL
+  dialect, entirely behind the `postgres` feature — the default build emits exactly the
+  upstream CockroachDB statements:
+  1. `crates/scion-store-crdb/src/dialect.rs` (**new**) — `Dialect::{Cockroach, Postgres}`:
+     migration rewrites, inline cast rewrites, retry budget, session options, rustls roots.
+  2. `crates/scion-store-crdb/src/store.rs` — dialect-selected upserts and `UNNEST` casts,
+     dialect session options, TLS in `connect_fresh_for_tests`, a `connect_raw` helper.
+  3. `crates/scion-store-crdb/src/store/txn.rs` — `adapt_inline_sql` in the three
+     statement-preparation helpers; the attempt budget moved to `Dialect::max_attempts`.
+  4. `crates/scion-store-crdb/src/migrations.rs` — `migrations()`, the dialect-adapted set.
+  5. `crates/scion-store-crdb/tests/neon_conformance.rs` (**new**) — the conformance suite
+     run against Postgres/Neon.
+  6. `Cargo.toml` (workspace) and the crate manifest — `postgres` feature, `webpki-roots`
+     pinned to the version already in `Cargo.lock`.
+
+  No SQL statement's logic changed; only its dialect spelling. Proof is the suite, not
+  inspection: 20/20 cases of `meta_store_suite` pass against Neon.
 
 ## Build and test
 
 ```sh
 cargo test -p forgevcs-service          # the service
 cargo build --release --locked          # what the container runs
-upstream/scripts/check.sh               # the vendored upstream gate (T-core) — must exit 0
+
+scripts/gate.sh                         # the vendored upstream gate (T-core) — must exit 0
+                                        # detached, one log per run:
+                                        #   tail -3 ~/Library/Logs/forgevcs/latest.log
+upstream/scripts/check.sh               # the same gate, in the foreground, if you want to watch
 upstream/scripts/check-layers.sh        # module-boundary check
+
+# W2 acceptance: the full MetaStore conformance suite against Postgres/Neon.
+# Unpooled URL only — the pooler breaks prepared statements and session SERIALIZABLE.
+(cd upstream && SCION_TEST_CRDB_URL="$(grep '^DATABASE_URL_UNPOOLED=' ../.env.local | cut -d= -f2- | tr -d '"')" \
+  cargo test -p scion-store-crdb --features postgres --test neon_conformance -- --nocapture)
 ```
 
 Gate on **T-core**. Do not gate on `check.sh --full`: it is red upstream at the baseline SHA

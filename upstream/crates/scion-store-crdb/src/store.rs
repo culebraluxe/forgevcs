@@ -2,16 +2,22 @@
 //!
 //! Every [`MetaStore`] method is one `SERIALIZABLE` transaction on a pooled connection
 //! (deadpool-postgres over tokio-postgres). SQLSTATE `40001` (and `40003` on read-only methods)
-//! is retried client-side with full-jitter backoff, at most [`txn::MAX_ATTEMPTS`] attempts;
+//! is retried client-side with full-jitter backoff, at most
+//! [`crate::dialect::Dialect::max_attempts`] attempts;
 //! exhaustion is UNAVAILABLE/txn_retry. Connection and pool failures are
 //! UNAVAILABLE/store_unavailable. [`Consistency::Stale`] reads run as a single statement with
 //! `AS OF SYSTEM TIME follower_read_timestamp()` outside an explicit transaction.
+//!
+//! With the `postgres` feature the SQL is adapted by [`crate::dialect`]: `TEXT`/`BYTEA`
+//! columns, standard `ON CONFLICT` upserts, no Cockroach-only session options, and stale reads
+//! that degrade to strong reads (PostgreSQL has no follower reads).
 
 mod codec;
 mod txn;
 
 use crate::config::CrdbConfig;
-use crate::migrations::MIGRATIONS;
+use crate::dialect::ACTIVE;
+use crate::migrations::migrations;
 use async_trait::async_trait;
 use codec::*;
 use deadpool_postgres::{Manager, ManagerConfig, Object, Pool, RecyclingMethod, Runtime};
@@ -25,8 +31,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 use tokio_postgres::{NoTls, Row};
 use txn::{
-    MAX_ATTEMPTS, Params, TxErr, backoff, begin, execute, is_schema_too_new, is_unique_violation,
-    query, query_implicit,
+    Params, TxErr, backoff, begin, execute, is_schema_too_new, is_unique_violation, query,
+    query_implicit,
 };
 
 /// Rows per multi-row `INSERT ... SELECT FROM UNNEST(...)` statement.
@@ -35,11 +41,11 @@ const BATCH_ROWS: usize = 1000;
 const TEST_POOL_SIZE: usize = 32;
 /// Repository name used by [`CrdbMetaStore::connect_fresh_for_tests`] (as `MemOptions`).
 const TEST_REPO_NAME: &str = "test";
-/// Session option set on every metadata connection (see `from_pg_config`). The variable
-/// exists from CockroachDB 23.1; SPEC 3.5 requires 23.2 or later.
-const NO_FORECASTS: &str = "-c optimizer_use_forecasts=off";
 
 /// The follower-read clause used for [`Consistency::Stale`] (storage-semantics 1.7, 3).
+/// PostgreSQL has no follower reads, so the stale statement is the strong one (see
+/// [`crate::dialect::Dialect::stale_read_clause`]).
+#[cfg(not(feature = "postgres"))]
 macro_rules! stale_variant {
     ($head:literal, $tail:literal) => {
         (
@@ -50,6 +56,14 @@ macro_rules! stale_variant {
                 $tail
             ),
         )
+    };
+}
+
+/// PostgreSQL: [`Consistency::Stale`] is served by the strong statement.
+#[cfg(feature = "postgres")]
+macro_rules! stale_variant {
+    ($head:literal, $tail:literal) => {
+        (concat!($head, " ", $tail), concat!($head, " ", $tail))
     };
 }
 
@@ -77,19 +91,86 @@ const SELECT_LANDED: &str = "SELECT ref, change_id, version, source_changeset, r
      FROM landed WHERE repo_id = $1 AND ref = $2 AND change_id = $3";
 const SELECT_EPOCH_FOR_UPDATE: &str =
     "SELECT value FROM counters WHERE repo_id = $1 AND name = 'redaction_epoch' FOR UPDATE";
+#[cfg(not(feature = "postgres"))]
 const UPSERT_EPOCH: &str =
     "UPSERT INTO counters (repo_id, name, value) VALUES ($1, 'redaction_epoch', $2)";
+#[cfg(feature = "postgres")]
+const UPSERT_EPOCH: &str = "INSERT INTO counters (repo_id, name, value) \
+     VALUES ($1, 'redaction_epoch', $2) \
+     ON CONFLICT (repo_id, name) DO UPDATE SET value = EXCLUDED.value";
 /// The audit sequence counter row, locked for update.
 const SELECT_AUDIT_SEQ_FOR_UPDATE: &str =
     "SELECT value FROM counters WHERE repo_id = $1 AND name = 'audit_seq' FOR UPDATE";
 /// Seeds the audit sequence from existing rows (only when the counter row is absent).
 const MAX_AUDIT_SEQ: &str = "SELECT max(seq) FROM audit_log WHERE repo_id = $1";
+#[cfg(not(feature = "postgres"))]
 const UPSERT_AUDIT_SEQ: &str =
     "UPSERT INTO counters (repo_id, name, value) VALUES ($1, 'audit_seq', $2)";
+#[cfg(feature = "postgres")]
+const UPSERT_AUDIT_SEQ: &str = "INSERT INTO counters (repo_id, name, value) \
+     VALUES ($1, 'audit_seq', $2) \
+     ON CONFLICT (repo_id, name) DO UPDATE SET value = EXCLUDED.value";
+#[cfg(not(feature = "postgres"))]
 const INSERT_AUDIT: &str = "INSERT INTO audit_log (repo_id, seq, at, actor, action, target, \
      reason, detail) SELECT $1, u.s, u.a, u.ac, u.an, u.t, u.r, u.d FROM UNNEST($2::INT8[], \
      $3::TIMESTAMPTZ[], $4::STRING[], $5::STRING[], $6::STRING[], $7::STRING[], $8::STRING[]) \
      AS u(s, a, ac, an, t, r, d)";
+#[cfg(feature = "postgres")]
+const INSERT_AUDIT: &str = "INSERT INTO audit_log (repo_id, seq, at, actor, action, target, \
+     reason, detail) SELECT $1, u.s, u.a, u.ac, u.an, u.t, u.r, u.d FROM UNNEST($2::INT8[], \
+     $3::TIMESTAMPTZ[], $4::TEXT[], $5::TEXT[], $6::TEXT[], $7::TEXT[], $8::TEXT[]) \
+     AS u(s, a, ac, an, t, r, d)";
+
+#[cfg(not(feature = "postgres"))]
+const INSERT_DERIVED: &str = "INSERT INTO derived (repo_id, type, type_version, key, value, \
+     storage_key, source_object, at) SELECT $1, u.t, u.v, u.k, u.val, u.sk, u.src, u.a FROM \
+     UNNEST($2::STRING[], $3::INT8[], $4::BYTES[], $5::BYTES[], $6::STRING[], $7::BYTES[], \
+     $8::TIMESTAMPTZ[]) AS u(t, v, k, val, sk, src, a) ON CONFLICT DO NOTHING";
+#[cfg(feature = "postgres")]
+const INSERT_DERIVED: &str = "INSERT INTO derived (repo_id, type, type_version, key, value, \
+     storage_key, source_object, at) SELECT $1, u.t, u.v, u.k, u.val, u.sk, u.src, u.a FROM \
+     UNNEST($2::TEXT[], $3::INT8[], $4::BYTEA[], $5::BYTEA[], $6::TEXT[], $7::BYTEA[], \
+     $8::TIMESTAMPTZ[]) AS u(t, v, k, val, sk, src, a) ON CONFLICT DO NOTHING";
+#[cfg(not(feature = "postgres"))]
+const UPSERT_LEASE: &str = "UPSERT INTO derive_leases (repo_id, type, type_version, key, holder, \
+     expires_at) VALUES ($1, $2, $3, $4, $5, $6)";
+#[cfg(feature = "postgres")]
+const UPSERT_LEASE: &str = "INSERT INTO derive_leases (repo_id, type, type_version, key, holder, \
+     expires_at) VALUES ($1, $2, $3, $4, $5, $6) \
+     ON CONFLICT (repo_id, type, type_version, key) DO UPDATE SET holder = EXCLUDED.holder, \
+     expires_at = EXCLUDED.expires_at";
+
+/// Open one unpooled connection, with the TLS connector when one is configured (`None` is
+/// plaintext, which CockroachDB tests use and Neon refuses).
+async fn connect_raw(
+    pg: &tokio_postgres::Config,
+    tls: Option<Arc<rustls::ClientConfig>>,
+) -> Result<tokio_postgres::Client> {
+    let mut pg = pg.clone();
+    if pg.get_connect_timeout().is_none() {
+        pg.connect_timeout(Duration::from_secs(10));
+    }
+    match tls {
+        Some(t) => {
+            let (client, conn) = pg
+                .connect(tokio_postgres_rustls::MakeRustlsConnect::new((*t).clone()))
+                .await
+                .map_err(|e| unavailable(format!("connect to test database: {e}")))?;
+            // Detached: the client owns the socket, and connection errors surface through it.
+            drop(tokio::spawn(conn));
+            Ok(client)
+        }
+        None => {
+            let (client, conn) = pg
+                .connect(NoTls)
+                .await
+                .map_err(|e| unavailable(format!("connect to test database: {e}")))?;
+            // Detached: the client owns the socket, and connection errors surface through it.
+            drop(tokio::spawn(conn));
+            Ok(client)
+        }
+    }
+}
 
 /// Shared state behind the store handle.
 struct Inner {
@@ -184,10 +265,7 @@ async fn insert_derived(
     rid: i64,
     cols: &DerivedCols,
 ) -> std::result::Result<(), TxErr> {
-    const SQL: &str = "INSERT INTO derived (repo_id, type, type_version, key, value, storage_key, \
-         source_object, at) SELECT $1, u.t, u.v, u.k, u.val, u.sk, u.src, u.a FROM \
-         UNNEST($2::STRING[], $3::INT8[], $4::BYTES[], $5::BYTES[], $6::STRING[], $7::BYTES[], \
-         $8::TIMESTAMPTZ[]) AS u(t, v, k, val, sk, src, a) ON CONFLICT DO NOTHING";
+    const SQL: &str = INSERT_DERIVED;
     let mut start = 0;
     while start < cols.len() {
         let end = (start + BATCH_ROWS).min(cols.len());
@@ -304,13 +382,17 @@ impl CrdbMetaStore {
         Ok(store)
     }
 
-    /// Apply [`crate::MIGRATIONS`] (idempotent: `CREATE ... IF NOT EXISTS`): every SPEC 5.2
-    /// table plus `audit_log` and the secondary indexes of storage-semantics 2.
+    /// Apply [`crate::migrations`] adapted to the active dialect (idempotent: `CREATE ... IF
+    /// NOT EXISTS`): every SPEC 5.2 table plus `audit_log` and the secondary indexes of
+    /// storage-semantics 2.
     pub async fn migrate(&self) -> Result<()> {
-        for &(name, sql) in MIGRATIONS {
-            self.txn("migrate", false, |c| async move {
-                c.batch_execute(sql).await?;
-                Ok(())
+        for (name, sql) in migrations() {
+            self.txn("migrate", false, |c| {
+                let sql = sql.clone();
+                async move {
+                    c.batch_execute(&sql).await?;
+                    Ok(())
+                }
             })
             .await?;
             tracing::debug!(target: "scion::store::crdb", migration = name, "migration applied");
@@ -319,7 +401,9 @@ impl CrdbMetaStore {
     }
 
     /// `CREATE DATABASE scion_test_<rand>`, connect and migrate (tests; PLAN 3.3). The base URL
-    /// names any existing database (e.g. `defaultdb`) and is used without TLS.
+    /// names any existing database (e.g. `defaultdb`) and is used without TLS. Under the
+    /// `postgres` feature the connection is TLS (Neon rejects plaintext), using the webpki
+    /// roots via [`crate::dialect::tls_client_config`].
     pub async fn connect_fresh_for_tests(base_url: &str) -> Result<Self> {
         let base: tokio_postgres::Config = base_url.parse().map_err(|e| {
             ScionError::new(
@@ -328,21 +412,17 @@ impl CrdbMetaStore {
             )
         })?;
         let db = format!("scion_test_{:016x}", rand::random::<u64>());
-        let (client, conn) = base
-            .connect(NoTls)
-            .await
-            .map_err(|e| unavailable(format!("connect to test database: {e}")))?;
-        let conn_task = tokio::spawn(conn);
+        let tls = crate::dialect::test_tls();
+        let client = connect_raw(&base, tls.clone()).await?;
         let created = client
             .batch_execute(&format!("CREATE DATABASE {db}"))
             .await
             .map_err(|e| unavailable(format!("create test database: {e}")));
         drop(client);
-        let _ = conn_task.await;
         created?;
         let mut pg = base.clone();
         pg.dbname(&db);
-        let store = Self::from_pg_config(pg, None, TEST_POOL_SIZE, TEST_REPO_NAME)?;
+        let store = Self::from_pg_config(pg, tls, TEST_POOL_SIZE, TEST_REPO_NAME)?;
         store.migrate().await?;
         store.ensure_repo().await?;
         Ok(store)
@@ -375,15 +455,19 @@ impl CrdbMetaStore {
         if pg.get_connect_timeout().is_none() {
             pg.connect_timeout(Duration::from_secs(10));
         }
-        // Statistics forecasts can predict an empty `repo_id` span on these single-repository
-        // tables, turning ON CONFLICT arbiters into anti-joins over the whole repository: a
-        // 6-row object_paths insert read 150k rows and serialized concurrent changeset
-        // creation. Hot-path writes must stay point lookups whatever the forecast says.
-        let options = match pg.get_options() {
-            Some(o) => format!("{o} {NO_FORECASTS}"),
-            None => NO_FORECASTS.to_owned(),
-        };
-        pg.options(&options);
+        // CockroachDB only: statistics forecasts can predict an empty `repo_id` span on these
+        // single-repository tables, turning ON CONFLICT arbiters into anti-joins over the whole
+        // repository: a 6-row object_paths insert read 150k rows and serialized concurrent
+        // changeset creation. Hot-path writes must stay point lookups whatever the forecast
+        // says. PostgreSQL has no such option and rejects it as an unrecognized parameter, so
+        // it is applied only for the CockroachDB dialect.
+        if let Some(forecasts) = ACTIVE.session_options() {
+            let options = match pg.get_options() {
+                Some(o) => format!("{o} {forecasts}"),
+                None => forecasts.to_owned(),
+            };
+            pg.options(&options);
+        }
         let database = pg.get_dbname().map(str::to_owned);
         let mcfg = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
@@ -437,7 +521,8 @@ impl CrdbMetaStore {
     }
 
     /// One attempt loop: `f` runs one whole transaction on a fresh pooled connection; retryable
-    /// failures are retried with full-jitter backoff up to [`MAX_ATTEMPTS`] attempts.
+    /// failures are retried with full-jitter backoff up to [`ACTIVE`]'s attempt budget
+    /// ([`crate::dialect::Dialect::max_attempts`]).
     async fn run<T, F, Fut>(
         &self,
         op: &'static str,
@@ -460,7 +545,7 @@ impl CrdbMetaStore {
                 Ok(v) => return Ok(v),
                 Err(e) if e.retryable(read_only) => {
                     self.inner.retries.fetch_add(1, Ordering::Relaxed);
-                    if attempt >= MAX_ATTEMPTS {
+                    if attempt >= ACTIVE.max_attempts() {
                         tracing::warn!(
                             target: "scion::store::crdb",
                             op,
@@ -1313,8 +1398,7 @@ impl MetaStore for CrdbMetaStore {
             }
             execute(
                 &tx,
-                "UPSERT INTO derive_leases (repo_id, type, type_version, key, holder, expires_at) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+                UPSERT_LEASE,
                 &[&rid, &ty, &ver, &key, &holder, &expires],
             )
             .await?;
@@ -1601,6 +1685,7 @@ mod tests {
         assert!(compute_repo_id("x").0 >= 0);
     }
 
+    #[cfg(not(feature = "postgres"))]
     #[test]
     fn stale_variants_differ_only_by_the_follower_clause() {
         for (strong, stale) in [GET_OBJECTS, GET_CHANGESETS, GET_DERIVED] {
@@ -1609,6 +1694,17 @@ mod tests {
                 stale.replace(" AS OF SYSTEM TIME follower_read_timestamp()", ""),
                 strong
             );
+        }
+    }
+
+    /// PostgreSQL has no follower reads: `Consistency::Stale` is served by the strong
+    /// statement rather than silently returning an error.
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn stale_variants_are_the_strong_statement() {
+        for (strong, stale) in [GET_OBJECTS, GET_CHANGESETS, GET_DERIVED] {
+            assert!(!strong.contains("AS OF SYSTEM TIME"));
+            assert_eq!(stale, strong);
         }
     }
 

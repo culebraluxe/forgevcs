@@ -9,8 +9,6 @@ use tokio_postgres::error::SqlState;
 use tokio_postgres::types::ToSql;
 use tokio_postgres::{IsolationLevel, Row};
 
-/// At most this many attempts per method (storage-semantics 3).
-pub(crate) const MAX_ATTEMPTS: u32 = 10;
 /// Full-jitter backoff: attempt `k` sleeps uniformly in `[0, min(CAP, BASE * 2^k))`.
 const BACKOFF_BASE: Duration = Duration::from_millis(2);
 const BACKOFF_CAP: Duration = Duration::from_millis(250);
@@ -174,7 +172,8 @@ pub(crate) async fn query(
     sql: &str,
     params: Params<'_>,
 ) -> Result<Vec<Row>, tokio_postgres::Error> {
-    let st = tx.prepare_cached(sql).await?;
+    let sql = crate::dialect::adapt_inline_sql(sql);
+    let st = tx.prepare_cached(&sql).await?;
     tx.query(&st, params).await
 }
 
@@ -184,7 +183,8 @@ pub(crate) async fn execute(
     sql: &str,
     params: Params<'_>,
 ) -> Result<u64, tokio_postgres::Error> {
-    let st = tx.prepare_cached(sql).await?;
+    let sql = crate::dialect::adapt_inline_sql(sql);
+    let st = tx.prepare_cached(&sql).await?;
     tx.execute(&st, params).await
 }
 
@@ -194,7 +194,8 @@ pub(crate) async fn query_implicit(
     sql: &str,
     params: Params<'_>,
 ) -> Result<Vec<Row>, tokio_postgres::Error> {
-    let st = c.prepare_cached(sql).await?;
+    let sql = crate::dialect::adapt_inline_sql(sql);
+    let st = c.prepare_cached(&sql).await?;
     c.query(&st, params).await
 }
 

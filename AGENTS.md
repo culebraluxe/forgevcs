@@ -17,6 +17,11 @@ inspectable with no network. `.env.local` and `.neon/` are gitignored and must s
 that way — they hold live Neon credentials (`neon env pull` writes them, and rotates
 them on every run).
 
+**Workstream state.** W0 baseline PASS; W1 service shell PASS (tag `w1-service-shell`);
+**W2 Postgres port PASS (2026-10-17)** — `meta_store_suite` 20/20 against Neon, both dialects'
+unit tests 15/15, vendored gate green. See `docs/W2-postgres-port.md`. W3 object storage is
+next; the port lives behind `--features postgres` so the default build stays upstream-identical.
+
 Read these before changing anything, in this order:
 
 1. [`docs/adr/0001-infrastructure-stack.md`](docs/adr/0001-infrastructure-stack.md) — the
@@ -28,7 +33,10 @@ Read these before changing anything, in this order:
    later workstreams exploit.
 3. [`docs/W1-service-shell.md`](docs/W1-service-shell.md) — the service that exists today:
    routes, env config, and what is deliberately unfinished.
-4. [`docs/W3-object-storage.md`](docs/W3-object-storage.md) — the object-storage work
+4. [`docs/W2-postgres-port.md`](docs/W2-postgres-port.md) — the meta store ported to
+   Postgres/Neon: the dialect seam, the acceptance command, and the four findings that only
+   running the suite found.
+5. [`docs/W3-object-storage.md`](docs/W3-object-storage.md) — the object-storage work
    order mapped clause-by-clause onto the vendored source, including what is **already
    implemented** and must not be rebuilt.
 
