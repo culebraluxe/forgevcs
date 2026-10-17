@@ -1,20 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "forgevcs": {
-      "root": ".",
-      "entrypoint": "Dockerfile.vercel",
-      "runtime": "container"
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/(.*)",
-      "destination": {
-        "service": "forgevcs"
-      }
-    }
-  ],
   "git": {
     "deploymentEnabled": false
   }

@@ -1,0 +1,25 @@
+# WHAT VERCEL BUILDS: no compiler, no Rust compile. It unpacks the binary produced by
+# devops/Dockerfile.build and starts it. The image is intentionally tiny; the build takes
+# seconds on Vercel.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/* \
+ && useradd --system --uid 10001 forgevcs
+
+WORKDIR /app
+COPY forgevcs-service.gz /usr/local/bin/forgevcs-service.gz
+RUN gunzip /usr/local/bin/forgevcs-service.gz \
+ && chmod +x /usr/local/bin/forgevcs-service
+COPY acl.toml /etc/forgevcs/acl.toml
+
+ENV PORT=3000 \
+    FORGEVCS_POLICY_PATH=/etc/forgevcs/acl.toml
+EXPOSE 3000
+USER forgevcs
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=20s --retries=3 \
+  CMD curl --fail --silent "http://127.0.0.1:${PORT}/health" >/dev/null || exit 1
+
+ENTRYPOINT ["/usr/local/bin/forgevcs-service"]

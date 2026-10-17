@@ -1,0 +1,45 @@
+# LOCAL BUILD (Mac, free): cross-compile the ForgeVCS service for Vercel's x86_64 Linux.
+#
+# This is the same shape as Culebraluxe-web's devops/Dockerfile.build: the Mac's Docker
+# runs a native arm64 Rust image, and the binary is cross-compiled for linux/amd64. The
+# output is a single binary exported to a host directory; Vercel never compiles the Rust
+# workspace.
+#
+#   docker build -f devops/Dockerfile.build --output type=local,dest=<dir> .
+#   -> <dir>/forgevcs-service (linux/amd64)
+
+# syntax=docker/dockerfile:1
+
+FROM --platform=$BUILDPLATFORM rust:1.98-bookworm AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      protobuf-compiler \
+      gcc-x86-64-linux-gnu \
+      libc6-dev-amd64-cross \
+ && rm -rf /var/lib/apt/lists/*
+
+ENV CARGO_TARGET_DIR=/target \
+    CARGO_INCREMENTAL=0 \
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
+    CC_x86_64_unknown_linux_gnu=x86_64-linux-gnu-gcc \
+    AR_x86_64_unknown_linux_gnu=x86_64-linux-gnu-ar
+
+WORKDIR /src
+# Copy the toolchain pin BEFORE adding the target: the base image's default toolchain and the
+# pinned 1.98.0 are different rustup toolchains, and adding the target to the former does not
+# install it for the latter.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+RUN rustup target add x86_64-unknown-linux-gnu
+COPY crates ./crates
+COPY upstream ./upstream
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/target \
+    mkdir -p /out \
+ && cargo build --locked --release -p forgevcs-service --target x86_64-unknown-linux-gnu \
+ && x86_64-linux-gnu-strip /target/x86_64-unknown-linux-gnu/release/forgevcs-service \
+ && cp /target/x86_64-unknown-linux-gnu/release/forgevcs-service /out/forgevcs-service
+
+FROM scratch AS out
+COPY --from=builder /out/forgevcs-service /forgevcs-service

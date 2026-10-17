@@ -27,29 +27,28 @@ Vercel project culebraluxe-forgevcs
                 └── Neon Object Storage (content-addressed objects)
 ```
 
-`vercel.json` declares the service and the catch-all rewrite:
+The release path compiles on this Mac, exactly like the main application:
 
-```json
-{
-  "services": {
-    "forgevcs": {
-      "root": ".",
-      "entrypoint": "Dockerfile.vercel",
-      "runtime": "container"
-    }
-  },
-  "rewrites": [
-    { "source": "/(.*)", "destination": { "service": "forgevcs" } }
-  ]
-}
+```text
+devops/Dockerfile.build   arm64 Docker host, linux/amd64 target, cargo release
+        │  --output type=local
+        ▼
+forgevcs-service (linux/amd64) + acl.toml
+        │
+        ▼
+devops/Dockerfile.runtime  tiny Debian, binary.gz, acl.toml, uid 10001, PORT=3000
+        │
+        ▼
+vercel deploy --prod        project framework=container; Vercel builds seconds, not Rust
 ```
 
-`Dockerfile.vercel` builds a release binary in `rust:1.98-bookworm` (with `protobuf-compiler`
-for Scion's proto build), copies the binary and `acl.toml` into a slim Debian runtime, and runs
-as uid 10001. The policy is at `/etc/forgevcs/acl.toml` and `FORGEVCS_POLICY_PATH` points there.
+`scripts/deploy-forgevcs-prod.sh` performs the compile, stage, `framework=container` PATCH,
+deploy, `/ready` wait and live checks. The Vercel project has `git.deploymentEnabled: false`;
+`vercel.json` carries only that setting. `Dockerfile.vercel` remains in the tree as a
+remote-build fallback, but the normal release does not use it.
 
-The runtime image does **not** contain a compiler, Cargo or the upstream source tree. Local
-Docker and Vercel run the same portable binary; only the filename is Vercel-specific.
+The runtime image does **not** contain a compiler, Cargo or the upstream source tree. The policy
+is baked at `/etc/forgevcs/acl.toml` and `FORGEVCS_POLICY_PATH` points there.
 
 ## 3. Environment
 
@@ -79,8 +78,8 @@ authoritative copies.
 
 ```sh
 scripts/deploy-forgevcs-prod.sh --smoke
-# or, for a manual inspection:
-vercel deploy --prod --yes
+# or, for a manual inspection of the live service:
+vercel curl https://culebraluxe-forgevcs.vercel.app/health
 vercel curl https://culebraluxe-forgevcs.vercel.app/health
 vercel curl https://culebraluxe-forgevcs.vercel.app/ready
 vercel curl https://culebraluxe-forgevcs.vercel.app/version
@@ -118,6 +117,21 @@ platform "successful" message.
    domains; `vercel curl` and the automation-bypass header reach it. The public custom domain is
    not configured yet.
 
+## 5a. The local-compile release path
+
+`scripts/deploy-forgevcs-prod.sh` is the production command. It is deliberately shaped like
+`lane-deep/scripts/deploy-prod.sh`:
+
+1. clean `main`, Docker running, Vercel authenticated;
+2. `devops/Dockerfile.build` cross-compiles for linux/amd64 and exports the binary;
+3. stage `devops/Dockerfile.runtime`, the gzipped binary and `acl.toml`;
+4. PATCH `framework=container`;
+5. deploy the stage, wait for `/ready`, check `/health` `/ready` `/version`;
+6. `--smoke` runs W8.
+
+The first build downloads the Rust image and cross toolchain; later builds reuse the BuildKit
+cache and typically compile in under a minute. Vercel builds only the runtime layer.
+
 ## 6. Relationship to the main application release path
 
 CulebraLuxe already has a mature production path in the `lane-deep` tree
@@ -136,11 +150,9 @@ printed rollback line. ForgeVCS **reuses the conventions, not the project**:
   runs the W8 acceptance. It prints the rollback path.
 - **Upload hygiene.** `.vercelignore` excludes history, build output, credentials, docs and local
   scripts from the Vercel upload; `.dockerignore` does the same for the build context.
-- **Current image build is remote.** Vercel builds `Dockerfile.vercel` (about 4–6 minutes). The main
-  app instead compiles locally and ships a runtime-only image. If ForgeVCS build minutes become a
-  constraint, the same `Dockerfile.build → stage → framework=container` pattern can replace the
-  remote build without changing the guard/check script. That is a deliberate later optimization,
-  not a reason to merge projects.
+- **Image build is local now.** ForgeVCS uses the same `Dockerfile.build → stage →
+  framework=container` pattern as the main app. Vercel builds only the tiny runtime layer; the
+  Rust workspace is compiled on this Mac. `Dockerfile.vercel` is retained as a remote fallback.
 
 ## 7. Remaining gaps
 

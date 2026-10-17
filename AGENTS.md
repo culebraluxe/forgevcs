@@ -45,9 +45,10 @@ dual mode, the CulebraLuxe auth tables; `forgevcs_auth_decisions` records both r
 final decision. `SCION_ONLY` is the default; `SHADOW_COMPARE` allows what Scion allows and records
 mismatches; `DUAL_ENFORCE` requires both. `scripts/w6-authz-smoke.sh` proves 200/403 plus persisted
 rows. See `docs/W6-authorization-ab.md` and ADR-0004. **W7 — Vercel deployment — PASS
-(2026-10-17)**: separate project `culebraluxe-forgevcs`, container service from
-`Dockerfile.vercel` via `vercel.json`, policy baked at `/etc/forgevcs/acl.toml`, signing key
-through `FORGEVCS_SIGNING_KEY_PEM`; production is
+(2026-10-17)**: separate project `culebraluxe-forgevcs`, local Docker compile
+(`devops/Dockerfile.build`) + tiny runtime image (`devops/Dockerfile.runtime`), project
+`framework=container`, policy baked at `/etc/forgevcs/acl.toml`, signing key through
+`FORGEVCS_SIGNING_KEY_PEM`; production is
 https://culebraluxe-forgevcs.vercel.app. **W8 — hosted smoke — PASS (2026-10-17), M0**: the W4
 (20 checks) and W5 (17 checks) clients pass against the hosted deployment and Neon, with no Git
 in the source-control operations; `scripts/w8-hosted-smoke.sh` is the receipt. See

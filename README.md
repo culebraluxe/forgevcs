@@ -146,15 +146,16 @@ FORGEVCS_AUTH_MODE=SHADOW_COMPARE scripts/w6-authz-smoke.sh
 ## Deployment
 
 The service is its own Vercel project, `culebraluxe-forgevcs`:
-**https://culebraluxe-forgevcs.vercel.app**. `vercel.json` declares a container service using
-`Dockerfile.vercel`; the image carries the binary and `acl.toml`, runs as uid 10001, and listens
-on `PORT=3000` (non-root cannot bind 80). Production secrets include Neon, object storage, the
-service principal and `FORGEVCS_SIGNING_KEY_PEM`; see
+**https://culebraluxe-forgevcs.vercel.app**. The release is compiled locally in Docker (`devops/Dockerfile.build`, linux/amd64) and Vercel
+unpacks a tiny runtime image (`devops/Dockerfile.runtime`) with the binary and `acl.toml`; the
+project is `framework=container` and listens on `PORT=3000` (non-root cannot bind 80).
+`scripts/deploy-forgevcs-prod.sh` builds, stages, deploys, waits for `/ready`, checks the live
+service and optionally runs W8. Production secrets include Neon, object storage, the service
+principal and `FORGEVCS_SIGNING_KEY_PEM`; see
 [`docs/W7-vercel-deployment.md`](docs/W7-vercel-deployment.md).
 
 ```sh
-vercel deploy --prod --yes
-scripts/w8-hosted-smoke.sh     # W4 20 + W5 17 against the hosted service
+scripts/deploy-forgevcs-prod.sh --smoke   # local Docker compile + Vercel runtime deploy + W8
 ```
 
 ## Build and test

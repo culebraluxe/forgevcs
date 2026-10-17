@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Production deploy for the SEPARATE ForgeVCS Vercel project.
 #
-# This deliberately does not touch culebraluxe-web-fp. It follows the same release
-# conventions as scripts/deploy-prod.sh in the Culebraluxe-web tree: clean main, pinned
-# CLI, one named project, deploy, then ask the live service whether it is actually ready.
-# The image is currently built by Vercel from Dockerfile.vercel; the optional local
-# prebuilt path (the main app's Dockerfile.build -> Dockerfile.runtime pattern) can
-# replace that step without changing this guard/check shape.
+# Follows the CulebraLuxe-house release shape (scripts/deploy-prod.sh in lane-deep):
+#   1. compile locally in Docker for Vercel's linux/amd64
+#   2. stage a tiny runtime image (binary + acl.toml, no compiler)
+#   3. PATCH the project to framework=container
+#   4. deploy the stage; Vercel builds only the runtime layer
+#   5. ask the live service whether it is ready, then optionally run W8
+#
+# It deliberately never touches culebraluxe-web-fp.
 set -euo pipefail
 
 PROJECT="culebraluxe-forgevcs"
+PROJECT_ID="prj_JdIzTs6dXi9EWXmmlDoQrTL2tGLQ"
 TEAM="culebraluxe-4460s-projects"
+TEAM_ID="team_xk8vFaeSyY6CuSkS3OK55tTc"
 URL="${FORGEVCS_HOSTED_URL:-https://culebraluxe-forgevcs.vercel.app}"
 VERCEL_CLI_VERSION="${VERCEL_CLI_VERSION:-64.5.0}"
 
@@ -22,20 +26,49 @@ cd "$ROOT_DIR"
 
 [[ "$(git branch --show-current)" == "main" ]] || fail "Production deploys must run from main."
 [[ -z "$(git status --porcelain)" ]] || fail "Working tree is not clean. Commit or discard changes first."
-vc whoami >/dev/null 2>&1 || fail "Vercel CLI is not authenticated. Run: vercel login"
+command -v docker >/dev/null 2>&1 || fail "Docker is required for the local compile."
+docker info >/dev/null 2>&1 || fail "Docker is not running. Start Docker Desktop."
+vc whoami >/dev/null 2>&1 || fail "Vercel CLI is not authenticated. Run: vercel login."
 
 printf '\nForgeVCS production deploy\n  project: %s\n  team:    %s\n  commit:  %s\n\n' \
   "$PROJECT" "$TEAM" "$(git rev-parse --short HEAD)"
 
-DEPLOY_OUT="$(vc deploy --prod --yes)"
-printf '%s\n' "$DEPLOY_OUT" | tail -8
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+mkdir -p "$WORK/build" "$WORK/stage"
 
+printf '1/5 Compiling locally for linux/amd64 (first run is slow; later runs reuse the cache)...\n'
+docker build -f devops/Dockerfile.build --output "type=local,dest=$WORK/build" . \
+  || fail "The local compile failed."
+BIN="$WORK/build/forgevcs-service"
+[ -f "$BIN" ] || fail "The compile produced no forgevcs-service binary."
+file "$BIN" | grep -q 'x86-64' || fail "The binary is not linux/amd64: $(file "$BIN")"
+printf '  binary: %s\n' "$(du -h "$BIN" | cut -f1)"
+
+printf '\n2/5 Packing the runtime stage...\n'
+cp devops/Dockerfile.runtime "$WORK/stage/Dockerfile"
+gzip -9 -c "$BIN" > "$WORK/stage/forgevcs-service.gz"
+cp acl.toml "$WORK/stage/acl.toml"
+chmod -R a+rX "$WORK/stage"
+printf '  upload size: %s\n' "$(du -sh "$WORK/stage" | cut -f1)"
+
+printf '\n3/5 Making sure the project runs the application container...\n'
+printf '{"framework":"container"}' > "$WORK/project.json"
+vc api "/v9/projects/${PROJECT_ID}?teamId=${TEAM_ID}" -X PATCH --input "$WORK/project.json" >/dev/null \
+  || fail "Could not set the project to run a container."
+
+printf '\n4/5 Deploying the prebuilt runtime image...\n'
+DEPLOY_OUT="$(
+  cd "$WORK/stage" \
+    && VERCEL_ORG_ID="$TEAM_ID" VERCEL_PROJECT_ID="$PROJECT_ID" vc deploy --prod --yes
+)"
+printf '%s\n' "$DEPLOY_OUT" | tail -8
 DEPLOY_URL="$(printf '%s\n' "$DEPLOY_OUT" |
   grep -oE 'https://[^[:space:]]+\.vercel\.app' | head -1)"
 [[ -n "$DEPLOY_URL" ]] || DEPLOY_URL="$URL"
-printf 'Deployment: %s\n' "$DEPLOY_URL"
+printf '  deployment: %s\n' "$DEPLOY_URL"
 
-printf '\nWaiting for the production alias to answer /ready...\n'
+printf '\n5/5 Checking the live service...\n'
 READY=0
 for _ in $(seq 1 30); do
   BODY="$(vc curl "${URL%/}/ready" 2>/dev/null || true)"
@@ -46,12 +79,13 @@ done
 
 for path in /health /ready /version; do
   BODY="$(vc curl "${URL%/}${path}" 2>/dev/null || true)"
-  printf '%-10s %s\n' "$path" "$BODY"
+  printf '  %-9s %s\n' "$path" "$BODY"
   printf '%s' "$BODY" | grep -q "\"status\":\"$( [ "$path" = /ready ] && echo ready || echo ok )\"" \
     || fail "Live check failed for ${path}."
 done
 
 printf '\nFORGEVCS DEPLOY COMPLETE — %s is ready.\n' "$URL"
+printf 'Vercel built the runtime image only; the Rust workspace was compiled on this Mac.\n'
 printf 'Rollback: Vercel -> %s -> Deployments -> promote the previous ready deployment.\n' "$PROJECT"
 
 if [[ "${1:-}" == "--smoke" ]]; then
