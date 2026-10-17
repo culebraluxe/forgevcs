@@ -8,6 +8,15 @@ deploy (`Dockerfile.vercel`). `upstream/` is vendored Scion and is a **separate*
 workspace — the root manifest sets `exclude = ["upstream"]` so cargo resolves Scion's
 inherited fields against Scion, not against us. Do not merge the two workspaces.
 
+**Version control.** The root is a plain git repo; first commit `c37c343`, tagged
+`w1-service-shell`. Carter runs **jj in front of git** on his other repos
+(`Culebraluxe-web` is a jj+git colocated repo), so keep history linear and commits
+described rather than terse. Identity is `culebradev <culebraluxe@gmail.com>`.
+`upstream/` is committed as **plain files, not a submodule**, so the baseline SHA is
+inspectable with no network. `.env.local` and `.neon/` are gitignored and must stay
+that way — they hold live Neon credentials (`neon env pull` writes them, and rotates
+them on every run).
+
 Read these before changing anything, in this order:
 
 1. [`docs/adr/0001-infrastructure-stack.md`](docs/adr/0001-infrastructure-stack.md) — the

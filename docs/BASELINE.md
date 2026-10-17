@@ -197,8 +197,8 @@ Still open:
 1. **Where the ForgeVCS repo lives** — a fork under the org, or a fresh repo whose first
    commit is upstream `e0ffadf9` vendored as `upstream/scion-*`. W1 needs this before it
    can create the workspace shape. Docs and code live in
-   `/Users/Shared/dev/src/forgevcs` (confirmed home; `git init` done 2026-10-17, no commit
-   or remote yet).
+   `/Users/Shared/dev/src/forgevcs` (confirmed home; git repo initialized, first commit
+   `c37c343`, tag `w1-service-shell`, **no remote yet**).
 2. **Which Neon project/branch W2 tests against. RESOLVED.** Never the CulebraLuxe
    production database; the conformance suite creates and drops tables. `Projects Limit 0`
    forces branch-only use: branch `forgevcs-ci` of `CulebraluxeData`, `aws-us-east-2`
