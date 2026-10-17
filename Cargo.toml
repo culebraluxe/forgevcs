@@ -21,11 +21,13 @@ publish = false
 
 [workspace.dependencies]
 # ---- vendored Scion (read-only) ----
+scion-core = { path = "upstream/crates/scion-core" }
 scion-obs = { path = "upstream/crates/scion-obs" }
 scion-store = { path = "upstream/crates/scion-store" }
 scion-store-s3 = { path = "upstream/crates/scion-store-s3" }
 
 # ---- versions pinned to match upstream exactly, so one Cargo.lock serves both ----
+bytes = "=1.12.1"
 axum = "=0.8.9"
 tokio = { version = "=1.53.3", features = ["full"] }
 tower = { version = "=0.5.3", features = ["util"] }

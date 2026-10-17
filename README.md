@@ -58,6 +58,12 @@ upstream/scripts/check-layers.sh        # module-boundary check
 # Unpooled URL only — the pooler breaks prepared statements and session SERIALIZABLE.
 (cd upstream && SCION_TEST_CRDB_URL="$(grep '^DATABASE_URL_UNPOOLED=' ../.env.local | cut -d= -f2- | tr -d '"')" \
   cargo test -p scion-store-crdb --features postgres --test neon_conformance -- --nocapture)
+
+# W3 acceptance: the blob contract against Neon Object Storage, driven through the
+# service's own Config (path-style, HTTPS-only). Skips and passes when unconfigured.
+set -a; . ./.env.local; set +a
+FORGEVCS_BUCKET=forgevcs-objects FORGEVCS_KEY_PREFIX=forgevcs-ci \
+  cargo test -p forgevcs-service --test neon_blob_conformance -- --nocapture)
 ```
 
 Gate on **T-core**. Do not gate on `check.sh --full`: it is red upstream at the baseline SHA

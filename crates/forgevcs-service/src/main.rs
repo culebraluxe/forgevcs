@@ -5,8 +5,6 @@
 //! router (`/metrics`, `/healthz`, `/readyz`) untouched. Business endpoints
 //! arrive with W2 (metadata) and W3 (object storage).
 
-mod config;
-
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -16,7 +14,7 @@ use axum::{Json, Router};
 use scion_obs::{LogFormat, Metrics, Readiness, health_router, init_logging};
 use serde_json::{Value, json};
 
-use crate::config::Config;
+use forgevcs_service::config::{self, Config};
 
 /// Service name reported by every probe.
 const SERVICE: &str = "forgevcs";

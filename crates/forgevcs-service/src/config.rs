@@ -7,6 +7,8 @@
 
 use std::env;
 
+use scion_store_s3::S3Config;
+
 /// The vendored Scion commit this build was assembled from (`docs/BASELINE.md`).
 pub const UPSTREAM_COMMIT: &str = "e0ffadf9c755f1b99812df5beffcabdebcb38c19";
 
@@ -26,6 +28,12 @@ pub struct Config {
     pub region: Option<String>,
     /// Object-storage endpoint (`$FORGEVCS_AWS_ENDPOINT_URL_S3`, else `$AWS_ENDPOINT_URL_S3`).
     pub endpoint: Option<String>,
+    /// Object-storage access key (`$FORGEVCS_AWS_ACCESS_KEY_ID`, else `$AWS_ACCESS_KEY_ID`).
+    pub access_key: Option<String>,
+    /// Object-storage secret key (`$FORGEVCS_AWS_SECRET_ACCESS_KEY`, else `$AWS_SECRET_ACCESS_KEY`).
+    pub secret_key: Option<String>,
+    /// Prefix every object key is written under (`$FORGEVCS_KEY_PREFIX`; empty by default).
+    pub key_prefix: Option<String>,
 }
 
 impl Config {
@@ -46,6 +54,9 @@ impl Config {
             bucket: get(&["FORGEVCS_BUCKET", "FORGEVCS_S3_BUCKET"]),
             region: get(&["FORGEVCS_AWS_REGION", "AWS_REGION"]),
             endpoint: get(&["FORGEVCS_AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL_S3"]),
+            access_key: get(&["FORGEVCS_AWS_ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"]),
+            secret_key: get(&["FORGEVCS_AWS_SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"]),
+            key_prefix: get(&["FORGEVCS_KEY_PREFIX"]),
         }
     }
 
@@ -62,12 +73,37 @@ impl Config {
         if self.endpoint.is_some() && self.bucket.is_none() {
             return Err("object-storage endpoint set without FORGEVCS_BUCKET".to_owned());
         }
+        if self.access_key.is_some() != self.secret_key.is_some() {
+            return Err("object-storage credentials are half-configured: set both \
+                 FORGEVCS_AWS_ACCESS_KEY_ID and FORGEVCS_AWS_SECRET_ACCESS_KEY"
+                .to_owned());
+        }
         Ok(())
+    }
+
+    /// The object-storage client settings (W3 work order §4), or `None` when storage is not
+    /// configured.
+    ///
+    /// Path-style addressing is mandatory on Neon Object Storage — it rejects virtual-hosted
+    /// style — and plain HTTP is refused because the endpoint is HTTPS-only (ADR-0001 §7.2,
+    /// §7.3). Credentials, when present, are passed explicitly so an ambient `AWS_*` profile
+    /// on a developer machine cannot silently take over from the injected ones.
+    pub fn s3_config(&self) -> Option<S3Config> {
+        Some(S3Config {
+            endpoint: self.endpoint.clone()?,
+            bucket: self.bucket.clone()?,
+            region: self.region.clone()?,
+            access_key: self.access_key.clone(),
+            secret_key: self.secret_key.clone(),
+            allow_http: false,
+            path_style: true,
+            key_prefix: self.key_prefix.clone().unwrap_or_default(),
+        })
     }
 
     /// True when object storage is configured well enough to construct a client.
     pub fn has_object_storage(&self) -> bool {
-        self.bucket.is_some() && self.region.is_some()
+        self.s3_config().is_some()
     }
 }
 
@@ -150,6 +186,53 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         let cfg = config(&[("FORGEVCS_DATABASE_URL", "postgresql://x/y")]);
+        assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    #[test]
+    fn s3_config_is_path_style_and_https_only() {
+        let cfg = config(&[
+            ("FORGEVCS_BUCKET", "forgevcs-objects"),
+            ("AWS_REGION", "aws-us-east-2"),
+            ("AWS_ENDPOINT_URL_S3", "https://s3.example"),
+            ("AWS_ACCESS_KEY_ID", "ak"),
+            ("AWS_SECRET_ACCESS_KEY", "sk"),
+            ("FORGEVCS_KEY_PREFIX", "w3/run"),
+        ]);
+        let s3 = cfg.s3_config().expect("configured");
+        assert!(s3.path_style, "Neon rejects virtual-hosted style");
+        assert!(!s3.allow_http, "the endpoint is HTTPS-only");
+        assert_eq!(s3.endpoint, "https://s3.example");
+        assert_eq!(s3.bucket, "forgevcs-objects");
+        assert_eq!(s3.region, "aws-us-east-2");
+        assert_eq!(s3.access_key.as_deref(), Some("ak"));
+        assert_eq!(s3.secret_key.as_deref(), Some("sk"));
+        assert_eq!(s3.key_prefix, "w3/run");
+    }
+
+    #[test]
+    fn s3_config_needs_an_endpoint_and_defaults_the_prefix() {
+        let cfg = config(&[
+            ("FORGEVCS_BUCKET", "forgevcs-objects"),
+            ("AWS_REGION", "aws-us-east-2"),
+        ]);
+        assert!(!cfg.has_object_storage());
+        assert!(cfg.s3_config().is_none());
+
+        let cfg = config(&[
+            ("FORGEVCS_BUCKET", "forgevcs-objects"),
+            ("AWS_REGION", "aws-us-east-2"),
+            ("AWS_ENDPOINT_URL_S3", "https://s3.example"),
+        ]);
+        assert_eq!(cfg.s3_config().expect("configured").key_prefix, "");
+    }
+
+    #[test]
+    fn validate_rejects_half_configured_credentials() {
+        let cfg = config(&[("AWS_ACCESS_KEY_ID", "ak")]);
+        assert!(cfg.validate().is_err(), "secret key missing");
+
+        let cfg = config(&[("AWS_ACCESS_KEY_ID", "ak"), ("AWS_SECRET_ACCESS_KEY", "sk")]);
         assert_eq!(cfg.validate(), Ok(()));
     }
 }

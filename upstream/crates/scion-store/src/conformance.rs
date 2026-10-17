@@ -1699,3 +1699,139 @@ where
         fails.join("\n")
     );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Extended blob suite (W3): the cases the base suite leaves implicit
+// ---------------------------------------------------------------------------------------------
+
+async fn blob_duplicate_put(s: Arc<dyn BlobStore>) -> CaseResult {
+    let k = "conf/ext/r/1/b/aa/dup";
+    ok(s.put(k, Bytes::from_static(b"same")).await, "first put")?;
+    ok(s.put(k, Bytes::from_static(b"same")).await, "duplicate put")?;
+    ensure_eq!(
+        ok(s.get(k).await, "get")?,
+        Some(Bytes::from_static(b"same")),
+        "duplicate put kept the bytes"
+    );
+    ensure_eq!(
+        ok(s.list("conf/ext/r/1/b/aa/").await, "list")?,
+        vec![k.to_owned()],
+        "duplicate put is one key, not two"
+    );
+    // `put` may overwrite (blob.rs); content-addressed keys make it idempotent in practice, so
+    // an overwrite must replace the value and still be a single key.
+    ok(s.put(k, Bytes::from_static(b"newer")).await, "overwrite")?;
+    ensure_eq!(
+        ok(s.get(k).await, "get")?,
+        Some(Bytes::from_static(b"newer")),
+        "overwrite wins"
+    );
+    ensure_eq!(
+        ok(s.list("conf/ext/r/1/b/aa/").await, "list")?.len(),
+        1,
+        "overwrite is not a second key"
+    );
+    Ok(())
+}
+
+async fn blob_zero_byte(s: Arc<dyn BlobStore>) -> CaseResult {
+    let k = "conf/ext/r/1/b/aa/empty";
+    ok(s.put(k, Bytes::new()).await, "put empty")?;
+    ensure_eq!(
+        ok(s.get(k).await, "get")?,
+        Some(Bytes::new()),
+        "an empty value reads Some(empty), not None"
+    );
+    ensure!(ok(s.exists(k).await, "exists")?, "empty object exists");
+    ensure_eq!(
+        ok(s.list("conf/ext/r/1/b/aa/").await, "list")?,
+        vec![k.to_owned()],
+        "empty object is listed"
+    );
+    let to = "conf/ext/q/1/b/aa/empty";
+    ok(s.copy(k, to).await, "copy empty")?;
+    ensure_eq!(
+        ok(s.get(to).await, "get copy")?,
+        Some(Bytes::new()),
+        "copied empty value"
+    );
+    ok(s.delete(k).await, "delete")?;
+    ensure_eq!(
+        ok(s.get(k).await, "get")?,
+        None,
+        "deleted empty object reads None"
+    );
+    Ok(())
+}
+
+async fn blob_large_object(s: Arc<dyn BlobStore>) -> CaseResult {
+    // 12 MiB: past the 1 MiB round trip in `blob_put_get` and past `object_store`'s multipart
+    // threshold, so a real S3 backend takes its multi-part path. The repo layer's own
+    // `max_blob_bytes` ceiling (100 MiB) is `store_repo.rs`, not here.
+    const SIZE: usize = 12 * 1024 * 1024;
+    let data: Vec<u8> = (0..SIZE).map(|i| (i % 251) as u8).collect();
+    let k = "conf/ext/r/1/b/aa/large";
+    ok(s.put(k, Bytes::from(data.clone())).await, "put 12 MiB")?;
+    ensure!(
+        ok(s.get(k).await, "get 12 MiB")?.as_deref() == Some(&data[..]),
+        "12 MiB value round trip"
+    );
+    ensure!(ok(s.exists(k).await, "exists")?, "large object exists");
+    ok(s.delete(k).await, "delete 12 MiB")?;
+    ensure_eq!(
+        ok(s.get(k).await, "get")?,
+        None,
+        "deleted large object reads None"
+    );
+    Ok(())
+}
+
+async fn blob_missing_object(s: Arc<dyn BlobStore>) -> CaseResult {
+    // The base suite hits these inside other cases; this asserts the whole read path at once.
+    let k = "conf/ext/r/1/b/aa/absent";
+    ensure_eq!(
+        ok(s.get(k).await, "get missing")?,
+        None,
+        "get of a missing key is None, not an error"
+    );
+    ensure!(
+        !ok(s.exists(k).await, "exists missing")?,
+        "missing key does not exist"
+    );
+    ensure!(
+        ok(s.list("conf/ext/r/1/b/aa/").await, "list missing")?.is_empty(),
+        "missing key is not listed"
+    );
+    expect_err(
+        s.copy(k, "conf/ext/q/1/b/aa/absent").await,
+        ErrorCode::NotFound,
+        "copy of a missing key",
+    )?;
+    ok(s.delete(k).await, "delete missing")?;
+    Ok(())
+}
+
+/// The W3 additions to section 6 of `docs/contracts/storage-semantics.md` (work order §5):
+/// duplicate and overwriting puts, zero-byte values, a value past the multipart threshold, and
+/// a missing key asserted across the whole read path.
+///
+/// Separate from [`blob_store_suite`] on purpose: that suite stays byte-comparable with the
+/// upstream run recorded in `docs/BASELINE.md`. The in-memory backends run both
+/// (`tests/store_conformance.rs`), so these cases are proven without a real bucket too.
+pub async fn blob_store_suite_extended<F, Fut>(factory: F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn BlobStore>>,
+{
+    let mut fails: Vec<String> = Vec::new();
+    run_case!(fails, factory, "duplicate_put", blob_duplicate_put);
+    run_case!(fails, factory, "zero_byte", blob_zero_byte);
+    run_case!(fails, factory, "large_object", blob_large_object);
+    run_case!(fails, factory, "missing_object", blob_missing_object);
+    assert!(
+        fails.is_empty(),
+        "blob_store_suite_extended: {} case(s) failed:\n{}",
+        fails.len(),
+        fails.join("\n")
+    );
+}

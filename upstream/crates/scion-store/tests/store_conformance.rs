@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)] // test crate
 
 use scion_core::FaultRegistry;
-use scion_store::conformance::{blob_store_suite, meta_store_suite};
+use scion_store::conformance::{blob_store_suite, blob_store_suite_extended, meta_store_suite};
 use scion_store::{
     BlobStore, Counters, InstrumentedBlob, InstrumentedMeta, MemBlobStore, MemMetaStore,
     MemOptions, MetaStore,
@@ -50,6 +50,24 @@ async fn blob_store_suite_on_mem() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn blob_store_suite_on_instrumented_mem() {
     blob_store_suite(|| async {
+        Arc::new(InstrumentedBlob::new(
+            MemBlobStore::new(),
+            Arc::new(Counters::default()),
+            FaultRegistry::new(),
+        )) as Arc<dyn BlobStore>
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blob_store_suite_extended_on_mem() {
+    blob_store_suite_extended(|| async { Arc::new(MemBlobStore::new()) as Arc<dyn BlobStore> })
+        .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blob_store_suite_extended_on_instrumented_mem() {
+    blob_store_suite_extended(|| async {
         Arc::new(InstrumentedBlob::new(
             MemBlobStore::new(),
             Arc::new(Counters::default()),

@@ -46,7 +46,7 @@ DIRTY=$(git -C "$ROOT" status --porcelain | wc -l | tr -d ' ')
   echo "== repo       $ROOT"
   echo "== commit     $(git -C "$ROOT" rev-parse --short HEAD) on $(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
   echo "== dirty      $DIRTY uncommitted path(s)"
-  echo "== target dir ${CARGO_TARGET_DIR:-<repo default: upstream/target>}"
+  echo "== target dir ${CARGO_TARGET_DIR:-<cargo config default>}"
   echo "== started    $(date -u +%FT%TZ)"
 } >>"$LOG"
 

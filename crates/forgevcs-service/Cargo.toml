@@ -16,6 +16,8 @@ path = "src/main.rs"
 
 [dependencies]
 scion-obs = { workspace = true }
+scion-store = { workspace = true }
+scion-store-s3 = { workspace = true }
 axum = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -25,3 +27,5 @@ anyhow = { workspace = true }
 
 [dev-dependencies]
 tower = { workspace = true }
+bytes = { workspace = true }
+scion-core = { workspace = true }

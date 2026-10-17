@@ -1,8 +1,9 @@
 # W3 — Neon Object Storage work order: what is already done, what is actually left
 
-**Status: code-side analysis complete; provisioning BLOCKED on Neon authentication.**
-Work order received 2026-10-16 (Carter). This file maps each clause of that order onto the
-vendored Scion source so we do not rebuild a storage layer that already exists.
+**Status: code landed and building (2026-10-17); Neon run pending.** Provisioning is no
+longer blocked (see §7). Work order received 2026-10-16 (Carter). This file maps each clause
+of that order onto the vendored Scion source so we do not rebuild a storage layer that
+already exists, then records the ForgeVCS delta.
 
 Upstream at `e0ffadf9` (`FORGESC-SCION-UPSTREAM-BASELINE`). All line references below were
 read from the source, not inferred.
@@ -82,7 +83,7 @@ read another's objects. Vercel gets the four `AWS_*` vars, never `DATABASE_URL_U
 `S3Config` must be built from the environment, with no committed secrets:
 
 ```text
-bucket     = FORGEVCS_BUCKET       (default: forgevcs-objects)
+bucket     = FORGEVCS_BUCKET       (required; `forgevcs-objects` is the bucket §3 provisions)
 endpoint   = AWS_ENDPOINT_URL_S3
 region     = AWS_REGION
 access     = AWS_ACCESS_KEY_ID
@@ -105,13 +106,14 @@ This is the entire ForgeVCS delta for clause §3 of the work order.
 | put new object, get existing | covered (`put_get`) |
 | concurrent reads/writes | covered (`concurrent`) |
 | corrupt object → hard integrity error | covered, at the object-repo layer: `store_repo.rs:557` |
-| identical object uploaded twice | covered at repo layer (`InsertOutcome::AlreadyExists`, `conformance.rs:238`) — **not** asserted at the blob layer |
-| missing object | partially: `get` → `None` inside `put_get`; make it explicit |
-| **zero-byte object** | **not covered anywhere** — add |
-| **large object** (above inline threshold, near `max_blob_bytes` = 100 MiB) | **not covered** — add |
+| identical object uploaded twice | repo layer covered (`InsertOutcome::AlreadyExists`, `conformance.rs:238`); blob layer added in W3 — `blob_store_suite_extended` case `duplicate_put` (§8) |
+| missing object | covered explicitly in W3 — case `missing_object` (§8) |
+| **zero-byte object** | added in W3 — case `zero_byte` (§8) |
+| **large object** (above the inline threshold; 12 MiB, past the S3 multipart threshold) | added in W3 — case `large_object` (§8). The repo layer's own 100 MiB `max_blob_bytes` ceiling is `store_repo.rs:354` |
 
-So the honest test delta is **three additions** — explicit blob-level duplicate `put`,
-zero-byte, and large-object cases — plus running the existing suites against Neon.
+So the honest test delta was **three additions** — explicit blob-level duplicate `put`,
+zero-byte, and large-object cases — plus running the existing suites against Neon. W3 landed
+those as a separate `blob_store_suite_extended`, which the in-memory backends run too.
 
 ## 6. Acceptance mapping (work order §10)
 
@@ -142,5 +144,44 @@ authentication works, so the unblocking order is:
 3. ~~Run `blob_store_suite` against it **before** writing adapter code~~ **Platform half
    answered 2026-10-17** by raw SigV4 probes: `CopyObject` returns 200 (ADR §7.2). The
    suite run still happens in W3 — now as regression, not discovery.
+
+## 8. What W3 added (2026-10-17)
+
+Four additions, no adapter rewrite. The vendor delta stays additive: one new suite, two new
+tests, no change to any existing case.
+
+| what | where | why |
+| --- | --- | --- |
+| `blob_store_suite_extended` | `upstream/crates/scion-store/src/conformance.rs` | §5's three missing cases — explicit duplicate `put`, zero-byte, and a value past the multipart threshold (12 MiB) — plus a missing key asserted across the whole read path. A separate entry point so `blob_store_suite` stays byte-comparable with the W0 recording. |
+| the same suite on the in-memory backends | `upstream/crates/scion-store/tests/store_conformance.rs` | the new cases are proven hermetically (raw and instrumented), so a failure against Neon is a backend or config problem, not a broken case |
+| `Config::s3_config()` | `crates/forgevcs-service/src/config.rs` | §4's client settings from the environment: `path_style = true` (Neon rejects virtual-hosted style), `allow_http = false`, credentials passed explicitly so an ambient `AWS_*` profile cannot take over, and a half-configured key pair rejected by `validate()` |
+| `neon_blob_conformance` | `crates/forgevcs-service/tests/neon_blob_conformance.rs` | §6's acceptance: both suites plus one round trip at the real key layout through two independent clients (strong read-after-write), built from the *service's* `Config` |
+
+The crate became a **library plus a thin binary** (`src/lib.rs` exposes `config`; `main.rs`
+keeps the router) purely so an integration test can drive the same configuration code the
+container runs. The deployed binary is unchanged.
+
+Acceptance command — hermetic first, then the bucket:
+
+```sh
+cargo test -p forgevcs-service --all-targets          # skips the Neon tests when unconfigured
+set -a; . ./.env.local; set +a
+cargo test -p forgevcs-service --test neon_blob_conformance -- --nocapture
+```
+
+Every run writes under its own key prefix (`w3-<nanos>-<case>` under `FORGEVCS_KEY_PREFIX`),
+so repeated or concurrent runs cannot see each other's objects, which is also the suite's
+"fresh empty store per case" precondition. Nothing needs cleaning up first.
+
+### Result (2026-10-17)
+
+`cargo test -p forgevcs-service --test neon_blob_conformance` against the `forgevcs-ci`
+branch's bucket: **3 passed / 0 failed, 28.62 s** — the base suite (4 cases), the extended
+suite (duplicate put, zero byte, 12 MiB multipart, missing object), and the cross-client
+round trip at the real key layout. No `SKIP:` lines, so nothing was silently gated off.
+
+The same suites run on the in-memory backends (`store_conformance`, **7/7**), which is what
+makes a Neon failure diagnosable: the cases themselves are already proven.
+
 
 
