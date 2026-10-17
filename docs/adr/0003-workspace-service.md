@@ -43,8 +43,10 @@ Three options were considered:
   disk), performs the operation, and closes it. There is no long-lived in-memory WC handle.
 - The registry is per engine, but it is not the source of truth. `forgevcs_workspaces` stores
   each workspace's `WcState` JSON and `forgevcs_workspace_files` stores its dirty-file overlay.
-  A UUID is restored on demand: an instance that does not have it checks out the persisted base,
-  rewrites the overlay, and continues. The temp directory is a cache.
+  A UUID is restored per request: the service checks out the persisted base, rewrites the
+  overlay, serves the operation, and drops the temp directory. There is no cross-request
+  in-memory workspace, because another instance may have changed the overlay.
+  The temp directory is a request-scoped cache.
 - `submit` commits with `WorkingCopy::commit_with_report`, then either lands on the requested
   ref or stops at the unlanded changeset (`mode: "none"`). `destroy` removes the registry entry
   and its temporary directory.

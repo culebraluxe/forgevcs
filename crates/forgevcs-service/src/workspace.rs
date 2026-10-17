@@ -12,7 +12,6 @@
 //! workspace from its persisted base state and overlay before serving it. Vercel's scale-to-zero
 //! and multi-instance routing therefore do not lose a workspace ID.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -110,8 +109,6 @@ pub struct WorkspaceService {
     client: ScionClient,
     repo: String,
     pool: Pool,
-    entries: Mutex<HashMap<String, Arc<Entry>>>,
-    restore: Mutex<()>,
 }
 
 const CREATE_WORKSPACES: &str = r#"
@@ -152,25 +149,14 @@ impl WorkspaceService {
             client,
             repo: repo.to_owned(),
             pool,
-            entries: Mutex::new(HashMap::new()),
-            restore: Mutex::new(()),
         })
     }
 
     async fn entry(&self, id: &str) -> WsResult<Arc<Entry>> {
-        if let Some(entry) = self.entries.lock().await.get(id).cloned() {
-            return Ok(entry);
-        }
-        let _guard = self.restore.lock().await;
-        if let Some(entry) = self.entries.lock().await.get(id).cloned() {
-            return Ok(entry);
-        }
-        let entry = Arc::new(self.restore_entry(id).await?);
-        self.entries
-            .lock()
-            .await
-            .insert(id.to_owned(), Arc::clone(&entry));
-        Ok(entry)
+        // Deliberately no cross-request cache: another Vercel instance may have changed the
+        // persisted overlay since this container last looked. Each request restores from Neon,
+        // and the TempDir is dropped when the request ends.
+        Ok(Arc::new(self.restore_entry(id).await?))
     }
 
     async fn restore_entry(&self, id: &str) -> WsResult<Entry> {
@@ -317,13 +303,7 @@ impl WorkspaceService {
             )
             .await
             .map_err(internal)?;
-        self.entries.lock().await.insert(
-            id.clone(),
-            Arc::new(Entry {
-                dir,
-                lock: Mutex::new(()),
-            }),
-        );
+        drop(dir);
         Ok((id, state))
     }
 
@@ -582,9 +562,6 @@ impl WorkspaceService {
             return Err(Status::not_found(format!(
                 "workspace {id:?} does not exist"
             )));
-        }
-        if let Some(entry) = self.entries.lock().await.remove(id) {
-            drop(entry);
         }
         Ok(())
     }

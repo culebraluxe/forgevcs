@@ -29,7 +29,7 @@ REST /repos/{repo}/workspaces/...
         ▼
 WorkspaceService (per Engine)
         │
-        ├── registry: workspace id -> TempDir + lock
+        ├── per-request TempDir (restored from Neon; no cross-request cache)
         ├── forgevcs_workspaces: id, repo, WcState JSON
         ├── forgevcs_workspace_files: dirty path, mode, bytes
         │
@@ -163,7 +163,11 @@ passed 1343/0. No upstream file changed; the failure is recorded here rather tha
    Vercel routed a later request to another container; the fix persists `WcState` and the
    dirty-file overlay in Neon and restores the temp directory on demand. The 404-for-a-lost-
    workspace semantics was not good enough once W8 ran on the real platform.
-5. **The internal token lives 24 hours.** A process older than that cannot open new workspaces
+5. **A cross-request workspace cache was wrong on Vercel.** The first persistence fix still
+   cached a restored workspace in memory. A repeat W8 run wrote a file on one instance and then
+   read clean status from a stale cache on another. Each request now restores from Neon and drops
+   its TempDir; the working copy is a request-scoped cache, not a service-wide one.
+6. **The internal token lives 24 hours.** A process older than that cannot open new workspaces
    until restart. The Vercel container's 5-minute idle scale-down makes this theoretical for M0;
    a long-lived deployment needs a refresh path or a non-expiring internal identity.
 
