@@ -20,7 +20,8 @@ decision of authority.
 
 - Upstream: `CarterT27/scion` @ `e0ffadf9c755f1b99812df5beffcabdebcb38c19`, tagged
   `FORGESC-SCION-UPSTREAM-BASELINE` in the source repo.
-- Vendored **with no source modifications**; `upstream/.git` was excluded, nothing else was.
+- Vendored **with no source modifications**: `rsync -a --exclude .git --exclude target`, so
+  only VCS metadata and build output were dropped. No file in `upstream/` was edited.
 - Scion is **Apache-2.0**; its licence is retained at `upstream/LICENSE` and mirrored at
   `LICENSE`. Copyright remains with Scion's authors.
 - Changes to vendored code, when they start, are listed here. As of W1 there are none:
