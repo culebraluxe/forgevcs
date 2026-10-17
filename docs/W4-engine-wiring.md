@@ -362,19 +362,18 @@ exited 0.
    than the encoded blob. `tree` names are UTF-8 text; a repository path that is not valid UTF-8
    is rendered lossily, so a byte-exact client should use `changesets/{id}`/`diff` object ids
    rather than the display name.
-7. **A restart knows only the default repo.** Repos initialized on demand live in `Engines`
-   for the process lifetime; the `repos` rows are durable, but nothing enumerates them at
-   boot. A read for a non-default repo after a restart is 404 until `init` is called again
-   (which is idempotent and cheap). Fixing this properly is the registry/restart work in
-   §8.6, not a read-path auto-create — a typo must not mint a repository.
+7. **A process knew only the repositories it had booted.** Repos initialized on demand lived in
+   `Engines` for the process lifetime; the `repos` rows were durable, but nothing enumerated
+   them. The hosted W8 run made this visible when Vercel routed a later read to another
+   container. The fix keeps the "a typo must not mint a repository" rule: `repo_engine` first
+   checks the `repos` row, and only then boots the engine on demand. The first hosted run that
+   needed it is recorded in `docs/W8-hosted-smoke.md` §3.
 
 ### 8.6 Remaining gaps
 
 - **Repository deletion** has no upstream primitive and no façade endpoint. Deleting a repo
   means deleting every Scion table row for its `repo_id` plus the object keys; that needs a
   reviewed destructive path, not an ad-hoc `DELETE`.
-- **Restart recovery** for non-default repositories: either a `forgevcs_repos` registry read
-  at boot or a lazy boot that first proves the `repos` row exists.
 - **Human login**: `FORGEVCS_GITHUB_CLIENT_ID` is still unset, so only service principals can
   mint tokens.
 - **The gRPC layers do not wrap the façade.** `ServerApp`'s per-principal rate limiter, load

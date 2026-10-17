@@ -83,8 +83,12 @@ rows and object keys to the branch; the names are unique so the history is not a
 6. **Vercel routed a workspace request to a different container.** The second hosted W8 run
    created a workspace, then a later `diff` reached another instance and answered 404 because the
    registry was process-local. The fix persists `WcState` and the dirty-file overlay in Neon
-   (`forgevcs_workspaces`, `forgevcs_workspace_files`) and restores them on demand. The W8 run
-   then passed again. This is exactly the kind of platform fact a hosted smoke exists to find.
+   (`forgevcs_workspaces`, `forgevcs_workspace_files`) and restores them on demand.
+7. **The repository registry had the same process-local assumption.** After the workspace fix,
+   a repository initialized on one container answered 404 on the next request that reached
+   another. `repo_engine` now checks the `repos` row in Neon and boots that engine on demand;
+   a name with no row still answers 404, so a typo cannot create a repository. Both fixes came
+   from running the hosted smoke, not from the local one, which is why W8 exists.
 
 ## 4. M0 checklist
 

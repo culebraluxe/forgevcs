@@ -10,7 +10,7 @@ use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// Build a small pool for ForgeVCS-owned tables. The URL must be a Postgres/Neon URL; TLS is
 /// mandatory because Neon rejects plaintext.
-pub(crate) fn build_pool(url: &str) -> Result<Pool, String> {
+pub fn build_pool(url: &str) -> Result<Pool, String> {
     let pg: tokio_postgres::Config = url
         .parse()
         .map_err(|error| format!("invalid database url: {error}"))?;

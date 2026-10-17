@@ -19,6 +19,8 @@ use scion_server::{handlers, interceptor};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use deadpool_postgres::Pool;
+
 use crate::authz::AuthorizationService;
 use crate::config::{self, Config};
 use crate::engine::{Engine, Engines};
@@ -40,6 +42,8 @@ pub struct AppState {
     pub config: Config,
     /// The Scion/Culebra authorization A/B harness (W6).
     pub authz: Arc<AuthorizationService>,
+    /// Pool for the `repos` registry, used to boot an existing repository on demand.
+    pub db: Option<Pool>,
 }
 
 impl AppState {
@@ -339,6 +343,10 @@ mod tests {
             engines,
             repo: config.repo().to_owned(),
             authz: Arc::new(AuthorizationService::from_config(&config).await),
+            db: config
+                .database_url
+                .as_deref()
+                .and_then(|url| crate::db::build_pool(url).ok()),
             config,
         }))
     }
@@ -431,6 +439,10 @@ mod tests {
             engines,
             repo: config.repo().to_owned(),
             authz: Arc::new(AuthorizationService::from_config(&config).await),
+            db: config
+                .database_url
+                .as_deref()
+                .and_then(|url| crate::db::build_pool(url).ok()),
             config,
         }));
         let (status, _, body) = send(

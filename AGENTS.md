@@ -30,13 +30,14 @@ verified `CallerCtx`. **W4 part 3 — business façade — PASS (2026-10-17)**: 
 map JSON onto the vendored handlers in-process; `cargo test -p forgevcs-service --lib --bins` 30
 passed, clippy 0, the upstream gate is unchanged at 1343, and `scripts/engine-smoke.sh` runs the
 20-check `scripts/w4-acceptance.py` client against Neon (A → B, parent, history, both file
-versions, tree, diff, merge-base) and exits 0. Repository deletion, restart recovery for
-non-default repos, human login, and the gRPC layers the façade skips are the open W4 gaps
+versions, tree, diff, merge-base) and exits 0. Repository deletion, human login, and the
+gRPC layers the façade skips are the open W4 gaps
 (`docs/W4-engine-wiring.md` §8.6). See `docs/W4-engine-wiring.md`. **W5 — WorkspaceService —
 PASS (2026-10-17)**: `WorkspaceService` wraps the vendored `scion-wc` over a private
 Unix-socket gRPC surface (ADR-0003); `POST/GET/PUT/DELETE /repos/{repo}/workspaces…` cover
-create/materialize/status/read/write/delete/diff/submit/destroy. Workspaces are disposable
-temp directories; canonical history stays in Neon. `scripts/w5-acceptance.py` passes 17 checks
+create/materialize/status/read/write/delete/diff/submit/destroy. Workspace state and its
+dirty-file overlay are persisted in Neon so any instance can restore an ID; the temp
+directory is a cache, and canonical source history stays in Neon changesets/objects. `scripts/w5-acceptance.py` passes 17 checks
 (create → write → diff → submit → destroy → recreate; history survives), the service has 30
 tests, clippy is 0, and the upstream gate is 1343. See `docs/W5-workspace-service.md`. **W6 —
 authorization A/B — PASS (2026-10-17)**: every business request evaluates Scion and, in shadow or

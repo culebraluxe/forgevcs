@@ -31,6 +31,10 @@ async fn main() -> anyhow::Result<()> {
     let engines = Arc::new(Engines::boot(&config).await);
     let ready = EngineHealth::start(config.clone(), Arc::clone(&engines)).await;
     let authz = Arc::new(AuthorizationService::from_config(&config).await);
+    let db = config
+        .database_url
+        .as_deref()
+        .and_then(|url| forgevcs_service::db::build_pool(url).ok());
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(
@@ -48,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
         repo,
         config,
         authz,
+        db,
     });
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown())

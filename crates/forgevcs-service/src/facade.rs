@@ -83,17 +83,55 @@ fn valid_repo_name(name: &str) -> bool {
 
 /// The engine for an addressed repository, or 404. Reads never create a repository: a typo in
 /// a path must not mint one.
-fn repo_engine(state: &AppState, repo: &str) -> Result<Arc<Engine>, Response> {
-    state.engine_for(repo).ok_or_else(|| {
+async fn repo_engine(state: &AppState, repo: &str) -> Result<Arc<Engine>, Response> {
+    if let Some(engine) = state.engine_for(repo) {
+        return Ok(engine);
+    }
+    // The process may not have booted this repository yet (a different Vercel instance, or a
+    // restart). Boot it only if the `repos` row already exists, so a typo still cannot create a
+    // repository as a side effect of a read.
+    let Some(db) = &state.db else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "repository registry is unavailable",
+        ));
+    };
+    let client = db.get().await.map_err(|error| {
         error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            &format!("repository registry connection: {error}"),
+        )
+    })?;
+    let exists = client
+        .query_opt("SELECT 1 FROM repos WHERE name = $1", &[&repo])
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                &format!("repository registry query: {error}"),
+            )
+        })?;
+    if exists.is_none() {
+        return Err(error_response(
             StatusCode::NOT_FOUND,
             "not_found",
-            &format!(
-                "repository {repo:?} is not initialized in this process; \
-                 POST /repos/{repo}/init first"
-            ),
-        )
-    })
+            &format!("repository {repo:?} does not exist; POST /repos/{repo}/init first"),
+        ));
+    }
+    state
+        .engines
+        .get_or_boot(&state.config, repo)
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                &format!("booting repository {repo:?}: {error:#}"),
+            )
+        })
 }
 
 fn bad_json(rejection: JsonRejection) -> Response {
@@ -332,7 +370,7 @@ pub(crate) async fn refs(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -518,7 +556,7 @@ pub(crate) async fn commits(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -688,7 +726,7 @@ pub(crate) async fn pull(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -837,7 +875,7 @@ pub(crate) async fn changeset(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -922,7 +960,7 @@ pub(crate) async fn file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1013,7 +1051,7 @@ pub(crate) async fn tree(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1113,7 +1151,7 @@ pub(crate) async fn diff(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1213,7 +1251,7 @@ pub(crate) async fn merge_base(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1572,7 +1610,7 @@ pub(crate) async fn push(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1846,7 +1884,7 @@ pub(crate) async fn workspace_create(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1904,7 +1942,7 @@ pub(crate) async fn workspace_status(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1944,7 +1982,7 @@ pub(crate) async fn workspace_materialize(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -1987,7 +2025,7 @@ pub(crate) async fn workspace_read_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -2029,7 +2067,7 @@ pub(crate) async fn workspace_write_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -2091,7 +2129,7 @@ pub(crate) async fn workspace_delete_file(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -2132,7 +2170,7 @@ pub(crate) async fn workspace_diff(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -2186,7 +2224,7 @@ pub(crate) async fn workspace_submit(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
@@ -2248,7 +2286,7 @@ pub(crate) async fn workspace_destroy(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let engine = match repo_engine(&state, &repo) {
+    let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(response) => return response,
     };
