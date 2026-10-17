@@ -1,0 +1,12 @@
+# Workspace cargo configuration (P00).
+
+[net]
+# crates.io downloads occasionally stall; retry instead of failing the build.
+retry = 5
+
+[term]
+color = "auto"
+
+[build]
+# Incremental artifacts are large and this workspace is built from scratch in CI anyway.
+incremental = false

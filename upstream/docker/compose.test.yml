@@ -1,0 +1,37 @@
+# External test backends for scripts/test-external.sh (docs/PLAN.md section 3.3).
+#   docker compose -f docker/compose.test.yml up -d --wait
+#   docker compose -f docker/compose.test.yml down -v
+name: scion-test
+
+services:
+  cockroach:
+    image: cockroachdb/cockroach:v24.3.5
+    # v24.3 rejects a non-localhost --listen-addr in insecure mode; the default listens on all
+    # interfaces of the container.
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+    healthcheck:
+      test: ["CMD", "cockroach", "sql", "--insecure", "--host=localhost:26257", "-e", "SELECT 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # The official minio/minio and minio/mc images are no longer pullable anonymously (Docker Hub
+  # and quay.io); the Bitnami legacy MinIO image is used instead. It creates the bucket itself.
+  minio:
+    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_DEFAULT_BUCKETS: scion-test
+      MINIO_API_PORT_NUMBER: "9000"
+      MINIO_CONSOLE_PORT_NUMBER: "9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/ready"]
+      interval: 2s
+      timeout: 5s
+      retries: 60

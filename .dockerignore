@@ -1,0 +1,10 @@
+target/
+upstream/target/
+.git/
+node_modules/
+.vercel/
+.env
+.env.*
+*.log
+docs/
+.agents/

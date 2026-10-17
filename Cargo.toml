@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/forgevcs-service"]
+# `upstream/` has its own [workspace] root and its own gate. Without this,
+# cargo would auto-claim the vendored crates as members of *this* workspace and
+# try to resolve their `version.workspace = true` inheritance here.
+exclude = ["upstream"]
+
+# ForgeVCS is its own workspace. `upstream/` is vendored Scion and remains a
+# *separate* cargo workspace: its own scripts/check.sh re-roots itself to
+# `upstream/`, so the W0 gate keeps meaning exactly what it meant before
+# vendoring (same crates, same tests, same layering rules). We consume it
+# read-only, by path. See docs/adr/0001-infrastructure-stack.md §6.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+publish = false
+
+[workspace.dependencies]
+# ---- vendored Scion (read-only) ----
+scion-obs = { path = "upstream/crates/scion-obs" }
+scion-store = { path = "upstream/crates/scion-store" }
+scion-store-s3 = { path = "upstream/crates/scion-store-s3" }
+
+# ---- versions pinned to match upstream exactly, so one Cargo.lock serves both ----
+axum = "=0.8.9"
+tokio = { version = "=1.53.3", features = ["full"] }
+tower = { version = "=0.5.3", features = ["util"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+anyhow = "=1.0.104"
+tracing = "=0.1.44"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
