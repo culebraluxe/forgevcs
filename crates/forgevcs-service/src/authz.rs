@@ -13,14 +13,12 @@
 //! is provisional and recorded in `docs/adr/0004-authorization-ab.md`.
 
 use std::collections::HashSet;
-use std::time::Duration;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod, Runtime};
+use deadpool_postgres::Pool;
 use scion_core::Principal;
 use scion_object::RepoPath;
 use scion_policy::Policy;
 use scion_proto::status_from_error;
-use tokio_postgres_rustls::MakeRustlsConnect;
 use tonic::Status;
 
 use crate::config::Config;
@@ -167,7 +165,7 @@ impl AuthorizationService {
             );
             return Self { mode, pool: None };
         };
-        let pool = match build_pool(url) {
+        let pool = match crate::db::build_pool(url) {
             Ok(pool) => pool,
             Err(error) => {
                 tracing::error!(%error, "Culebra authorization pool did not start");
@@ -355,28 +353,6 @@ impl AuthorizationService {
             .map_err(|error| error.to_string())?;
         Ok(())
     }
-}
-
-fn build_pool(url: &str) -> Result<Pool, String> {
-    let pg: tokio_postgres::Config = url
-        .parse()
-        .map_err(|error| format!("invalid database url: {error}"))?;
-    let tls = scion_store_crdb::dialect::tls_client_config()
-        .ok_or_else(|| "no TLS client configuration for Neon".to_owned())?;
-    let manager = Manager::from_config(
-        pg,
-        MakeRustlsConnect::new((*tls).clone()),
-        ManagerConfig {
-            recycling_method: RecyclingMethod::Fast,
-        },
-    );
-    Pool::builder(manager)
-        .max_size(4)
-        .runtime(Runtime::Tokio1)
-        .create_timeout(Some(Duration::from_secs(10)))
-        .recycle_timeout(Some(Duration::from_secs(5)))
-        .build()
-        .map_err(|error| error.to_string())
 }
 
 async fn ensure_schema(pool: &Pool) -> Result<(), String> {

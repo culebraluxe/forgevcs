@@ -2,9 +2,9 @@
 
 **Status:** complete 2026-10-17. One `WorkspaceService` wraps the vendored `scion-wc`
 implementation over a private Unix-socket gRPC surface. A workspace is a disposable
-materialization; canonical state stays in Neon. The 17-check `scripts/w5-acceptance.py` client
-creates, writes, diffs, submits, destroys, and recreates a workspace to prove history survives
-disposal.
+materialization; its state and dirty-file overlay are persisted in Neon, so any container can
+restore it after scale-to-zero. The 17-check `scripts/w5-acceptance.py` client creates, writes,
+diffs, submits, destroys, and recreates a workspace to prove history survives disposal.
 
 ## 1. What this part solves
 
@@ -30,6 +30,8 @@ REST /repos/{repo}/workspaces/...
 WorkspaceService (per Engine)
         │
         ├── registry: workspace id -> TempDir + lock
+        ├── forgevcs_workspaces: id, repo, WcState JSON
+        ├── forgevcs_workspace_files: dirty path, mode, bytes
         │
         └── WorkingCopy::open/checkout/... (scion-wc)
                     │
@@ -67,9 +69,17 @@ asked to touch a path, so the privileged internal principal is not a privilege e
 | `POST /repos/{repo}/workspaces/{id}/submit` | `commit` then `land` (`mode:"land"`, default) or leave unlanded (`mode:"none"`) |
 | `DELETE /repos/{repo}/workspaces/{id}` | `destroy` the materialization |
 
-Workspace IDs are UUIDs valid only in the process that created them. A restart empties the
-registry; the ID is 404 and the client creates a new workspace. That is the V0 semantics:
-workspace state is a cache, never canonical.
+Workspace IDs are UUIDs persisted in `forgevcs_workspaces`. The temporary directory is only a
+cache: when a request reaches an instance that does not have the workspace, `WorkspaceService`
+reads the persisted `WcState`, checks out its base changeset, re-applies the dirty-file overlay
+from `forgevcs_workspace_files`, and continues. A restart or a different Vercel instance therefore
+does not turn the ID into a 404. The overlay is updated on every write/delete; `submit` and a
+clean `materialize` clear it. `destroy` deletes the row and cascades the overlay.
+
+The current limits of that restore are explicit: a workspace moved while a rebase is paused is
+not replayed (the pending operation is in `WcState`, but the resolved/unresolved conflict files
+are not part of the overlay), and two instances doing concurrent writes to one workspace are not
+serialized by a distributed lock. Both are W5 gaps, not silent promises.
 
 `submit` commits with `WorkingCopy::commit_with_report` and then lands through
 `WorkingCopy::land`, so the upload, change-set construction and land rules are Scion's. The
@@ -125,6 +135,11 @@ OK  17 checks passed
 
 The script exits non-zero on any failure; this run exited 0.
 
+Persistence is additionally proven across processes: create a workspace and write a file in
+process A, stop A, start B, then `GET status`, `GET file` and `POST submit` on the same workspace
+ID in B. The observed responses were 200 with the dirty file present and the commit landed. The
+hosted W8 smoke exercises the same property across Vercel instances.
+
 One full gate run on this tree failed the upstream test
 `object_upload::upload_batches_preserve_order_and_reduce_metadata_writes` (265 vs 263 metadata
 writes). The same test passed in isolation immediately afterwards, and the next full gate
@@ -144,23 +159,23 @@ passed 1343/0. No upstream file changed; the failure is recorded here rather tha
    each request opens a fresh handle under a per-workspace lock. A long-lived in-memory handle
    would have to be `Send + Sync` across awaits and would keep the internal state stale if two
    requests interleaved.
-4. **Workspace IDs do not survive a restart.** There is no workspace table and no container
-   affinity in V0. The 404 is explicit; a client creates another workspace from the ref or
-   changeset. Persisting IDs would need a `forgevcs_workspaces` table and a materialization
-   strategy on a new container, which M0 does not require.
+4. **Workspace IDs now survive restarts and instances.** The first hosted W5 run failed when
+   Vercel routed a later request to another container; the fix persists `WcState` and the
+   dirty-file overlay in Neon and restores the temp directory on demand. The 404-for-a-lost-
+   workspace semantics was not good enough once W8 ran on the real platform.
 5. **The internal token lives 24 hours.** A process older than that cannot open new workspaces
    until restart. The Vercel container's 5-minute idle scale-down makes this theoretical for M0;
    a long-lived deployment needs a refresh path or a non-expiring internal identity.
 
 ## 7. Remaining gaps
 
-- **Workspace persistence/affinity** across restarts and multiple containers. This is the W5
-  equivalent of the W4 restart gap; the work order's "workspace disappears" property is met, but
-  a client cannot resume an ID.
+- **Concurrent writes to one workspace from two instances** are not serialized across the
+  database; the per-workspace mutex is process-local. V0 assumes one active editor per workspace.
+- **Paused rebases are not restored exactly**: the pending operation is persisted in `WcState`,
+  but conflict-file materialization/resolution state is not part of the overlay.
 - **Rebase/conflict operations** (`rebase`, `resolve`, `abort`) are in `scion-wc` but not exposed
   by the V0 REST surface. A paused rebase is visible in `.scion/state` but has no endpoint.
-- **Workspace listing and quotas.** The registry has no `GET /workspaces` and no cap; a client
-  that creates workspaces without destroying them keeps temp directories until the process
-  exits.
+- **Workspace listing and quotas.** There is no `GET /workspaces` and no cap; a client that
+  creates workspaces without destroying them keeps DB rows and temp directories until destroyed.
 - **TempDir cleanup on SIGKILL.** A killed process can leave a `/tmp` directory; the OS temp
   cleaner owns it. A normal `destroy` or process drop removes it.

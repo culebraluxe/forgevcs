@@ -8,6 +8,7 @@
 
 pub mod authz;
 pub mod config;
+pub mod db;
 pub mod engine;
 pub mod facade;
 pub mod http;

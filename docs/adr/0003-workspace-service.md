@@ -41,8 +41,10 @@ Three options were considered:
 - A workspace is a `tempfile::TempDir` materialization plus a per-workspace lock. The
   `WorkspaceService` opens a fresh `WorkingCopy` for each operation (its `.scion/state` is on
   disk), performs the operation, and closes it. There is no long-lived in-memory WC handle.
-- The registry is per engine and in memory. Workspace IDs are UUIDs. A restart empties the
-  registry; IDs answer 404 and a client creates a new workspace from a ref or changeset.
+- The registry is per engine, but it is not the source of truth. `forgevcs_workspaces` stores
+  each workspace's `WcState` JSON and `forgevcs_workspace_files` stores its dirty-file overlay.
+  A UUID is restored on demand: an instance that does not have it checks out the persisted base,
+  rewrites the overlay, and continues. The temp directory is a cache.
 - `submit` commits with `WorkingCopy::commit_with_report`, then either lands on the requested
   ref or stops at the unlanded changeset (`mode: "none"`). `destroy` removes the registry entry
   and its temporary directory.
@@ -51,12 +53,16 @@ Three options were considered:
 
 - **Canonical state is still Neon.** A workspace is a cache; deleting it, losing the container,
   or scaling to zero loses only the materialization. History is in Postgres + Object Storage.
-- **No workspace survives a restart.** V0 has no workspace table and no container affinity. A
-  workspace ID is valid only in the process that created it; after a restart the client must
-  create another. This is deliberate, not a silent failure: the 404 says so.
+- **Workspaces survive a restart/instance change, with limits.** The first hosted W8 run exposed
+  Vercel routing a later request to another container; the table/overlay fix makes the ID
+  resumable. Concurrent writes from two instances are still not serialized across the database,
+  and a paused rebase's conflict materialization is not fully replayed (W5 §7).
 - **One extra Unix listener per engine.** It is not reachable from outside the process; no
   Vercel route, no port, no TLS. The socket directory is a `TempDir` and is removed with the
   engine (a SIGKILL can leave a stale `/tmp` directory; the OS temp cleaner owns that).
+- **Workspace rows are canonical for workspace state, not for source history.** The source
+  history remains Scion changesets/objects in Neon; a workspace row is disposable metadata that
+  can be deleted without touching history.
 - **The internal principal is a real policy grant.** Anyone who can mint tokens with the
   engine's signing key can act as it; that is the same trust boundary as the service itself.
   With `FORGEVCS_SIGNING_KEY_PATH` set, the token is stable across restarts (though the

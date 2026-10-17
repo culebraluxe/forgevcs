@@ -7,26 +7,31 @@
 //! implementation. Every mutation still passes the façade's external policy check because the
 //! internal client's principal is deliberately privileged.
 //!
-//! Workspaces live in the process (and therefore in the container's warm lifetime). A restart
-//! empties the registry; the IDs answer 404 and a client creates a new workspace from a ref or
-//! changeset. That is the V0 semantics: a workspace is cache, never authoritative.
+//! Workspace state and dirty-file overlays are persisted in Neon (`forgevcs_workspaces`,
+//! `forgevcs_workspace_files`). The temp directory is only a cache: any container can restore a
+//! workspace from its persisted base state and overlay before serving it. Vercel's scale-to-zero
+//! and multi-instance routing therefore do not lose a workspace ID.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use deadpool_postgres::Pool;
 use scion_core::{Mode, Principal, ScionError};
 use scion_object::{RefName, RepoPath};
 use scion_policy::Policy;
 use scion_proto::{ScionClient, status_from_error};
 use scion_wc::fs_safe::SafeRoot;
+use scion_wc::state::save as save_wc_state;
 use scion_wc::{WcOptions, WorkingCopy};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::sync::Mutex;
 use tonic::Status;
 use uuid::Uuid;
+
+use crate::config::Config;
 
 /// Default author of a workspace commit.
 pub const DEFAULT_AUTHOR: &[u8] = b"ForgeVCS workspace <workspace@example.test>";
@@ -103,22 +108,185 @@ struct Entry {
 /// The process-wide workspace registry of one engine.
 pub struct WorkspaceService {
     client: ScionClient,
+    repo: String,
+    pool: Pool,
     entries: Mutex<HashMap<String, Arc<Entry>>>,
+    restore: Mutex<()>,
 }
 
+const CREATE_WORKSPACES: &str = r#"
+CREATE TABLE IF NOT EXISTS forgevcs_workspaces (
+    id         UUID PRIMARY KEY,
+    repo       TEXT NOT NULL,
+    state      JSONB NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)
+"#;
+
+const CREATE_FILES: &str = r#"
+CREATE TABLE IF NOT EXISTS forgevcs_workspace_files (
+    workspace_id UUID NOT NULL REFERENCES forgevcs_workspaces(id) ON DELETE CASCADE,
+    path         TEXT NOT NULL,
+    mode         INT2 NOT NULL,
+    data         BYTEA,
+    PRIMARY KEY (workspace_id, path)
+)
+"#;
+
 impl WorkspaceService {
-    /// Build a service over the engine's internal gRPC client.
-    pub fn new(client: ScionClient) -> Self {
-        Self {
-            client,
-            entries: Mutex::new(HashMap::new()),
+    /// Build a service over the engine's internal gRPC client and the shared Postgres pool.
+    pub async fn connect(client: ScionClient, repo: &str, config: &Config) -> Result<Self, String> {
+        let url = config
+            .database_url
+            .as_deref()
+            .ok_or_else(|| "workspace persistence needs FORGEVCS_DATABASE_URL".to_owned())?;
+        let pool = crate::db::build_pool(url)?;
+        {
+            let client = pool.get().await.map_err(|error| error.to_string())?;
+            client
+                .batch_execute(&format!("{CREATE_WORKSPACES}; {CREATE_FILES}"))
+                .await
+                .map_err(|error| format!("creating workspace tables: {error}"))?;
         }
+        Ok(Self {
+            client,
+            repo: repo.to_owned(),
+            pool,
+            entries: Mutex::new(HashMap::new()),
+            restore: Mutex::new(()),
+        })
     }
 
     async fn entry(&self, id: &str) -> WsResult<Arc<Entry>> {
-        self.entries.lock().await.get(id).cloned().ok_or_else(|| {
-            Status::not_found(format!("workspace {id:?} does not exist in this process"))
+        if let Some(entry) = self.entries.lock().await.get(id).cloned() {
+            return Ok(entry);
+        }
+        let _guard = self.restore.lock().await;
+        if let Some(entry) = self.entries.lock().await.get(id).cloned() {
+            return Ok(entry);
+        }
+        let entry = Arc::new(self.restore_entry(id).await?);
+        self.entries
+            .lock()
+            .await
+            .insert(id.to_owned(), Arc::clone(&entry));
+        Ok(entry)
+    }
+
+    async fn restore_entry(&self, id: &str) -> WsResult<Entry> {
+        Uuid::parse_str(id)
+            .map_err(|_| Status::not_found(format!("workspace {id:?} does not exist")))?;
+        let client = self.pool.get().await.map_err(internal)?;
+        let row = client
+            .query_opt(
+                "SELECT state::text AS state FROM forgevcs_workspaces WHERE id = $1::text::uuid AND repo = $2",
+                &[&id, &self.repo],
+            )
+            .await
+            .map_err(internal)?
+            .ok_or_else(|| Status::not_found(format!("workspace {id:?} does not exist")))?;
+        let state_text: String = row.get("state");
+        let state: scion_wc::state::WcState =
+            serde_json::from_str(&state_text).map_err(internal)?;
+
+        let dir = tempfile::tempdir().map_err(internal)?;
+        WorkingCopy::checkout(
+            self.client.clone(),
+            dir.path(),
+            &state.base.to_text(),
+            state.sparse.clone(),
+            WcOptions::default(),
+        )
+        .await
+        .map_err(scion)?;
+        save_wc_state(&dir.path().join(".scion"), &state).map_err(scion)?;
+
+        let files = client
+            .query(
+                "SELECT path, mode, data FROM forgevcs_workspace_files WHERE workspace_id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(internal)?;
+        if !files.is_empty() {
+            let root = SafeRoot::open(dir.path()).map_err(scion)?;
+            for file in files {
+                let path: String = file.get("path");
+                let path = RepoPath::parse(path.as_bytes()).map_err(scion)?;
+                let mode = Mode::from_u8(file.get::<_, i16>("mode") as u8).map_err(scion)?;
+                match file.get::<_, Option<Vec<u8>>>("data") {
+                    Some(data) => match mode {
+                        Mode::Symlink => root.symlink(&path, &data).map_err(scion)?,
+                        Mode::File | Mode::Executable => {
+                            root.write_file_atomic(&path, &data, mode).map_err(scion)?;
+                        }
+                        Mode::Tree => return Err(internal("persisted tree overlay")),
+                    },
+                    None => root.remove(&path).map_err(scion)?,
+                }
+            }
+        }
+        Ok(Entry {
+            dir,
+            lock: Mutex::new(()),
         })
+    }
+
+    async fn persist_state(&self, id: &str, state: &scion_wc::state::WcState) -> WsResult<()> {
+        let json = serde_json::to_string(state).map_err(internal)?;
+        let client = self.pool.get().await.map_err(internal)?;
+        client
+            .execute(
+                "UPDATE forgevcs_workspaces SET state = $1::text::jsonb WHERE id = $2::text::uuid AND repo = $3",
+                &[&json, &id, &self.repo],
+            )
+            .await
+            .map_err(internal)?;
+        Ok(())
+    }
+
+    async fn persist_file(
+        &self,
+        id: &str,
+        path: &RepoPath,
+        mode: Mode,
+        data: &[u8],
+        deleted: bool,
+    ) -> WsResult<()> {
+        let path = path_text(path);
+        let client = self.pool.get().await.map_err(internal)?;
+        if deleted {
+            client
+                .execute(
+                    "DELETE FROM forgevcs_workspace_files WHERE workspace_id = $1::text::uuid AND path = $2",
+                    &[&id, &path],
+                )
+                .await
+                .map_err(internal)?;
+        } else {
+            client
+                .execute(
+                    "INSERT INTO forgevcs_workspace_files (workspace_id, path, mode, data)
+                     VALUES ($1::text::uuid, $2, $3, $4)
+                     ON CONFLICT (workspace_id, path) DO UPDATE SET mode = $3, data = $4",
+                    &[&id, &path, &(mode as u8 as i16), &data],
+                )
+                .await
+                .map_err(internal)?;
+        }
+        Ok(())
+    }
+
+    async fn clear_files(&self, id: &str) -> WsResult<()> {
+        let client = self.pool.get().await.map_err(internal)?;
+        client
+            .execute(
+                "DELETE FROM forgevcs_workspace_files WHERE workspace_id = $1::text::uuid",
+                &[&id],
+            )
+            .await
+            .map_err(internal)?;
+        Ok(())
     }
 
     fn open(&self, entry: &Entry) -> WsResult<WorkingCopy> {
@@ -138,8 +306,17 @@ impl WorkspaceService {
         )
         .await
         .map_err(scion)?;
+        let state_text = serde_json::to_string(wc.state()).map_err(internal)?;
         let state = state_json(wc.state());
         let id = Uuid::new_v4().to_string();
+        let client = self.pool.get().await.map_err(internal)?;
+        client
+            .execute(
+                "INSERT INTO forgevcs_workspaces (id, repo, state) VALUES ($1::text::uuid, $2, $3::text::jsonb)",
+                &[&id, &self.repo, &state_text],
+            )
+            .await
+            .map_err(internal)?;
         self.entries.lock().await.insert(
             id.clone(),
             Arc::new(Entry {
@@ -156,6 +333,10 @@ impl WorkspaceService {
         let _guard = entry.lock.lock().await;
         let mut wc = self.open(&entry)?;
         let report = wc.goto(rev, force).await.map_err(scion)?;
+        self.persist_state(id, wc.state()).await?;
+        if report.preserved_dirty.is_empty() {
+            self.clear_files(id).await?;
+        }
         Ok(json!({
             "workspace_id": id,
             "state": state_json(wc.state()),
@@ -285,6 +466,7 @@ impl WorkspaceService {
                 return Err(Status::invalid_argument("cannot write a tree entry"));
             }
         }
+        self.persist_file(id, &path, mode, data, false).await?;
         Ok(json!({
             "workspace_id": id,
             "path": path_text(&path),
@@ -314,6 +496,7 @@ impl WorkspaceService {
         let _guard = entry.lock.lock().await;
         let root = SafeRoot::open(entry.dir.path()).map_err(scion)?;
         root.remove(&path).map_err(scion)?;
+        self.persist_file(id, &path, Mode::File, &[], true).await?;
         Ok(json!({
             "workspace_id": id,
             "path": path_text(&path),
@@ -372,26 +555,37 @@ impl WorkspaceService {
             let landed = wc.land(&parsed_ref).await.map_err(scion)?;
             ref_value = land_json(&landed);
         }
+        let final_state = wc.state().clone();
+        self.clear_files(id).await?;
+        self.persist_state(id, &final_state).await?;
         Ok(json!({
             "workspace_id": id,
             "changeset": report,
             "ref": ref_value,
-            "state": state_json(wc.state()),
+            "state": state_json(&final_state),
         }))
     }
 
     /// Destroy a workspace and its temporary directory.
     pub async fn destroy(&self, id: &str) -> WsResult<()> {
-        let removed = self.entries.lock().await.remove(id);
-        match removed {
-            Some(entry) => {
-                // Drop under the map lock is fine: TempDir removal is synchronous.
-                drop(entry);
-                Ok(())
-            }
-            None => Err(Status::not_found(format!(
-                "workspace {id:?} does not exist in this process"
-            ))),
+        Uuid::parse_str(id)
+            .map_err(|_| Status::not_found(format!("workspace {id:?} does not exist")))?;
+        let client = self.pool.get().await.map_err(internal)?;
+        let deleted = client
+            .execute(
+                "DELETE FROM forgevcs_workspaces WHERE id = $1::text::uuid AND repo = $2",
+                &[&id, &self.repo],
+            )
+            .await
+            .map_err(internal)?;
+        if deleted == 0 {
+            return Err(Status::not_found(format!(
+                "workspace {id:?} does not exist"
+            )));
         }
+        if let Some(entry) = self.entries.lock().await.remove(id) {
+            drop(entry);
+        }
+        Ok(())
     }
 }

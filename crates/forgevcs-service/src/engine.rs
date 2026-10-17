@@ -168,7 +168,11 @@ impl Engine {
         let client = ScionClient::connect(&Endpoint::Unix(socket_path), None, Some(token))
             .await
             .context("connecting the internal gRPC client")?;
-        let workspaces = Arc::new(WorkspaceService::new(client.clone()));
+        let workspaces = Arc::new(
+            WorkspaceService::connect(client.clone(), repo, config)
+                .await
+                .map_err(|error| anyhow::anyhow!("starting the workspace service: {error}"))?,
+        );
 
         Ok(Self {
             repo: repo.to_owned(),

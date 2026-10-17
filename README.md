@@ -126,9 +126,10 @@ every path operation (ADR-0003).
 | `POST /repos/{repo}/workspaces/{id}/submit` | Commit, then land (`mode:"land"`, default) or leave unlanded |
 | `DELETE /repos/{repo}/workspaces/{id}` | Destroy the materialization |
 
-Workspace IDs live only in the process that created them; a restart answers 404 and the client
-creates another from a ref or changeset. `scripts/w5-acceptance.py` proves the work order's
-disposal property: destroy the workspace, recreate it, and the submitted file is still there.
+Workspace state and its dirty-file overlay are persisted in Neon (`forgevcs_workspaces`,
+`forgevcs_workspace_files`); the temp directory is a cache that any instance can restore. The
+17-check `scripts/w5-acceptance.py` proves the work order's disposal property: destroy the
+workspace, recreate it, and the submitted file is still there.
 
 **Authorization A/B.** Every business request runs `AuthorizationService` after the token is
 verified. `FORGEVCS_AUTH_MODE` selects `SCION_ONLY` (default), `SHADOW_COMPARE`, `DUAL_ENFORCE`

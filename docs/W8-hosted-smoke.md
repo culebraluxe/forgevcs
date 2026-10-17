@@ -80,6 +80,11 @@ rows and object keys to the branch; the names are unique so the history is not a
    not implemented. This is the W4 repository-deletion gap, now visible in the hosted run.
 5. **No Git operation is involved.** The acceptance client speaks only HTTP and Scion ids; the
    deploy pipeline still uses Git/CLI for the ForgeVCS source, which the work order permits.
+6. **Vercel routed a workspace request to a different container.** The second hosted W8 run
+   created a workspace, then a later `diff` reached another instance and answered 404 because the
+   registry was process-local. The fix persists `WcState` and the dirty-file overlay in Neon
+   (`forgevcs_workspaces`, `forgevcs_workspace_files`) and restores them on demand. The W8 run
+   then passed again. This is exactly the kind of platform fact a hosted smoke exists to find.
 
 ## 4. M0 checklist
 
