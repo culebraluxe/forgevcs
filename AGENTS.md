@@ -62,8 +62,12 @@ Read these before changing anything, in this order:
 ## Gate before claiming a workstream is done
 
 ```sh
-scripts/check.sh                      # vendored upstream gate — must exit 0
+upstream/scripts/check.sh             # vendored upstream gate — must exit 0
 ```
+
+(Run it as `upstream/scripts/check.sh` from the repo root. The script re-roots itself with
+`cd "$(dirname "$0")/.."`, so it does not exist at `scripts/check.sh` in this repo — only
+inside `upstream/`.)
 
 Gate on **T-core**. Do **not** gate on `check.sh --full`: it is red upstream at the
 baseline SHA on one test at one hardcoded seed (`docs/BASELINE.md`, "T-full result"), so
