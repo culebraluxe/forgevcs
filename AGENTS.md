@@ -95,6 +95,9 @@ Read these before changing anything, in this order:
    its container service, environment classes, production URL and deployment findings.
 10. [`docs/W8-hosted-smoke.md`](docs/W8-hosted-smoke.md) — the hosted W4/W5 acceptance, the M0
     checklist, and what remains after M0.
+11. [`docs/M1-readiness-and-multi-agent.md`](docs/M1-readiness-and-multi-agent.md) — the
+    post-M0 readiness verdict, the prime-usage blockers by category, and the recommended
+    multi-agent pilot topology and checks. Read this before starting M1 or an agent pilot.
 
 ## Hard rules
 

@@ -18,7 +18,7 @@ of authority.
 | `crates/forgevcs-service` | The Axum service. `http.rs` serves `/health`, `/ready`, `/version`, the auth seam (`/auth/token`, `/auth/whoami`) and merges Scion's `/healthz`, `/readyz`, `/metrics` unmodified; `facade.rs` serves `/repos/{repo}/init`, `/push`, `/pull`, `/refs`, `/commits`, `/changesets/{id}`, `/file`, `/tree`, `/diff`, `/merge-base` and the `/workspaces…` routes; `workspace.rs` is the WorkspaceService over `scion-wc`; `authz.rs` is the Scion/Culebra A/B gate; `engine.rs` boots the Scion `ServerApp` on Neon (metadata + objects), its private Unix-socket gRPC surface, and publishes a readiness snapshot |
 | `acl.toml` | The policy file the engine loads (deny-by-default; agents only — ADR-0002 D4) |
 | `upstream/` | Vendored Scion at `e0ffadf9`. A **separate cargo workspace** (`exclude = ["upstream"]` at the root) with its own gate. Read-only: adapt at the edges, do not rewrite |
-| `docs/` | `adr/0001-infrastructure-stack.md` … `adr/0004-authorization-ab.md`, `BASELINE.md` (W0), `W1-service-shell.md` … `W8-hosted-smoke.md` |
+| `docs/` | `adr/0001-infrastructure-stack.md` … `adr/0004-authorization-ab.md`, `BASELINE.md` (W0), `W1-service-shell.md` … `W8-hosted-smoke.md`, `M1-readiness-and-multi-agent.md` |
 | `migrations/` | ForgeVCS-owned tables; `0001_forgevcs_auth_decisions.sql` is the W6 A/B decision log |
 | `vercel.json` | The container service and catch-all rewrite for the separate Vercel project |
 | `Dockerfile.vercel` | Release build + slim runtime, policy at `/etc/forgevcs/acl.toml`, non-root |
