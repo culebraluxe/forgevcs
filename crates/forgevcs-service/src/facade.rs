@@ -1548,6 +1548,20 @@ pub(crate) struct LandBody {
     allow_empty: bool,
 }
 
+/// `POST /repos/{repo}/merge-land` — merge a head into the ref tip and land the result.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MergeLandBody {
+    #[serde(rename = "ref", default = "default_ref")]
+    ref_name: String,
+    head: String,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    change_id: Option<String>,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -2039,6 +2053,243 @@ pub(crate) async fn land(
         }
         Err(status) => status_response(status),
     }
+}
+
+fn merge_land_meta(author: &str, message: &str) -> v1::MetaFields {
+    v1::MetaFields {
+        author: author.as_bytes().to_vec(),
+        author_time: Some(v1::Timestamp::default()),
+        committer: None,
+        committer_time: None,
+        message: message.as_bytes().to_vec(),
+        extensions: Vec::new(),
+    }
+}
+
+/// `POST /repos/{repo}/merge-land` — merge a head into the ref tip and publish the result as
+/// one linear changeset, then land it.
+///
+/// v1 Land accepts linear stacks only (SPEC 8.4: a multi-parent member fails
+/// `INVALID_ARGUMENT/merge_in_stack`), so a two-parent merge changeset cannot be published
+/// directly. This endpoint performs what a client otherwise does by hand:
+///
+/// 1. resolve the ref tip;
+/// 2. `Merge(tip, head)` — the merge's delta is computed against `tip` (the `a` side);
+/// 3. create a single-parent changeset with that delta;
+/// 4. land it.
+///
+/// The published history is therefore linear while its tree is the merge result — a
+/// squash-land. The two-parent merge changeset is returned as `merge_changeset` so its lineage
+/// stays referencable. The merge delta is read through `GetChangesets`, so the caller's read
+/// policy still applies; a filtered view (a merged path the caller cannot read) is refused
+/// rather than published as a partial tree.
+pub(crate) async fn merge_land(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<MergeLandBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let head = match parse_id(&body.head, "head") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let app = engine.context();
+
+    let resolved = match handlers::object::resolve_ref(
+        &app,
+        caller_request(
+            v1::ResolveRefRequest {
+                name: body.ref_name.clone(),
+                at_version: None,
+            },
+            &caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => return status_response(status),
+    };
+    let tip = match ObjectId::from_bytes(&resolved.target) {
+        Ok(id) => id,
+        Err(error) => return status_response(status_from_error(&error)),
+    };
+
+    let author = body
+        .author
+        .clone()
+        .unwrap_or_else(|| "ForgeVCS merge-land <merge@example.test>".to_owned());
+    let message = body.message.clone().unwrap_or_else(|| {
+        format!(
+            "merge-land {} onto {}",
+            head.to_text(),
+            body.ref_name
+        )
+    });
+    let merge_change_id = match body.change_id.as_deref() {
+        Some(raw) => match parse_change_id(raw) {
+            Ok(id) => id,
+            Err(message) => {
+                return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            }
+        },
+        None => uuid::Uuid::new_v4().into_bytes().to_vec(),
+    };
+
+    let merged = match handlers::write::merge(
+        &app,
+        caller_request(
+            v1::MergeRequest {
+                a: convert::id_bytes(&tip),
+                b: convert::id_bytes(&head),
+                meta_fields: Some(merge_land_meta(&author, &message)),
+                change_id: merge_change_id,
+            },
+            &caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => return status_response(status),
+    };
+    let merged_id = match ObjectId::from_bytes(&merged.changeset_id) {
+        Ok(id) => id,
+        Err(error) => return status_response(status_from_error(&error)),
+    };
+
+    let changesets = match handlers::query::get_changesets(
+        &app,
+        caller_request(
+            v1::GetChangesetsRequest {
+                ids: vec![convert::id_bytes(&merged_id)],
+            },
+            &caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => return status_response(status),
+    };
+    let Some(item) = changesets.items.first() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("merge changeset {merged_id} not found"),
+        );
+    };
+    if item.status != v1::ItemStatus::Ok as i32 {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("merge changeset {merged_id} not found"),
+        );
+    }
+    let delta = match &item.view {
+        Some(v1::changeset_item::View::FilteredView(view)) => {
+            if view.filtered {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "conflict",
+                    "the merge delta includes a path this principal cannot read; refusing to \
+                     publish a partial tree",
+                );
+            }
+            view.delta.clone()
+        }
+        Some(v1::changeset_item::View::Encoded(bytes)) => {
+            let changeset = match scion_object::Changeset::decode(bytes) {
+                Ok(changeset) => changeset,
+                Err(error) => return status_response(status_from_error(&error)),
+            };
+            changeset
+                .delta
+                .iter()
+                .map(v1::DeltaEntryMsg::from)
+                .collect()
+        }
+        None => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("merge changeset {merged_id} has no view"),
+            );
+        }
+    };
+
+    let linear = match handlers::write::create_changeset(
+        &app,
+        caller_request(
+            v1::CreateChangesetRequest {
+                parents: vec![convert::id_bytes(&tip)],
+                delta,
+                meta_fields: Some(merge_land_meta(&author, &message)),
+                change_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
+                expected_root_tree: None,
+                import_mode: false,
+            },
+            &caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => return status_response(status),
+    };
+    let linear_id = match ObjectId::from_bytes(&linear.changeset_id) {
+        Ok(id) => id,
+        Err(error) => return status_response(status_from_error(&error)),
+    };
+
+    let landed = match handlers::write::land(
+        &app,
+        caller_request(
+            v1::LandRequest {
+                r#ref: body.ref_name.clone(),
+                head: convert::id_bytes(&linear_id),
+                allow_empty: true,
+            },
+            &caller,
+        ),
+    )
+    .await
+    {
+        Ok(response) => response.into_inner(),
+        Err(status) => return status_response(status),
+    };
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "service": SERVICE,
+            "status": "ok",
+            "repo": repo,
+            "merge_changeset": { "id": merged_id.to_text() },
+            "changeset": { "id": linear_id.to_text() },
+            "ref": {
+                "name": body.ref_name,
+                "target": id_text(&landed.target),
+                "version": landed.version,
+            },
+            "landed": landed_json(&landed.landed),
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------------------------

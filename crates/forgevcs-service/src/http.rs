@@ -12,8 +12,9 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use scion_core::{EntryInfo, ErrorPayload};
 use scion_obs::{Metrics, Readiness, health_router};
-use scion_proto::{status_from_error, v1};
+use scion_proto::{error_from_status, status_from_error, v1};
 use scion_server::context::CallerCtx;
 use scion_server::{handlers, interceptor};
 use serde::Deserialize;
@@ -163,6 +164,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/rebase", post(facade::rebase))
         .route("/repos/{repo}/merge", post(facade::merge))
         .route("/repos/{repo}/land", post(facade::land))
+        .route("/repos/{repo}/merge-land", post(facade::merge_land))
         .route("/repos/{repo}/workspaces", post(facade::workspace_create))
         .route(
             "/repos/{repo}/workspaces/{id}",
@@ -305,8 +307,98 @@ pub(crate) fn error_response(status: StatusCode, code: &str, message: &str) -> R
         .into_response()
 }
 
+/// One entry of a conflict payload as JSON: `{mode, id, size}`.
+fn entry_payload_json(entry: &EntryInfo) -> Value {
+    json!({
+        "mode": entry.mode as u8,
+        "id": entry.id.to_text(),
+        "size": entry.size,
+    })
+}
+
+/// A `MERGE_CONFLICT` payload as JSON (SPEC 8.3): every conflict plus the clean entries.
+///
+/// This is the contract an agent resolves against. The server never writes conflict markers
+/// into objects, so the paths, kinds, three entries and line hunks are the entire description
+/// of what the caller must decide.
+fn conflict_report_json(report: &scion_core::ConflictReport) -> Value {
+    let conflicts: Vec<Value> = report
+        .conflicts
+        .iter()
+        .map(|conflict| {
+            json!({
+                "path": String::from_utf8_lossy(&conflict.path).into_owned(),
+                "kind": conflict.kind.as_str(),
+                "base": conflict.base.as_ref().map(entry_payload_json),
+                "ours": conflict.ours.as_ref().map(entry_payload_json),
+                "theirs": conflict.theirs.as_ref().map(entry_payload_json),
+                "hunks": conflict.hunks.iter().map(|hunk| json!({
+                    "base":   { "start": hunk.base.start,   "end": hunk.base.end },
+                    "ours":   { "start": hunk.ours.start,   "end": hunk.ours.end },
+                    "theirs": { "start": hunk.theirs.start, "end": hunk.theirs.end },
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let clean_entries: Vec<Value> = report
+        .clean_entries
+        .iter()
+        .map(|clean| {
+            json!({
+                "path": String::from_utf8_lossy(&clean.path).into_owned(),
+                "entry": clean.entry.as_ref().map(entry_payload_json),
+            })
+        })
+        .collect();
+    json!({ "conflicts": conflicts, "clean_entries": clean_entries })
+}
+
+/// The `scion.v1.ErrorDetail` payload as JSON, when the status carries one.
+fn error_payload_json(payload: &ErrorPayload) -> Option<Value> {
+    match payload {
+        ErrorPayload::None => None,
+        ErrorPayload::Subcode(subcode) => Some(json!({ "kind": "subcode", "subcode": subcode })),
+        ErrorPayload::Limit { name, limit, actual } => Some(json!({
+            "kind": "limit", "name": name, "limit": limit, "actual": actual
+        })),
+        ErrorPayload::MergeConflict(report) => Some(json!({
+            "kind": "merge_conflict",
+            "report": conflict_report_json(report),
+        })),
+        ErrorPayload::RefMismatch {
+            current_version,
+            current_target,
+        } => Some(json!({
+            "kind": "ref_version_mismatch",
+            "current_version": current_version,
+            "current_target": current_target.as_ref().map(|id| id.to_text()),
+        })),
+        ErrorPayload::AlreadyLanded {
+            source,
+            result,
+            version,
+        } => Some(json!({
+            "kind": "already_landed",
+            "source": source.to_text(),
+            "result": result.to_text(),
+            "version": version,
+        })),
+        ErrorPayload::Candidates(ids) => Some(json!({
+            "kind": "candidates",
+            "ids": ids.iter().map(|id| id.to_text()).collect::<Vec<_>>(),
+        })),
+    }
+}
+
 /// Map an upstream `tonic::Status` to HTTP: the façade and the gRPC surface must not disagree
 /// about what a failure means (ADR-0002 D4).
+///
+/// The status message alone is not enough for the failures a merge produces. `scion.v1`
+/// carries an `ErrorDetail` payload in the status details (a `ConflictReport` for
+/// MERGE_CONFLICT, the current ref state for REF_VERSION_MISMATCH, …); it is decoded here and
+/// returned as `details` so an HTTP client sees the same structured conflict the gRPC client
+/// sees. Without this the REST surface collapsed every conflict into `{"code":"conflict"}` and
+/// an agent had no way to learn which paths it must decide.
 pub(crate) fn status_response(status: tonic::Status) -> Response {
     use tonic::Code;
     let (http, slug) = match status.code() {
@@ -322,7 +414,19 @@ pub(crate) fn status_response(status: tonic::Status) -> Response {
         Code::Unimplemented => (StatusCode::NOT_IMPLEMENTED, "unimplemented"),
         _ => (StatusCode::INTERNAL_SERVER_ERROR, "internal"),
     };
-    error_response(http, slug, status.message())
+    let error = error_from_status(&status);
+    let mut body = json!({
+        "service": SERVICE,
+        "status": "error",
+        "code": slug,
+        "message": status.message(),
+    });
+    if let Some(details) = error_payload_json(&error.payload)
+        && let Some(object) = body.as_object_mut()
+    {
+        object.insert("details".to_owned(), details);
+    }
+    (http, Json(body)).into_response()
 }
 
 #[cfg(test)]
@@ -335,6 +439,53 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+
+    #[test]
+    fn merge_conflict_payload_is_exposed_as_details() {
+        use scion_core::{Conflict, ConflictHunk, ConflictKind, ConflictReport};
+        let report = ConflictReport {
+            conflicts: vec![Conflict {
+                path: b"src/lib.rs".to_vec(),
+                kind: ConflictKind::Content,
+                base: None,
+                ours: None,
+                theirs: None,
+                hunks: vec![ConflictHunk {
+                    base: 1..2,
+                    ours: 1..3,
+                    theirs: 1..2,
+                }],
+            }],
+            clean_entries: Vec::new(),
+        };
+        let details = error_payload_json(&ErrorPayload::MergeConflict(Box::new(report)))
+            .expect("merge conflict payload");
+        assert_eq!(details["kind"], "merge_conflict");
+        let conflict = &details["report"]["conflicts"][0];
+        assert_eq!(conflict["path"], "src/lib.rs");
+        assert_eq!(conflict["kind"], "content");
+        assert_eq!(conflict["hunks"][0]["ours"]["end"], 3);
+    }
+
+    #[test]
+    fn ref_mismatch_payload_is_exposed_as_details() {
+        let target = scion_core::ObjectId::parse_text(
+            "c12597b62a1634a5e5c5bd505e47cf5fb15939cde2a52c3d692c7bdf1c92391c33",
+        )
+        .unwrap();
+        let details = error_payload_json(&ErrorPayload::RefMismatch {
+            current_version: 7,
+            current_target: Some(target),
+        })
+        .expect("ref mismatch payload");
+        assert_eq!(details["kind"], "ref_version_mismatch");
+        assert_eq!(details["current_version"], 7);
+        assert!(
+            details["current_target"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("c1"))
+        );
+    }
 
     /// Router-level tests must not depend on Neon: with no `FORGEVCS_DATABASE_URL` the registry
     /// boots empty, which is exactly the "engine is down" state /ready and the façade report.

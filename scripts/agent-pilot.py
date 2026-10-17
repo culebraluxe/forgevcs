@@ -24,12 +24,15 @@ What it proves, in order:
   land         Land rebases each agent's linear stack onto main; both lanes' files coexist
   merge        the merge handler produces a two-parent changeset for the two lane heads
   rebase       a fresh changeset is replayed onto main and then landed
+  merge-land   a stale-base changeset merges into the tip and lands as one linear changeset
+  conflicts    explicit Merge and rebase-on-Land both refuse with 409 and a structured report
+               (paths, kinds, entries, hunks); resolution is explicit content plus land
 
 It never invents identities: the principals and secrets come from
 FORGEVCS_SERVICE_PRINCIPALS, which scripts/agent-pilot.sh sets before booting the engine.
 
 There is no repository deletion endpoint yet (docs/M1-readiness-and-multi-agent.md), so
-this client creates five repositories and prints their names for manual cleanup.
+this client creates six repositories and prints their names for manual cleanup.
 
 Exit 0 only when every graded check passes. No third-party Python packages are used.
 """
@@ -631,6 +634,164 @@ def main() -> int:
         "rebase: the replayed changeset landed on main",
         file_at(lead, team_repo, rebased_tip, f"{letter[other]}/rebase.txt") is not None,
         f"tip {rebased_tip}",
+    )
+
+    # --- merge-land, and where conflicts actually rise -----------------------------------
+    #
+    # A stale-base changeset is integrated by merge-land: v1 Land takes a linear stack, so the
+    # two-parent merge cannot be published directly and merge-land re-parents the merge result
+    # as one linear changeset. Then both conflict sites are observed: explicit Merge(a, b) and
+    # Land's automatic rebase (the path every ordinary push takes).
+    merge_repo = f"agent-pilot-{stamp}-merge"
+    created.append(merge_repo)
+    init_repo(lead, merge_repo)
+    tip0, _ = main_target(lead, merge_repo)
+
+    first_land = clients[first].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(tip0, "m/a.txt", BLOB_A, len(CONTENT_A), B64_A, "agent-a main file"),
+    )
+    tip1 = first_land["ref"]["target"]
+    stale_b = clients[second].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(
+            tip0,
+            "m/b.txt",
+            BLOB_A,
+            len(CONTENT_A),
+            B64_A,
+            "agent-b stale base",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    merged_land = lead.call(
+        "POST",
+        f"/repos/{merge_repo}/merge-land",
+        {"ref": DEFAULT_REF, "head": stale_b, "message": "merge-land agent-b onto main"},
+    )
+    lead.check(
+        "merge-land: it published a linear changeset distinct from the merge changeset",
+        merged_land["merge_changeset"]["id"] != merged_land["changeset"]["id"],
+        str(merged_land),
+    )
+    tip2, _ = main_target(lead, merge_repo)
+    lead.check(
+        "merge-land: main carries both the landed file and the merged stale-base file",
+        file_at(lead, merge_repo, tip2, "m/a.txt") == CONTENT_A.decode()
+        and file_at(lead, merge_repo, tip2, "m/b.txt") == CONTENT_A.decode(),
+        f"tip {tip2}",
+    )
+
+    # Conflict site 1: explicit Merge(a, b) over the same added path.
+    base_tip, _ = main_target(lead, merge_repo)
+    side_one = clients[second].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(base_tip, "m/conflict.txt", BLOB_A, len(CONTENT_A), B64_A, "side one", mode="none"),
+    )["changeset"]["id"]
+    side_two = clients[agents[2][0]].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(base_tip, "m/conflict.txt", BLOB_B, len(CONTENT_B), B64_B, "side two", mode="none"),
+    )["changeset"]["id"]
+    merge_status, merge_error = lead.status(
+        "POST",
+        f"/repos/{merge_repo}/merge",
+        {
+            "a": side_one,
+            "b": side_two,
+            "meta": {
+                "author": "ForgeVCS agent pilot <pilot@example.test>",
+                "message": "conflicting merge",
+            },
+            "change_id": secrets.token_hex(16),
+        },
+    )
+    conflicts = merge_error.get("details", {}).get("report", {}).get("conflicts", [])
+    lead.check(
+        "conflict(merge): the merge is refused 409",
+        merge_status == 409,
+        f"HTTP {merge_status} {str(merge_error)[:200]}",
+    )
+    lead.check(
+        "conflict(merge): the REST payload names the path and add_add kind",
+        any(
+            item.get("path") == "m/conflict.txt" and item.get("kind") == "add_add"
+            for item in conflicts
+        ),
+        str(conflicts)[:300],
+    )
+
+    # Conflict site 2: Land's automatic rebase, which is the ordinary push path.
+    land_base, _ = main_target(lead, merge_repo)
+    land_side = clients[second].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(
+            land_base,
+            "m/land-conflict.txt",
+            BLOB_A,
+            len(CONTENT_A),
+            B64_A,
+            "land side",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    late_side = clients[agents[2][0]].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(
+            land_base,
+            "m/land-conflict.txt",
+            BLOB_B,
+            len(CONTENT_B),
+            B64_B,
+            "late side",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    lead.call("POST", f"/repos/{merge_repo}/land", {"ref": DEFAULT_REF, "head": land_side})
+    late_status, late_error = lead.status(
+        "POST", f"/repos/{merge_repo}/land", {"ref": DEFAULT_REF, "head": late_side}
+    )
+    late_conflicts = late_error.get("details", {}).get("report", {}).get("conflicts", [])
+    lead.check(
+        "conflict(land): the rebase-on-land conflict is refused 409",
+        late_status == 409,
+        f"HTTP {late_status} {str(late_error)[:200]}",
+    )
+    lead.check(
+        "conflict(land): the payload carries the conflicted path and kind",
+        any(
+            item.get("path") == "m/land-conflict.txt" and item.get("kind") == "add_add"
+            for item in late_conflicts
+        ),
+        str(late_conflicts)[:300],
+    )
+
+    # Resolution today is explicit content plus land: the server never writes conflict markers.
+    tip_after_land, _ = main_target(lead, merge_repo)
+    resolved = clients[first].call(
+        "POST",
+        f"/repos/{merge_repo}/push",
+        push_body(
+            tip_after_land,
+            "m/land-conflict.txt",
+            BLOB_B,
+            len(CONTENT_B),
+            B64_B,
+            "resolution",
+        ),
+    )
+    resolved_tip, _ = main_target(lead, merge_repo)
+    lead.check(
+        "conflict(resolution): a chosen resolution lands as a normal changeset",
+        resolved["ref"]["version"] > 0
+        and file_at(lead, merge_repo, resolved_tip, "m/land-conflict.txt")
+        == CONTENT_B.decode(),
+        f"tip {resolved_tip}",
     )
 
     total = sum(client.checks for client in clients.values())
