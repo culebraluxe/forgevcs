@@ -11,9 +11,15 @@ WORKDIR /src
 ENV CARGO_TARGET_DIR=/target \
     CARGO_INCREMENTAL=0
 
+# scion-proto's build script invokes protoc; the Rust image does not ship it.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends protobuf-compiler \
+ && rm -rf /var/lib/apt/lists/*
+
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY upstream ./upstream
+COPY acl.toml /etc/forgevcs/acl.toml
 
 RUN cargo build --release --locked -p forgevcs-service
 
@@ -22,9 +28,12 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /target/release/forgevcs-service /usr/local/bin/forgevcs-service
+COPY acl.toml /etc/forgevcs/acl.toml
 RUN useradd --system --uid 10001 forgevcs
 USER forgevcs
-ENV PORT=3000
+WORKDIR /app
+ENV PORT=3000 \
+    FORGEVCS_POLICY_PATH=/etc/forgevcs/acl.toml
 EXPOSE 3000
 ENTRYPOINT ["/usr/local/bin/forgevcs-service"]
 

@@ -43,8 +43,16 @@ authorization A/B — PASS (2026-10-17)**: every business request evaluates Scio
 dual mode, the CulebraLuxe auth tables; `forgevcs_auth_decisions` records both results and the
 final decision. `SCION_ONLY` is the default; `SHADOW_COMPARE` allows what Scion allows and records
 mismatches; `DUAL_ENFORCE` requires both. `scripts/w6-authz-smoke.sh` proves 200/403 plus persisted
-rows. See `docs/W6-authorization-ab.md` and ADR-0004. The Postgres port does not change the default
-build: it lives behind `--features postgres`, and the object-storage additions are additive.
+rows. See `docs/W6-authorization-ab.md` and ADR-0004. **W7 — Vercel deployment — PASS
+(2026-10-17)**: separate project `culebraluxe-forgevcs`, container service from
+`Dockerfile.vercel` via `vercel.json`, policy baked at `/etc/forgevcs/acl.toml`, signing key
+through `FORGEVCS_SIGNING_KEY_PEM`; production is
+https://culebraluxe-forgevcs.vercel.app. **W8 — hosted smoke — PASS (2026-10-17), M0**: the W4
+(20 checks) and W5 (17 checks) clients pass against the hosted deployment and Neon, with no Git
+in the source-control operations; `scripts/w8-hosted-smoke.sh` is the receipt. See
+`docs/W7-vercel-deployment.md` and `docs/W8-hosted-smoke.md`. The Postgres port does not change
+the default build: it lives behind `--features postgres`, and the object-storage additions are
+additive.
 
 **Find out where things stand with one command, not by reading logs.**
 `scripts/gate-status.sh` prints one JSON line and exits 0 pass / 1 fail / 2 running / 3 never
@@ -81,6 +89,10 @@ Read these before changing anything, in this order:
    [`docs/W6-authorization-ab.md`](docs/W6-authorization-ab.md) — the Scion/Culebra A/B gate,
    its modes and provisional authority mapping, the persisted decision table, and the live
    shadow/dual acceptance.
+9. [`docs/W7-vercel-deployment.md`](docs/W7-vercel-deployment.md) — the separate Vercel project,
+   its container service, environment classes, production URL and deployment findings.
+10. [`docs/W8-hosted-smoke.md`](docs/W8-hosted-smoke.md) — the hosted W4/W5 acceptance, the M0
+    checklist, and what remains after M0.
 
 ## Hard rules
 

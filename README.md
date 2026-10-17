@@ -18,8 +18,10 @@ of authority.
 | `crates/forgevcs-service` | The Axum service. `http.rs` serves `/health`, `/ready`, `/version`, the auth seam (`/auth/token`, `/auth/whoami`) and merges Scion's `/healthz`, `/readyz`, `/metrics` unmodified; `facade.rs` serves `/repos/{repo}/init`, `/push`, `/pull`, `/refs`, `/commits`, `/changesets/{id}`, `/file`, `/tree`, `/diff`, `/merge-base` and the `/workspaces…` routes; `workspace.rs` is the WorkspaceService over `scion-wc`; `authz.rs` is the Scion/Culebra A/B gate; `engine.rs` boots the Scion `ServerApp` on Neon (metadata + objects), its private Unix-socket gRPC surface, and publishes a readiness snapshot |
 | `acl.toml` | The policy file the engine loads (deny-by-default; agents only — ADR-0002 D4) |
 | `upstream/` | Vendored Scion at `e0ffadf9`. A **separate cargo workspace** (`exclude = ["upstream"]` at the root) with its own gate. Read-only: adapt at the edges, do not rewrite |
-| `docs/` | `adr/0001-infrastructure-stack.md` … `adr/0004-authorization-ab.md`, `BASELINE.md` (W0), `W1-service-shell.md`, `W2-postgres-port.md`, `W3-object-storage.md`, `W4-engine-wiring.md`, `W5-workspace-service.md`, `W6-authorization-ab.md` |
+| `docs/` | `adr/0001-infrastructure-stack.md` … `adr/0004-authorization-ab.md`, `BASELINE.md` (W0), `W1-service-shell.md` … `W8-hosted-smoke.md` |
 | `migrations/` | ForgeVCS-owned tables; `0001_forgevcs_auth_decisions.sql` is the W6 A/B decision log |
+| `vercel.json` | The container service and catch-all rewrite for the separate Vercel project |
+| `Dockerfile.vercel` | Release build + slim runtime, policy at `/etc/forgevcs/acl.toml`, non-root |
 | `Dockerfile.vercel` | The deploy artefact: release build, non-root uid 10001, listens on `$PORT` |
 
 ## Upstream provenance and licence
@@ -140,10 +142,24 @@ FORGEVCS_AUTH_MODE=SHADOW_COMPARE scripts/w6-authz-smoke.sh
 # shadow refs 200, dual refs 403, two persisted decision rows, invalid mode /ready 503
 ```
 
+## Deployment
+
+The service is its own Vercel project, `culebraluxe-forgevcs`:
+**https://culebraluxe-forgevcs.vercel.app**. `vercel.json` declares a container service using
+`Dockerfile.vercel`; the image carries the binary and `acl.toml`, runs as uid 10001, and listens
+on `PORT=3000` (non-root cannot bind 80). Production secrets include Neon, object storage, the
+service principal and `FORGEVCS_SIGNING_KEY_PEM`; see
+[`docs/W7-vercel-deployment.md`](docs/W7-vercel-deployment.md).
+
+```sh
+vercel deploy --prod --yes
+scripts/w8-hosted-smoke.sh     # W4 20 + W5 17 against the hosted service
+```
+
 ## Build and test
 
 ```sh
-cargo test -p forgevcs-service          # the service (30 tests, no network)
+cargo test -p forgevcs-service          # the service (34 tests, no network)
 cargo build --release --locked          # what the container runs
 
 scripts/engine-smoke.sh                 # boot against the live Neon branch and probe it;
@@ -154,6 +170,7 @@ python3 scripts/w4-acceptance.py --base http://127.0.0.1:3000 --token "$TOKEN" -
 python3 scripts/w5-acceptance.py --base http://127.0.0.1:3000 --token "$TOKEN" --repo forgevcs-workspaces
                                         # the same clients against any deployment (W8)
 scripts/w6-authz-smoke.sh               # shadow 200 / dual 403 / persisted decisions
+scripts/w8-hosted-smoke.sh              # W4/W5 against the Vercel deployment + Neon
 
 scripts/gate.sh                         # the vendored upstream gate (T-core) — must exit 0
                                         # detached, one log per run:
@@ -192,6 +209,8 @@ back to the Neon-injected equivalents:
 | `FORGEVCS_DATABASE_URL` | `DATABASE_URL` | Must be `postgres://` |
 | `FORGEVCS_BUCKET` | `FORGEVCS_S3_BUCKET` | Bucket is **branch-scoped** on Neon |
 | `FORGEVCS_AUTH_MODE` | — | `SCION_ONLY` (default), `SHADOW_COMPARE`, `DUAL_ENFORCE` or `CULEBRA_ONLY` |
+| `FORGEVCS_SIGNING_KEY_PATH` | — | PKCS#8 PEM Ed25519 file; preferred on a host with files |
+| `FORGEVCS_SIGNING_KEY_PEM` | — | The same key inline for a platform that injects secrets as values (Vercel) |
 | `FORGEVCS_AWS_REGION` | `AWS_REGION` | Object Storage supports four AWS regions |
 | `FORGEVCS_AWS_ENDPOINT_URL_S3` | `AWS_ENDPOINT_URL_S3` | Rejected if orphaned without a bucket |
 | `PORT` | — | Default `3000`; Vercel injects it |

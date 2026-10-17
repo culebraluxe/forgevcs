@@ -54,6 +54,10 @@ pub struct Config {
     /// PKCS#8 PEM Ed25519 signing key (`$FORGEVCS_SIGNING_KEY_PATH`). Absent means the engine
     /// generates an ephemeral key and tokens die with the process (ADR-0002 D5).
     pub signing_key: Option<PathBuf>,
+    /// PKCS#8 PEM Ed25519 signing key supplied inline (`$FORGEVCS_SIGNING_KEY_PEM`), for a
+    /// platform that injects secrets as environment values rather than files (Vercel). The
+    /// engine writes it to a private temporary file, loads it, and removes the file.
+    pub signing_key_pem: Option<String>,
     /// GitHub OAuth App client id (`$FORGEVCS_GITHUB_CLIENT_ID`), used by `AuthService.Login`.
     pub github_client_id: Option<String>,
     /// Service principals, comma-separated `name=<sha256 hex>`
@@ -90,6 +94,7 @@ impl Config {
                 .and_then(|raw| raw.parse::<u16>().ok()),
             policy_path: get(&["FORGEVCS_POLICY_PATH"]).map(PathBuf::from),
             signing_key: get(&["FORGEVCS_SIGNING_KEY_PATH"]).map(PathBuf::from),
+            signing_key_pem: get(&["FORGEVCS_SIGNING_KEY_PEM"]),
             github_client_id: get(&["FORGEVCS_GITHUB_CLIENT_ID"]),
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),

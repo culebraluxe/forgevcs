@@ -37,9 +37,10 @@ class AcceptanceError(RuntimeError):
 
 
 class Client:
-    def __init__(self, base: str, token: str) -> None:
+    def __init__(self, base: str, token: str, bypass: str = "") -> None:
         self.base = base.rstrip("/")
         self.token = token
+        self.bypass = bypass
         self.checks = 0
 
     def call(self, method: str, path: str, body=None, token: bool = True, expect: int = 200):
@@ -49,6 +50,8 @@ class Client:
             request.add_header("content-type", "application/json")
         if token and self.token:
             request.add_header("authorization", "Bearer " + self.token)
+        if self.bypass:
+            request.add_header("x-vercel-protection-bypass", self.bypass)
         try:
             with urllib.request.urlopen(request, timeout=90) as response:
                 status = response.status
@@ -86,8 +89,8 @@ def push_body(parent: str, path: str, blob: str, size: int, data: str) -> dict:
     }
 
 
-def run(base: str, token: str, repo: str) -> int:
-    client = Client(base, token)
+def run(base: str, token: str, repo: str, bypass: str = "") -> int:
+    client = Client(base, token, bypass)
     prefix = f"/repos/{repo}"
 
     init = client.call("POST", prefix + "/init", {})
@@ -183,9 +186,10 @@ def main() -> int:
     parser.add_argument("--base", default="http://127.0.0.1:3000")
     parser.add_argument("--token", required=True)
     parser.add_argument("--repo", default="forgevcs-acceptance")
+    parser.add_argument("--bypass", default="", help="Vercel automation-bypass header")
     args = parser.parse_args()
     try:
-        run(args.base, args.token, args.repo)
+        run(args.base, args.token, args.repo, args.bypass)
     except AcceptanceError as error:
         print(f"FAIL  {error}", file=sys.stderr)
         return 1

@@ -273,14 +273,29 @@ fn parse_principals(raw: Option<&str>) -> Result<Vec<ServicePrincipalConfig>> {
 /// key and says so: the service still starts, but tokens do not survive a restart.
 fn signing_keyring(config: &Config) -> Result<Keyring> {
     let paths = config.signing_keys();
-    if paths.is_empty() {
-        tracing::warn!(
-            "FORGEVCS_SIGNING_KEY_PATH is unset: using an ephemeral Ed25519 key; every token \
-             becomes invalid when this process restarts"
-        );
-        return Ok(Keyring::generate_for_tests(1));
+    if !paths.is_empty() {
+        return Keyring::from_files(&paths)
+            .map_err(|e| anyhow::anyhow!("loading signing keys {paths:?}: {e}"));
     }
-    Keyring::from_files(&paths).map_err(|e| anyhow::anyhow!("loading signing keys {paths:?}: {e}"))
+    if let Some(pem) = config.signing_key_pem.as_deref() {
+        // Vercel injects secrets as environment values, not files. Write the PEM to a private
+        // temporary file, load it through the same parser as a path, then let the file drop.
+        use std::io::Write as _;
+        let mut file = tempfile::NamedTempFile::new()
+            .context("creating a temporary file for FORGEVCS_SIGNING_KEY_PEM")?;
+        file.write_all(pem.as_bytes())
+            .context("writing FORGEVCS_SIGNING_KEY_PEM")?;
+        file.flush().context("flushing FORGEVCS_SIGNING_KEY_PEM")?;
+        let path = file.path().to_owned();
+        let keyring = Keyring::from_files(std::slice::from_ref(&path))
+            .map_err(|e| anyhow::anyhow!("loading FORGEVCS_SIGNING_KEY_PEM: {e}"))?;
+        return Ok(keyring);
+    }
+    tracing::warn!(
+        "FORGEVCS_SIGNING_KEY_PATH and FORGEVCS_SIGNING_KEY_PEM are unset: using an ephemeral \
+         Ed25519 key; every token becomes invalid when this process restarts"
+    );
+    Ok(Keyring::generate_for_tests(1))
 }
 
 /// The process-wide registry of engines, keyed by repository name (D3).
@@ -541,6 +556,17 @@ mod tests {
         // repository is part of the contract, not an example.
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../acl.toml");
         PolicyHandle::load(&path).expect("acl.toml parses");
+    }
+
+    #[test]
+    fn signing_key_pem_is_loaded_through_the_same_parser() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keyring = Keyring::generate_for_tests(1);
+        let paths = keyring.write_pem_files(dir.path()).expect("write pem");
+        let pem = std::fs::read_to_string(&paths[0]).expect("read pem");
+        let config =
+            Config::from_lookup(|key| (key == "FORGEVCS_SIGNING_KEY_PEM").then(|| pem.clone()));
+        signing_keyring(&config).expect("PEM keyring loads");
     }
 
     #[test]
