@@ -153,13 +153,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/init", post(facade::init))
         .route("/repos/{repo}/push", post(facade::push))
         .route("/repos/{repo}/pull", post(facade::pull))
-        .route("/repos/{repo}/refs", get(facade::refs))
+        .route("/repos/{repo}/refs", get(facade::refs).post(facade::ref_create))
         .route("/repos/{repo}/commits", get(facade::commits))
         .route("/repos/{repo}/changesets/{id}", get(facade::changeset))
         .route("/repos/{repo}/file", get(facade::file))
         .route("/repos/{repo}/tree", get(facade::tree))
         .route("/repos/{repo}/diff", get(facade::diff))
         .route("/repos/{repo}/merge-base", get(facade::merge_base))
+        .route("/repos/{repo}/rebase", post(facade::rebase))
+        .route("/repos/{repo}/merge", post(facade::merge))
+        .route("/repos/{repo}/land", post(facade::land))
         .route("/repos/{repo}/workspaces", post(facade::workspace_create))
         .route(
             "/repos/{repo}/workspaces/{id}",

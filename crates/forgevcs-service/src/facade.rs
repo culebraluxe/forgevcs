@@ -1513,6 +1513,41 @@ fn default_push_mode() -> String {
     "land".to_owned()
 }
 
+/// `POST /repos/{repo}/refs` — create a ref at an existing changeset.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RefCreateBody {
+    name: String,
+    target: String,
+    #[serde(default)]
+    reason: String,
+}
+
+/// `POST /repos/{repo}/rebase` — rebase one changeset onto another.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RebaseBody {
+    changeset: String,
+    onto: String,
+}
+
+/// `POST /repos/{repo}/merge` — produce a merge changeset from two changesets.
+#[derive(Debug, Deserialize)]
+pub(crate) struct MergeBody {
+    a: String,
+    b: String,
+    meta: MetaBody,
+    change_id: String,
+}
+
+/// `POST /repos/{repo}/land` — publish an existing changeset on a ref.
+#[derive(Debug, Deserialize)]
+pub(crate) struct LandBody {
+    #[serde(rename = "ref", default = "default_ref")]
+    ref_name: String,
+    head: String,
+    #[serde(default)]
+    allow_empty: bool,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -1764,6 +1799,246 @@ pub(crate) async fn push(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Collaboration surface — refs, rebase, merge, land
+//
+// These are the operations a set of agents needs after the source-control floor: each agent
+// writes to its own ref (provisioned with CreateRef by an `admin.refs` seat), and integration
+// is `land`, which already rebases a linear stack onto the ref tip. `rebase` and `merge` expose
+// the vendored handlers so a contended agent has a designed convergence step instead of only
+// "retry onto the new tip".
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /repos/{repo}/refs` — create a ref at an existing changeset.
+///
+/// Upstream `RefService.CreateRef` requires `admin.refs`; that is the provisioning seat for
+/// per-agent lane refs. `GET /refs` (list) is unchanged and remains on the same route.
+pub(crate) async fn ref_create(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<RefCreateBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let target = match parse_id(&body.target, "target") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let request = v1::CreateRefRequest {
+        name: body.name.clone(),
+        target: convert::id_bytes(&target),
+        reason: body.reason.clone(),
+    };
+    match handlers::refs::create_ref(&engine.context(), caller_request(request, &caller)).await {
+        Ok(response) => {
+            let version = response.into_inner().version;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "ref": { "name": body.name, "target": target.to_text(), "version": version },
+                })),
+            )
+                .into_response()
+        }
+        Err(status) => status_response(status),
+    }
+}
+
+/// `POST /repos/{repo}/rebase` — replay a changeset onto another; returns the new changeset.
+///
+/// Requires repository read only (upstream `WriteService.Rebase`): the result is unnamed and
+/// landing it is what checks write and ref authority.
+pub(crate) async fn rebase(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<RebaseBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let changeset = match parse_id(&body.changeset, "changeset") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let onto = match parse_id(&body.onto, "onto") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let request = v1::RebaseRequest {
+        changeset: convert::id_bytes(&changeset),
+        onto: convert::id_bytes(&onto),
+    };
+    match handlers::write::rebase(&engine.context(), caller_request(request, &caller)).await {
+        Ok(response) => {
+            let id = id_text(&response.into_inner().changeset_id);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "changeset": { "id": id },
+                })),
+            )
+                .into_response()
+        }
+        Err(status) => status_response(status),
+    }
+}
+
+/// `POST /repos/{repo}/merge` — produce a merge changeset from two changesets.
+///
+/// Upstream `WriteService.Merge` checks write on every path of the resulting delta. The result
+/// is unnamed; publish it with `/land` when it is a linear head, or rebase it first.
+pub(crate) async fn merge(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<MergeBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let a = match parse_id(&body.a, "a") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let b = match parse_id(&body.b, "b") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let change_id = match parse_change_id(&body.change_id) {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let request = v1::MergeRequest {
+        a: convert::id_bytes(&a),
+        b: convert::id_bytes(&b),
+        meta_fields: Some(body.meta.into_proto()),
+        change_id,
+    };
+    match handlers::write::merge(&engine.context(), caller_request(request, &caller)).await {
+        Ok(response) => {
+            let id = id_text(&response.into_inner().changeset_id);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "changeset": { "id": id },
+                })),
+            )
+                .into_response()
+        }
+        Err(status) => status_response(status),
+    }
+}
+
+/// `POST /repos/{repo}/land` — publish an existing changeset on a ref.
+///
+/// This is the integration step for agents that write to their own ref: Land rebases the
+/// changeset's linear stack onto the ref tip, checks write on every delta path and update on
+/// the ref on every attempt, and commits with a version CAS. A merge head is not a legal stack
+/// member (upstream INVALID_ARGUMENT/merge_in_stack), so merge results are rebased or
+/// re-derived before landing.
+pub(crate) async fn land(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<LandBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let head = match parse_id(&body.head, "head") {
+        Ok(value) => value,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let request = v1::LandRequest {
+        r#ref: body.ref_name.clone(),
+        head: convert::id_bytes(&head),
+        allow_empty: body.allow_empty,
+    };
+    match handlers::write::land(&engine.context(), caller_request(request, &caller)).await {
+        Ok(response) => {
+            let response = response.into_inner();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "ref": {
+                        "name": body.ref_name,
+                        "target": id_text(&response.target),
+                        "version": response.version,
+                    },
+                    "landed": landed_json(&response.landed),
+                })),
+            )
+                .into_response()
+        }
+        Err(status) => status_response(status),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

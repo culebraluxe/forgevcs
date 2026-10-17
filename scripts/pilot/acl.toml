@@ -1,21 +1,31 @@
 # ForgeVCS pilot policy — LOCAL multi-agent test only.
 #
-# This is acl.toml with the three throwaway pilot principals added. It is loaded by
-# scripts/agent-pilot.sh through FORGEVCS_POLICY_PATH; it is NOT the policy the service
-# ships with, so the hosted deployment is unchanged.
+# This is acl.toml with the three throwaway pilot principals and the per-agent lane refs
+# added. It is loaded by scripts/agent-pilot.sh through FORGEVCS_POLICY_PATH; it is NOT the
+# policy the service ships with, so the hosted deployment is unchanged.
 #
 # Why a separate file: FORGEVCS_SERVICE_PRINCIPALS configures which identities can mint a
 # token; acl.toml decides what those identities may do. The pilot principals must be named
 # here or every request is PERMISSION_DENIED, which is the deny-by-default contract.
 #
-# Phase 1 keeps the shipped shape on purpose — one `agents` group, read/write on `/`.
-# That makes the pilot's isolation check meaningful: agent-a CAN read agent-b's repository,
-# which records the per-repository ACL gap instead of hiding it.
+# The write scope here is a REF scope, not a path scope. Each agent may advance only its own
+# lane ref (`agent/a`, `agent/b`, `agent/c`); the shared `main` ref is the integration target.
+# That is the direct replacement for "one git worktree + branch per lane": the agent still
+# gets its own writable line of history, but there is no checkout, index or worktree to
+# collide over. Paths stay readable/writable by all agents because a real codebase shares
+# files across agents; isolation is in history, not in directories.
+#
+# `admin.refs` is the provisioning seat: CreateRef is the only way to make a ref, so one
+# principal (agent-a, the lead) creates the three lane refs once. Agents cannot create refs.
 
 version = 1
 
 [groups]
 agents = ["service:agent-a", "service:agent-b", "service:agent-c", "service:forgevcs-workspace"]
+agent-a = ["service:agent-a"]
+agent-b = ["service:agent-b"]
+agent-c = ["service:agent-c"]
+provisioner = ["service:agent-a"]
 
 # The `/` rule is required by the parser and is the fallback for every path.
 [[paths]]
@@ -25,4 +35,9 @@ write = ["group:agents"]
 
 [refs]
 "main" = { update = ["group:agents"] }
-"refs/heads/*" = { update = ["group:agents"] }
+"agent/a" = { update = ["group:agent-a"] }
+"agent/b" = { update = ["group:agent-b"] }
+"agent/c" = { update = ["group:agent-c"] }
+
+[admin]
+refs = ["group:provisioner"]

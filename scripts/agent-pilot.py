@@ -19,12 +19,17 @@ What it proves, in order:
                the other gets a clear 409; the ref is not lost and nothing is half-applied
   recovery     the loser re-reads the ref and lands a changeset on the winner's tip
   workspaces   three agents each create a workspace, write, and submit concurrently
+  lane refs    an `admin.refs` seat provisions one ref per agent; each agent advances only
+               its own ref, and a cross-ref push is refused with a recorded 403
+  land         Land rebases each agent's linear stack onto main; both lanes' files coexist
+  merge        the merge handler produces a two-parent changeset for the two lane heads
+  rebase       a fresh changeset is replayed onto main and then landed
 
 It never invents identities: the principals and secrets come from
 FORGEVCS_SERVICE_PRINCIPALS, which scripts/agent-pilot.sh sets before booting the engine.
 
 There is no repository deletion endpoint yet (docs/M1-readiness-and-multi-agent.md), so
-this client creates four repositories and prints their names for manual cleanup.
+this client creates five repositories and prints their names for manual cleanup.
 
 Exit 0 only when every graded check passes. No third-party Python packages are used.
 """
@@ -119,7 +124,16 @@ def mint(base: str, principal: str, secret: str) -> str:
     return token
 
 
-def push_body(parent: str, path: str, blob: str, size: int, data: str, message: str) -> dict:
+def push_body(
+    parent: str,
+    path: str,
+    blob: str,
+    size: int,
+    data: str,
+    message: str,
+    ref_name: str = DEFAULT_REF,
+    mode: str = "land",
+) -> dict:
     return {
         "objects": [{"id": blob, "data": data}],
         "changeset": {
@@ -131,8 +145,8 @@ def push_body(parent: str, path: str, blob: str, size: int, data: str, message: 
             },
             "change_id": secrets.token_hex(16),
         },
-        "ref": DEFAULT_REF,
-        "mode": "land",
+        "ref": ref_name,
+        "mode": mode,
     }
 
 
@@ -166,6 +180,16 @@ def land(client: Client, repo: str, parent: str, path: str, blob: str, size: int
 def tree_paths(client: Client, repo: str, changeset: str) -> set[str]:
     tree = client.call("GET", f"/repos/{repo}/tree?changeset={changeset}")
     return {entry["name"] for entry in tree["entries"]}
+
+
+def file_at(client: Client, repo: str, changeset: str, path: str) -> str | None:
+    """Read one path at a changeset; None when it is absent (a nested path needs this)."""
+    status, body = client.status(
+        "GET", f"/repos/{repo}/file?changeset={changeset}&path={path}"
+    )
+    if status != 200:
+        return None
+    return base64.b64decode(body["data"]).decode("utf-8", "replace")
 
 
 def main() -> int:
@@ -343,13 +367,13 @@ def main() -> int:
     loser_index = 1 - winner_index
     tip, version = main_target(clients[first], shared_repo)
     winner_content = CONTENT_A if winner_index == 0 else CONTENT_B
-    file_at = clients[first].call(
+    winner_file = clients[first].call(
         "GET", f"/repos/{shared_repo}/file?changeset={tip}&path=collision.txt"
     )
     clients[first].check(
         "contention: the ref carries the winner's bytes",
-        base64.b64decode(file_at["data"]) == winner_content,
-        str(file_at.get("entry")),
+        base64.b64decode(winner_file["data"]) == winner_content,
+        str(winner_file.get("entry")),
     )
 
     # --- recovery: the loser lands on the winner's tip -----------------------------------
@@ -408,6 +432,206 @@ def main() -> int:
             bool(changeset),
             f"changeset {changeset}",
         )
+
+    # --- per-agent lane refs: write scope, cross-ref deny, integration --------------------
+    #
+    # This is the git-lane replacement. Each agent gets its own ref (its writable line of
+    # history); `admin.refs` provisions those refs once; each agent may advance only its own;
+    # `land` integrates a lane onto main and rebases it over whatever landed first. No
+    # checkout, index or worktree is involved.
+    team_repo = f"agent-pilot-{stamp}-team"
+    created.append(team_repo)
+    lead = clients[first]
+    init_repo(lead, team_repo)
+    base, base_version = main_target(lead, team_repo)
+    letter = {"agent-a": "a", "agent-b": "b", "agent-c": "c"}
+    ref_of = {principal: f"agent/{letter[principal]}" for principal, _ in agents}
+
+    # Stage one changeset per agent (mode "none" creates it without touching a ref), then the
+    # `admin.refs` seat provisions one lane ref per agent.
+    staged = {}
+    for principal, _ in agents:
+        staged[principal] = clients[principal].call(
+            "POST",
+            f"/repos/{team_repo}/push",
+            push_body(
+                base,
+                f"{letter[principal]}/lane.txt",
+                BLOB_A,
+                len(CONTENT_A),
+                B64_A,
+                f"{principal} lane seed",
+                mode="none",
+            ),
+        )["changeset"]["id"]
+    for principal, _ in agents:
+        lead.call(
+            "POST",
+            f"/repos/{team_repo}/refs",
+            {
+                "name": ref_of[principal],
+                "target": staged[principal],
+                "reason": "agent-pilot lane provisioning",
+            },
+        )
+    listed = {ref["name"] for ref in lead.call("GET", f"/repos/{team_repo}/refs")["refs"]}
+    lead.check(
+        "refs: one provisioned lane ref per agent",
+        set(ref_of.values()) <= listed,
+        str(sorted(listed)),
+    )
+
+    # Each agent advances its own lane ref. Every agent can write "/" and passes the shared
+    # push pre-check, so the landing is what proves the ref rule does the scoping.
+    heads = {}
+    for principal, _ in agents:
+        ref = ref_of[principal]
+        target, version = next(
+            (row["target"], row["version"])
+            for row in clients[principal].call("GET", f"/repos/{team_repo}/refs")["refs"]
+            if row["name"] == ref
+        )
+        pushed = clients[principal].call(
+            "POST",
+            f"/repos/{team_repo}/push",
+            push_body(
+                target,
+                f"{letter[principal]}/two.txt",
+                BLOB_A,
+                len(CONTENT_A),
+                B64_A,
+                f"{principal} lane advance",
+                ref_name=ref,
+            ),
+        )
+        clients[principal].check(
+            f"refs: {principal} landed its own lane ref",
+            pushed["ref"]["name"] == ref and pushed["ref"]["version"] > version,
+            str(pushed.get("ref")),
+        )
+        heads[principal] = pushed["ref"]["target"]
+
+    # The cross-agent write: agent-b cannot advance agent-a's lane ref.
+    intruder = agents[1][0]
+    owner = agents[0][0]
+    target_of_owner, _ = next(
+        (row["target"], row["version"])
+        for row in lead.call("GET", f"/repos/{team_repo}/refs")["refs"]
+        if row["name"] == ref_of[owner]
+    )
+    status, body = clients[intruder].status(
+        "POST",
+        f"/repos/{team_repo}/push",
+        push_body(
+            target_of_owner,
+            "intruder.txt",
+            BLOB_A,
+            len(CONTENT_A),
+            B64_A,
+            f"{intruder} cross-ref attempt",
+            ref_name=ref_of[owner],
+        ),
+    )
+    clients[intruder].check(
+        f"per-agent write scope: {intruder} cannot advance {ref_of[owner]}",
+        status == 403,
+        f"HTTP {status} {str(body)[:200]}",
+    )
+
+    # Integration is `land`: Land rebases a lane's linear stack onto main and commits. Land
+    # agent-b's lane, then agent-a's; both agents' files must coexist on main.
+    for principal, _ in agents[:2]:
+        landed = lead.call(
+            "POST",
+            f"/repos/{team_repo}/land",
+            {"ref": DEFAULT_REF, "head": heads[principal]},
+        )
+        lead.check(
+            f"land: {principal}'s lane landed on main",
+            landed["ref"]["version"] > base_version,
+            str(landed.get("ref")),
+        )
+    main_tip, _ = main_target(lead, team_repo)
+    integrated = {
+        f"{letter[principal]}/{name}.txt"
+        for principal, _ in agents[:2]
+        for name in ("lane", "two")
+    }
+    present = {
+        path
+        for path in integrated
+        if file_at(lead, team_repo, main_tip, path) is not None
+    }
+    lead.check(
+        "land: both integrated agents' files are in main",
+        present == integrated,
+        f"tip {main_tip} missing {sorted(integrated - present)}",
+    )
+
+    # Explicit merge: produce a merge changeset for the two lane heads. The handler exists
+    # upstream and is now routed through the façade.
+    merged = lead.call(
+        "POST",
+        f"/repos/{team_repo}/merge",
+        {
+            "a": heads[owner],
+            "b": heads[agents[1][0]],
+            "meta": {
+                "author": "ForgeVCS agent pilot <pilot@example.test>",
+                "message": "merge agent-a and agent-b lanes",
+            },
+            "change_id": secrets.token_hex(16),
+        },
+    )["changeset"]["id"]
+    merged_detail = lead.call("GET", f"/repos/{team_repo}/changesets/{merged}")["changeset"]
+    lead.check(
+        "merge: the merged changeset has two parents",
+        len(merged_detail.get("parents", [])) == 2,
+        str(merged_detail.get("parents")),
+    )
+    merge_land_status, merge_land_body = lead.status(
+        "POST", f"/repos/{team_repo}/land", {"ref": DEFAULT_REF, "head": merged}
+    )
+    print(
+        f"INFO  land-of-merge: HTTP {merge_land_status} "
+        f"({merge_land_body.get('code', 'landed')}) — Land takes a linear stack, "
+        "so a merge head is rebased or re-derived before landing"
+    )
+
+    # Explicit rebase: replay a fresh changeset onto the current main tip, then land it.
+    other = agents[2][0]
+    rebase_seed = clients[other].call(
+        "POST",
+        f"/repos/{team_repo}/push",
+        push_body(
+            base,
+            f"{letter[other]}/rebase.txt",
+            BLOB_B,
+            len(CONTENT_B),
+            B64_B,
+            f"{other} rebase seed",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    rebased = lead.call(
+        "POST",
+        f"/repos/{team_repo}/rebase",
+        {"changeset": rebase_seed, "onto": main_tip},
+    )["changeset"]["id"]
+    lead.check(
+        "rebase: the changeset was replayed onto main",
+        rebased != rebase_seed,
+        f"seed {rebase_seed} -> {rebased}",
+    )
+    lead.call(
+        "POST", f"/repos/{team_repo}/land", {"ref": DEFAULT_REF, "head": rebased}
+    )
+    rebased_tip, _ = main_target(lead, team_repo)
+    lead.check(
+        "rebase: the replayed changeset landed on main",
+        file_at(lead, team_repo, rebased_tip, f"{letter[other]}/rebase.txt") is not None,
+        f"tip {rebased_tip}",
+    )
 
     total = sum(client.checks for client in clients.values())
     print(f"OK  {total} checks passed across 3 agents and {len(created)} repositories")
