@@ -130,7 +130,9 @@ platform "successful" message.
 6. `--smoke` runs W8.
 
 The first build downloads the Rust image and cross toolchain; later builds reuse the BuildKit
-cache and typically compile in under a minute. Vercel builds only the runtime layer.
+cache. Measured 2026-10-17: the exported binary is 23 MB, Vercel's runtime image build took
+**9 seconds**, and the deployment was Ready in 30 seconds. The W8 acceptance then passed W4
+20/20 and W5 17/17 on that deployment.
 
 ## 6. Relationship to the main application release path
 
