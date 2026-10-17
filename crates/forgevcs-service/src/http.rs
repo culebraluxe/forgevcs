@@ -153,6 +153,29 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/tree", get(facade::tree))
         .route("/repos/{repo}/diff", get(facade::diff))
         .route("/repos/{repo}/merge-base", get(facade::merge_base))
+        .route("/repos/{repo}/workspaces", post(facade::workspace_create))
+        .route(
+            "/repos/{repo}/workspaces/{id}",
+            get(facade::workspace_status).delete(facade::workspace_destroy),
+        )
+        .route(
+            "/repos/{repo}/workspaces/{id}/materialize",
+            post(facade::workspace_materialize),
+        )
+        .route(
+            "/repos/{repo}/workspaces/{id}/file",
+            get(facade::workspace_read_file)
+                .put(facade::workspace_write_file)
+                .delete(facade::workspace_delete_file),
+        )
+        .route(
+            "/repos/{repo}/workspaces/{id}/diff",
+            get(facade::workspace_diff),
+        )
+        .route(
+            "/repos/{repo}/workspaces/{id}/submit",
+            post(facade::workspace_submit),
+        )
         // Pushes carry base64 objects; axum's 2 MiB JSON default is smaller than one
         // upstream blob limit. 32 MiB leaves room for base64 expansion of a 16 MiB blob.
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
@@ -501,13 +524,18 @@ mod tests {
             "/repos/forgevcs/tree?changeset=c12597b62a1634a5e5c5bd505e47cf5fb15939cde2a52c3d692c7bdf1c92391c33",
             "/repos/forgevcs/diff?b=c12597b62a1634a5e5c5bd505e47cf5fb15939cde2a52c3d692c7bdf1c92391c33",
             "/repos/forgevcs/merge-base?a=c12597b62a1634a5e5c5bd505e47cf5fb15939cde2a52c3d692c7bdf1c92391c33&b=c12597b62a1634a5e5c5bd505e47cf5fb15939cde2a52c3d692c7bdf1c92391c33",
+            "/repos/forgevcs/workspaces/00000000-0000-0000-0000-000000000000",
         ] {
             let (status, _, body) = get_at(path).await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
             let body: Value = serde_json::from_str(&body).unwrap();
             assert_eq!(body["code"], "unavailable", "{path}");
         }
-        for path in ["/repos/forgevcs/pull", "/repos/forgevcs/push"] {
+        for path in [
+            "/repos/forgevcs/pull",
+            "/repos/forgevcs/push",
+            "/repos/forgevcs/workspaces",
+        ] {
             let (status, _, body) = post_json(path, "{}").await;
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
             let body: Value = serde_json::from_str(&body).unwrap();

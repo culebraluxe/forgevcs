@@ -32,6 +32,7 @@ scion-policy = { path = "upstream/crates/scion-policy" }
 scion-server = { path = "upstream/crates/scion-server" }
 scion-proto = { path = "upstream/crates/scion-proto" }
 scion-object = { path = "upstream/crates/scion-object" }
+scion-wc = { path = "upstream/crates/scion-wc" }
 
 # ---- versions pinned to match upstream exactly, so one Cargo.lock serves both ----
 bytes = "=1.12.1"
@@ -40,12 +41,15 @@ tokio = { version = "=1.53.3", features = ["full"] }
 tower = { version = "=0.5.3", features = ["util"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_json = "=1.0.154"
-tonic = { version = "=0.14.6", default-features = false }
+tonic = { version = "=0.14.6", default-features = false, features = ["transport", "tls-ring", "tls-native-roots", "codegen", "router", "server", "channel"] }
 tonic-prost = "=0.14.6"
 prost = "=0.14.4"
 futures = "=0.3.34"
 base64 = "=0.22.1"
 hex = "=0.4.3"
+tokio-stream = { version = "=0.1.19", features = ["net"] }
+tempfile = "=3.27.0"
+uuid = { version = "=1.28.0", features = ["v4"] }
 anyhow = "=1.0.104"
 tracing = "=0.1.44"
 

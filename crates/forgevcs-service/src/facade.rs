@@ -1567,6 +1567,461 @@ pub(crate) async fn push(
         .into_response()
 }
 
+// ---------------------------------------------------------------------------------------------
+// W5 WorkspaceService
+//
+// Each workspace is a disposable scion-wc materialization in a temp directory. The working copy
+// talks to the engine's private Unix-socket gRPC surface; the external caller's policy is applied
+// here because the internal principal is privileged.
+// ---------------------------------------------------------------------------------------------
+
+fn require_root_read(engine: &Arc<Engine>, caller: &CallerCtx) -> Result<(), Response> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    if policy.can_read(&caller.principal, &RepoPath::root()) {
+        Ok(())
+    } else {
+        Err(status_response(Status::permission_denied(
+            "repository read (read on /) denied",
+        )))
+    }
+}
+
+fn require_root_write(engine: &Arc<Engine>, caller: &CallerCtx) -> Result<(), Response> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    if policy.can_write(&caller.principal, &RepoPath::root()) {
+        Ok(())
+    } else {
+        Err(status_response(Status::permission_denied(
+            "repository write (write on /) denied",
+        )))
+    }
+}
+
+fn workspace_rev(changeset: Option<&str>, ref_name: Option<&str>) -> Result<String, Response> {
+    match changeset {
+        Some(raw) => match parse_id(raw, "changeset") {
+            Ok(id) => Ok(id.to_text()),
+            Err(message) => Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &message,
+            )),
+        },
+        None => Ok(ref_name.unwrap_or(DEFAULT_REF).to_owned()),
+    }
+}
+
+fn parse_sparse(sparse: &[String]) -> Result<Vec<RepoPath>, Response> {
+    let mut paths = Vec::with_capacity(sparse.len());
+    for raw in sparse {
+        match RepoPath::parse(raw.as_bytes()) {
+            Ok(path) => paths.push(path),
+            Err(error) => {
+                return Err(error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    &format!("sparse path {raw:?}: {}", error.message),
+                ));
+            }
+        }
+    }
+    Ok(paths)
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceCreateBody {
+    #[serde(rename = "ref")]
+    ref_name: Option<String>,
+    changeset: Option<String>,
+    #[serde(default)]
+    sparse: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceMaterializeBody {
+    #[serde(rename = "ref")]
+    ref_name: Option<String>,
+    changeset: Option<String>,
+    #[serde(default)]
+    force: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceFileQuery {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceWriteBody {
+    data: String,
+    #[serde(default = "default_write_mode")]
+    mode: u8,
+}
+
+fn default_write_mode() -> u8 {
+    1
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceSubmitBody {
+    message: String,
+    author: Option<String>,
+    #[serde(rename = "ref")]
+    ref_name: Option<String>,
+    #[serde(default = "default_push_mode")]
+    mode: String,
+}
+
+/// `POST /repos/{repo}/workspaces` — materialize a ref/changeset into a disposable workspace.
+pub(crate) async fn workspace_create(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<WorkspaceCreateBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let rev = match workspace_rev(body.changeset.as_deref(), body.ref_name.as_deref()) {
+        Ok(rev) => rev,
+        Err(response) => return response,
+    };
+    let sparse = match parse_sparse(&body.sparse) {
+        Ok(sparse) => sparse,
+        Err(response) => return response,
+    };
+    match engine.workspaces().create(&rev, sparse).await {
+        Ok((workspace_id, workspace_state)) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "workspace_id": workspace_id,
+                "state": workspace_state,
+            })),
+        )
+            .into_response(),
+        Err(status) => status_response(status),
+    }
+}
+
+/// `GET /repos/{repo}/workspaces/{id}` — status.
+pub(crate) async fn workspace_status(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .status(&id, &policy, &caller.principal)
+        .await;
+    workspace_result(repo, result)
+}
+
+/// `POST /repos/{repo}/workspaces/{id}/materialize` — move to another ref/changeset.
+pub(crate) async fn workspace_materialize(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<WorkspaceMaterializeBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let rev = match workspace_rev(body.changeset.as_deref(), body.ref_name.as_deref()) {
+        Ok(rev) => rev,
+        Err(response) => return response,
+    };
+    let result = engine.workspaces().materialize(&id, &rev, body.force).await;
+    workspace_result(repo, result)
+}
+
+/// `GET /repos/{repo}/workspaces/{id}/file?path=…`
+pub(crate) async fn workspace_read_file(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    query: Result<Query<WorkspaceFileQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .read_file(&id, &query.path, &policy, &caller.principal)
+        .await;
+    workspace_result(repo, result)
+}
+
+/// `PUT /repos/{repo}/workspaces/{id}/file?path=…`
+pub(crate) async fn workspace_write_file(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    query: Result<Query<WorkspaceFileQuery>, QueryRejection>,
+    headers: HeaderMap,
+    body: Result<Json<WorkspaceWriteBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let data = match BASE64.decode(body.data.as_bytes()) {
+        Ok(data) => data,
+        Err(error) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!("data is not base64: {error}"),
+            );
+        }
+    };
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .write_file(
+            &id,
+            &query.path,
+            &data,
+            body.mode,
+            &policy,
+            &caller.principal,
+        )
+        .await;
+    workspace_result(repo, result)
+}
+
+/// `DELETE /repos/{repo}/workspaces/{id}/file?path=…`
+pub(crate) async fn workspace_delete_file(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    query: Result<Query<WorkspaceFileQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .delete_file(&id, &query.path, &policy, &caller.principal)
+        .await;
+    workspace_result(repo, result)
+}
+
+/// `GET /repos/{repo}/workspaces/{id}/diff?context=3`
+pub(crate) async fn workspace_diff(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    query: Result<Query<WorkspaceDiffQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    if let Err(response) = require_root_read(&engine, &caller) {
+        return response;
+    }
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .diff(&id, query.context.min(100), &policy, &caller.principal)
+        .await;
+    workspace_result(repo, result)
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct WorkspaceDiffQuery {
+    #[serde(default = "default_context")]
+    context: usize,
+}
+
+fn default_context() -> usize {
+    3
+}
+
+/// `POST /repos/{repo}/workspaces/{id}/submit` — commit and optionally land.
+pub(crate) async fn workspace_submit(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<WorkspaceSubmitBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    if body.message.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "message must not be empty",
+        );
+    }
+    let ref_name = body.ref_name.as_deref().unwrap_or(DEFAULT_REF);
+    let author = body
+        .author
+        .as_deref()
+        .unwrap_or("ForgeVCS workspace <workspace@example.test>");
+    let app = engine.context();
+    let policy = app.policy.current();
+    let result = engine
+        .workspaces()
+        .submit(
+            &id,
+            crate::workspace::SubmitRequest {
+                message: body.message.as_bytes(),
+                author: author.as_bytes(),
+                ref_name,
+                mode: &body.mode,
+            },
+            &policy,
+            &caller.principal,
+        )
+        .await;
+    workspace_result(repo, result)
+}
+
+/// `DELETE /repos/{repo}/workspaces/{id}` — dispose of the workspace.
+pub(crate) async fn workspace_destroy(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo) {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_root_write(&engine, &caller) {
+        return response;
+    }
+    match engine.workspaces().destroy(&id).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "workspace_id": id,
+                "destroyed": true,
+            })),
+        )
+            .into_response(),
+        Err(status) => status_response(status),
+    }
+}
+
+fn workspace_result(repo: String, result: Result<Value, Status>) -> Response {
+    match result {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "workspace": value,
+            })),
+        )
+            .into_response(),
+        Err(status) => status_response(status),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

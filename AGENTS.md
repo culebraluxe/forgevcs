@@ -32,9 +32,15 @@ passed, clippy 0, the upstream gate is unchanged at 1343, and `scripts/engine-sm
 20-check `scripts/w4-acceptance.py` client against Neon (A → B, parent, history, both file
 versions, tree, diff, merge-base) and exits 0. Repository deletion, restart recovery for
 non-default repos, human login, and the gRPC layers the façade skips are the open W4 gaps
-(`docs/W4-engine-wiring.md` §8.6). See `docs/W4-engine-wiring.md`. The Postgres port does not
-change the default build: it lives behind `--features postgres`, and the object-storage
-additions are additive.
+(`docs/W4-engine-wiring.md` §8.6). See `docs/W4-engine-wiring.md`. **W5 — WorkspaceService —
+PASS (2026-10-17)**: `WorkspaceService` wraps the vendored `scion-wc` over a private
+Unix-socket gRPC surface (ADR-0003); `POST/GET/PUT/DELETE /repos/{repo}/workspaces…` cover
+create/materialize/status/read/write/delete/diff/submit/destroy. Workspaces are disposable
+temp directories; canonical history stays in Neon. `scripts/w5-acceptance.py` passes 17 checks
+(create → write → diff → submit → destroy → recreate; history survives), the service has 30
+tests, clippy is 0, and the upstream gate is 1343. See `docs/W5-workspace-service.md`. The
+Postgres port does not change the default build: it lives behind `--features postgres`, and the
+object-storage additions are additive.
 
 **Find out where things stand with one command, not by reading logs.**
 `scripts/gate-status.sh` prints one JSON line and exits 0 pass / 1 fail / 2 running / 3 never
@@ -63,6 +69,10 @@ Read these before changing anything, in this order:
    service (D3 engine registry, D4 in-process handlers, D5 readiness, D6 table split) and the
    live acceptance run, including the three findings that cost time (TLS, `Arc` coercion,
    the required `/` policy rule).
+7. [`docs/adr/0003-workspace-service.md`](docs/adr/0003-workspace-service.md) +
+   [`docs/W5-workspace-service.md`](docs/W5-workspace-service.md) — the WorkspaceService
+   decision (internal Unix-socket gRPC, disposable temp-directory workspaces, external policy
+   checks) and the 17-check live acceptance.
 
 ## Hard rules
 

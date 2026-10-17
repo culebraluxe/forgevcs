@@ -18,15 +18,19 @@ use scion_config::{
     AuthSection, MetadataSection, ObjectsSection, PolicySection, ServerConfig, ServerSection,
     ServicePrincipalConfig,
 };
-use scion_core::{FaultRegistry, SystemClock};
+use scion_core::{FaultRegistry, Principal, SystemClock};
 use scion_obs::{Metrics, Readiness};
 use scion_policy::PolicyHandle;
+use scion_proto::{Endpoint, ScionClient};
 use scion_server::{AppContext, ServerApp, ServerDeps};
 use scion_store::{BlobStore, Storage};
 use scion_store_crdb::{CrdbConfig, CrdbMetaStore};
 use scion_store_s3::S3BlobStore;
+use tempfile::TempDir;
+use tokio::task::JoinHandle;
 
 use crate::config::Config;
+use crate::workspace::WorkspaceService;
 
 /// GitHub REST base URL (upstream SPEC 6.5 default).
 const DEFAULT_GITHUB_API: &str = "https://api.github.com";
@@ -44,15 +48,33 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// Key the readiness probe `HEAD`s. Content-addressed keys never collide with it.
 const PROBE_KEY: &str = "forgevcs/readiness-probe";
+/// Lifetime of the internal workspace client's token. Workspace operations are short-lived;
+/// the container is restarted far more often than this.
+const INTERNAL_TOKEN_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One repository's engine.
 pub struct Engine {
     repo: String,
     meta: Arc<CrdbMetaStore>,
     blobs: Arc<dyn BlobStore>,
+    /// The internal `scion.v1` client the working-copy layer uses. It talks to this engine's
+    /// own gRPC router over a Unix socket, so REST remains the only external surface.
+    client: ScionClient,
+    /// The WorkspaceService built on the internal client.
+    workspaces: Arc<WorkspaceService>,
+    /// The internal gRPC server task; aborted on drop.
+    _grpc: JoinHandle<()>,
+    /// Holds the Unix socket path; removing the directory removes the socket.
+    _socket_dir: TempDir,
     /// Kept for its `Drop`: dropping the app aborts its background tasks.
     _app: ServerApp,
     ctx: Arc<AppContext>,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self._grpc.abort();
+    }
 }
 
 impl Engine {
@@ -64,6 +86,16 @@ impl Engine {
     /// The handler context every endpoint will call into (D4).
     pub fn context(&self) -> Arc<AppContext> {
         Arc::clone(&self.ctx)
+    }
+
+    /// A client for the engine's internal `scion.v1` server (the working-copy layer).
+    pub fn client(&self) -> ScionClient {
+        self.client.clone()
+    }
+
+    /// The WorkspaceService for this repository.
+    pub fn workspaces(&self) -> Arc<WorkspaceService> {
+        Arc::clone(&self.workspaces)
     }
 
     /// Connect the metadata store, configure the object store, load the policy and the signing
@@ -111,10 +143,41 @@ impl Engine {
         .await
         .context("building the engine")?;
         let ctx = app.context();
+
+        // The working-copy library is a client of the gRPC surface. Serve that surface on a
+        // private Unix socket and connect a client to it, so the workspace layer uses Scion's
+        // own implementation without making gRPC externally reachable (ADR-0002 D4 keeps the
+        // REST façade in-process; this is the internal/local gRPC ADR-0001 §5.2 permits).
+        let socket_dir =
+            tempfile::tempdir().context("creating the internal gRPC socket directory")?;
+        let socket_path = socket_dir.path().join("scion.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path)
+            .context("binding the internal gRPC Unix socket")?;
+        let (token, _claims) = ctx.keyring.issue(
+            &Principal::Service("forgevcs-workspace".to_owned()),
+            INTERNAL_TOKEN_TTL,
+            ctx.clock.now(),
+        )?;
+        let router = app.router();
+        let grpc = tokio::spawn(async move {
+            let incoming = tokio_stream::wrappers::UnixListenerStream::new(listener);
+            if let Err(error) = router.serve_with_incoming(incoming).await {
+                tracing::error!(%error, "internal gRPC server stopped");
+            }
+        });
+        let client = ScionClient::connect(&Endpoint::Unix(socket_path), None, Some(token))
+            .await
+            .context("connecting the internal gRPC client")?;
+        let workspaces = Arc::new(WorkspaceService::new(client.clone()));
+
         Ok(Self {
             repo: repo.to_owned(),
             meta,
             blobs,
+            client,
+            workspaces,
+            _grpc: grpc,
+            _socket_dir: socket_dir,
             _app: app,
             ctx,
         })

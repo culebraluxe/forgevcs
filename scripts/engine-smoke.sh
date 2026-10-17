@@ -96,5 +96,18 @@ else
   FAIL=1
 fi
 
+# --- W5 WorkspaceService acceptance ---------------------------------------------------------
+#
+# Create a workspace, write, diff, submit; destroy it; create a new one at the same ref and
+# prove the submitted file survived. This is the work order's "workspace disappears -> source
+# history remains intact" property, through the real scion-wc implementation.
+printf '%-14s ' "W5(workspaces)"
+if python3 "$ROOT/scripts/w5-acceptance.py" --base "$BASE" --token "$TOKEN" --repo "forgevcs-workspaces"; then
+  echo "W5_ACCEPTANCE=PASS"
+else
+  echo "W5_ACCEPTANCE=FAIL"
+  FAIL=1
+fi
+
 echo "log: $LOG"
 exit "$FAIL"

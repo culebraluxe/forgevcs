@@ -7,11 +7,15 @@
 #
 # The principals themselves are configured in FORGEVCS_SERVICE_PRINCIPALS
 # (`name=<sha256 of secret>`), so rotating a secret does not touch this file.
+#
+# `service:forgevcs-workspace` has no secret: the engine mints its token internally for the
+# private Unix-socket gRPC client that scion-wc uses. It is privileged because the façade checks
+# the external caller's policy before asking the working copy to read or write a path.
 
 version = 1
 
 [groups]
-agents = ["service:maestro", "service:opencode"]
+agents = ["service:maestro", "service:opencode", "service:forgevcs-workspace"]
 
 # The `/` rule is required by the parser and is the fallback for every path.
 [[paths]]
