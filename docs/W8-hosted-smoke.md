@@ -2,7 +2,8 @@
 
 **Status:** complete 2026-10-17. The hosted Vercel service passes the W4 and W5 acceptance
 clients against Neon Postgres + Neon Object Storage, with no Git in the source-control
-operation.
+operation. After the multi-instance fixes, two consecutive runs passed: W4 20/20 and W5 17/17
+each.
 
 - **Host:** https://culebraluxe-forgevcs.vercel.app
 - **Script:** `scripts/w8-hosted-smoke.sh`
@@ -25,6 +26,9 @@ W5        create workspace → write → status → diff → read → submit/lan
           → destroy → recreate → history survives → materialize away/back
 W8_HOSTED=PASS
 ```
+
+A second consecutive run after the per-request restore fix also passed W4 20/20 and W5 17/17,
+so the result is not a single warm-container coincidence.
 
 The work order's M0 shape is demonstrated:
 
