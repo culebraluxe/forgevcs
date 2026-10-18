@@ -35,6 +35,11 @@ async fn main() -> anyhow::Result<()> {
         .database_url
         .as_deref()
         .and_then(|url| forgevcs_service::db::build_pool(url).ok());
+    if let Some(pool) = &db
+        && let Err(error) = forgevcs_service::escalations::ensure_schema(pool).await
+    {
+        tracing::warn!(%error, "conflict escalation queue schema unavailable");
+    }
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(

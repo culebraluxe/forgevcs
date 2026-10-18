@@ -15,6 +15,9 @@ Checks, in order:
   check-in      the worker lands a changeset on its own lane ref
   merge advance the worker's push to `main` is 403; the DevOps seat lands the
                 worker's head on `main`, and the worker's file is there
+  queue         a conflicting merge is escalated by the worker; a worker cannot
+                list or claim it; DevOps sees, claims and resolves it, and the
+                resolved item leaves the open list
   basic level   the worker can read refs, compute a merge base, and create a workspace
   deletion      there is no repository deletion endpoint yet (recorded, not graded) —
                 when one is built it must take the same admin seat
@@ -35,8 +38,11 @@ import urllib.error
 import urllib.request
 
 BLOB_A = "b1d3bae0cd810e6f0ca2bdfa4a431f5810e4c1878c0ada9ffcddc706c25020d430"
+BLOB_B = "b175ae44830c60dd21712afd5fcf09a4bf86d98d8b3cec75c7b5c0681b8ffb12e9"
 CONTENT_A = b"ForgeSC smoke test\n"
+CONTENT_B = b"ForgeVCS smoke test\n"
 B64_A = base64.b64encode(CONTENT_A).decode()
+B64_B = base64.b64encode(CONTENT_B).decode()
 DEFAULT_REF = "main"
 
 
@@ -93,12 +99,21 @@ def mint(base: str, principal: str, secret: str) -> str:
     return token
 
 
-def push_body(parent: str, path: str, message: str, ref: str) -> dict:
+def push_body(
+    parent: str,
+    path: str,
+    message: str,
+    ref: str,
+    *,
+    blob: str = BLOB_A,
+    content: bytes = CONTENT_A,
+    mode: str = "land",
+) -> dict:
     return {
-        "objects": [{"id": BLOB_A, "data": B64_A}],
+        "objects": [{"id": blob, "data": base64.b64encode(content).decode()}],
         "changeset": {
             "parents": [parent],
-            "delta": [{"path": path, "op": 1, "mode": 1, "id": BLOB_A, "size": len(CONTENT_A)}],
+            "delta": [{"path": path, "op": 1, "mode": 1, "id": blob, "size": len(content)}],
             "meta": {
                 "author": "ForgeVCS role pilot <role@example.test>",
                 "message": message,
@@ -106,7 +121,7 @@ def push_body(parent: str, path: str, message: str, ref: str) -> dict:
             "change_id": secrets.token_hex(16),
         },
         "ref": ref,
-        "mode": "land",
+        "mode": mode,
     }
 
 
@@ -219,6 +234,114 @@ def main() -> int:
         "merge advance: the worker's file is on main after the DevOps landing",
         base64.b64decode(file["data"]) == CONTENT_A,
         str(file.get("entry")),
+    )
+
+    # --- conflict escalation queue -------------------------------------------------------
+    #
+    # A worker that cannot resolve a conflict files it for the DevOps seat; the orchestrator
+    # polls the open list and launches a DevOps agent per item.
+    tip = next(
+        ref
+        for ref in worker.call("GET", f"/repos/{repo}/refs")["refs"]
+        if ref["name"] == DEFAULT_REF
+    )["target"]
+    left = worker.call(
+        "POST",
+        f"/repos/{repo}/push",
+        push_body(tip, "clash.txt", "left", DEFAULT_REF, mode="none"),
+    )["changeset"]["id"]
+    right = worker.call(
+        "POST",
+        f"/repos/{repo}/push",
+        push_body(
+            tip,
+            "clash.txt",
+            "right",
+            DEFAULT_REF,
+            blob=BLOB_B,
+            content=CONTENT_B,
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    merge_status, merge_error = worker.status(
+        "POST",
+        f"/repos/{repo}/merge",
+        {
+            "a": left,
+            "b": right,
+            "meta": {
+                "author": "ForgeVCS role pilot <role@example.test>",
+                "message": "conflicting merge",
+            },
+            "change_id": secrets.token_hex(16),
+        },
+    )
+    worker.check(
+        "queue: the conflicting merge is refused 409",
+        merge_status == 409,
+        f"HTTP {merge_status} {str(merge_error)[:200]}",
+    )
+    report = merge_error.get("details", {}).get("report", {})
+    escalated = worker.call(
+        "POST",
+        f"/repos/{repo}/conflicts/escalate",
+        {
+            "ref": DEFAULT_REF,
+            "head": right,
+            "onto": left,
+            "note": "add_add on clash.txt; worker cannot choose",
+            "report": report,
+        },
+    )
+    escalation_id = escalated["escalation"]["id"]
+    worker.check(
+        "queue: the worker escalated the conflict",
+        bool(escalation_id) and escalated["escalation"]["status"] == "open",
+        str(escalated)[:250],
+    )
+    denied_list, _ = worker.status("GET", f"/repos/{repo}/conflicts?status=open")
+    worker.check(
+        "queue: a worker cannot list the queue (403)",
+        denied_list == 403,
+        f"HTTP {denied_list}",
+    )
+    open_items = devops.call("GET", f"/repos/{repo}/conflicts?status=open")["escalations"]
+    devops.check(
+        "queue: DevOps sees the escalation",
+        any(item["id"] == escalation_id for item in open_items),
+        str(open_items)[:250],
+    )
+    denied_claim, _ = worker.status(
+        "POST", f"/repos/{repo}/conflicts/{escalation_id}/claim"
+    )
+    worker.check(
+        "queue: a worker cannot claim (403)",
+        denied_claim == 403,
+        f"HTTP {denied_claim}",
+    )
+    claimed = devops.call(
+        "POST", f"/repos/{repo}/conflicts/{escalation_id}/claim"
+    )["escalation"]
+    devops.check(
+        "queue: DevOps claimed it",
+        claimed["status"] == "claimed" and claimed["claimed_by"],
+        str(claimed)[:250],
+    )
+    resolved = devops.call(
+        "POST",
+        f"/repos/{repo}/conflicts/{escalation_id}/resolve",
+        {"resolution": "DevOps resolved: keep theirs"},
+    )["escalation"]
+    devops.check(
+        "queue: DevOps resolved it",
+        resolved["status"] == "resolved" and resolved["resolution"],
+        str(resolved)[:250],
+    )
+    after = devops.call("GET", f"/repos/{repo}/conflicts?status=open")["escalations"]
+    devops.check(
+        "queue: the resolved item is gone from the open list",
+        all(item["id"] != escalation_id for item in after),
+        str(after)[:250],
     )
 
     # --- basic level: read, merge-base, checkout ------------------------------------------

@@ -1592,6 +1592,36 @@ pub(crate) struct ConflictContextBody {
     onto: Option<String>,
 }
 
+/// `POST /repos/{repo}/conflicts/escalate` — file a stuck merge/rebase for the DevOps seat.
+#[derive(Debug, Deserialize)]
+pub(crate) struct EscalateBody {
+    #[serde(rename = "ref", default = "default_ref")]
+    ref_name: String,
+    head: String,
+    #[serde(default)]
+    onto: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+    #[serde(default)]
+    note: Option<String>,
+    #[serde(default)]
+    report: Option<Value>,
+}
+
+/// `GET /repos/{repo}/conflicts?status=…`
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConflictQueueQuery {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// `POST /repos/{repo}/conflicts/{id}/resolve`
+#[derive(Debug, Deserialize)]
+pub(crate) struct ResolveEscalationBody {
+    #[serde(default)]
+    resolution: Option<String>,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -1676,6 +1706,24 @@ fn landed_json(landed: &[v1::LandedEntry]) -> Vec<Value> {
 /// Advancing the trunk ref is the DevOps seat's entitlement, independent of path writes and of
 /// the ref rule: both must allow it. Workers check in on their own refs; they do not land to the
 /// trunk.
+fn require_devops(
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    permission: scion_policy::AdminPerm,
+    message: &str,
+) -> Result<(), Response> {
+    let app = engine.context();
+    if app.policy.current().can_admin(&caller.principal, permission) {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            message,
+        ))
+    }
+}
+
 fn require_trunk(
     engine: &Arc<Engine>,
     caller: &CallerCtx,
@@ -1684,20 +1732,12 @@ fn require_trunk(
     if ref_name != DEFAULT_REF {
         return Ok(());
     }
-    let app = engine.context();
-    if app
-        .policy
-        .current()
-        .can_admin(&caller.principal, scion_policy::AdminPerm::Trunk)
-    {
-        Ok(())
-    } else {
-        Err(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-            "advancing the trunk ref requires the DevOps seat (admin.trunk)",
-        ))
-    }
+    require_devops(
+        engine,
+        caller,
+        scion_policy::AdminPerm::Trunk,
+        "advancing the trunk ref requires the DevOps seat (admin.trunk)",
+    )
 }
 
 /// `POST /repos/{repo}/push` — upload objects, create a changeset, then land or update a ref.
@@ -2713,6 +2753,270 @@ pub(crate) async fn conflict_context(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Conflict escalation queue (DevOps hand-off)
+//
+// The worker escalates a conflict it cannot resolve; the DevOps seat lists, claims and resolves
+// it. The orchestrator polls `GET /repos/{repo}/conflicts?status=open` and launches a DevOps
+// agent per item. The queue stores pointers and the conflict report, never content: the DevOps
+// agent re-reads the three sides with `/conflict-context`.
+// ---------------------------------------------------------------------------------------------
+
+fn queue_unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "unavailable",
+        "the conflict queue needs FORGEVCS_DATABASE_URL",
+    )
+}
+
+/// `POST /repos/{repo}/conflicts/escalate` — file a stuck merge/rebase. Workers may escalate.
+pub(crate) async fn escalate_conflict(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<EscalateBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let head = match parse_id(&body.head, "head") {
+        Ok(id) => id.to_text(),
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let optional_id = |raw: Option<&str>, field: &str| -> Result<Option<String>, String> {
+        raw.map(|value| parse_id(value, field).map(|id| id.to_text()))
+            .transpose()
+    };
+    let onto = match optional_id(body.onto.as_deref(), "onto") {
+        Ok(id) => id,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    let base = match optional_id(body.base.as_deref(), "base") {
+        Ok(id) => id,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+        }
+    };
+    if let Err(response) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return response;
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::insert(
+        pool,
+        &repo,
+        &body.ref_name,
+        &head,
+        onto.as_deref(),
+        base.as_deref(),
+        body.note.as_deref(),
+        body.report.as_ref(),
+        &caller.principal.to_string(),
+    )
+    .await
+    {
+        Ok(row) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "escalation": row,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+/// `GET /repos/{repo}/conflicts?status=open|claimed|resolved|all` — the DevOps work list.
+pub(crate) async fn list_conflicts(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    query: Result<Query<ConflictQueueQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    if let Err(response) = require_devops(
+        &engine,
+        &caller,
+        scion_policy::AdminPerm::Trunk,
+        "reading the conflict queue requires the DevOps seat (admin.trunk)",
+    ) {
+        return response;
+    }
+    let status = query.status.unwrap_or_else(|| "open".to_owned());
+    if !crate::escalations::valid_status(&status) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "status must be one of open, claimed, resolved, all",
+        );
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::list(pool, &repo, &status).await {
+        Ok(rows) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "filter": status,
+                "escalations": rows,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+/// `POST /repos/{repo}/conflicts/{id}/claim` — take ownership of an escalation as DevOps.
+pub(crate) async fn claim_conflict(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &engine,
+        &caller,
+        scion_policy::AdminPerm::Trunk,
+        "claiming a conflict requires the DevOps seat (admin.trunk)",
+    ) {
+        return response;
+    }
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::claim(pool, &repo, &id, &caller.principal.to_string()).await {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "escalation": row,
+            })),
+        )
+            .into_response(),
+        Ok(None) => error_response(
+            StatusCode::CONFLICT,
+            "conflict",
+            "escalation is not open (already claimed or resolved)",
+        ),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+/// `POST /repos/{repo}/conflicts/{id}/resolve` — close an escalation with a resolution note.
+pub(crate) async fn resolve_conflict(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<ResolveEscalationBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    if let Err(response) = require_devops(
+        &engine,
+        &caller,
+        scion_policy::AdminPerm::Trunk,
+        "resolving a conflict requires the DevOps seat (admin.trunk)",
+    ) {
+        return response;
+    }
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::resolve(
+        pool,
+        &repo,
+        &id,
+        &caller.principal.to_string(),
+        body.resolution.as_deref(),
+    )
+    .await
+    {
+        Ok(Some(row)) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "escalation": row,
+            })),
+        )
+            .into_response(),
+        Ok(None) => error_response(
+            StatusCode::CONFLICT,
+            "conflict",
+            "escalation is already resolved or absent",
+        ),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

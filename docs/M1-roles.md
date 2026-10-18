@@ -45,35 +45,31 @@ cannot be used to bypass trunk advance because the `main` ref rule also names th
 - **Absent:** repository deletion. When it is built it must check `admin.repos`, and the same gate
   belongs on any future backup/restore or retention operation.
 
-## Conflict escalation queue (next)
+## Conflict escalation queue (implemented)
 
-An agent that cannot resolve a conflict should not guess. The intended loop is: worker lands →
-`409` with the report → `conflict-context` for the three sides → the worker resolves if it can;
-if it cannot, it **escalates** and moves on. Escalation is a work item for the DevOps seat that
-the orchestrator launches (Cline/DeepSeek as DevOps).
+An agent that cannot resolve a conflict should not guess. The loop is: worker lands → `409` with
+the report → `conflict-context` for the three sides → the worker resolves if it can; if it cannot,
+it **escalates** and moves on. Escalation is a work item for the DevOps seat that the orchestrator
+launches (Cline/DeepSeek as DevOps).
 
-Planned shape (not implemented yet): a ForgeVCS-owned `forgevcs_conflict_escalations` table
-(repo, ref, head, onto, conflict report, note, status, created/claimed/resolved timestamps,
-resolution), with
+Implemented as a ForgeVCS-owned `forgevcs_conflict_escalations` table
+(`crates/forgevcs-service/src/escalations.rs`, `migrations/0003_…sql`, created at boot like the
+workspace/authz tables):
 
-- `POST /repos/{repo}/conflicts/escalate` — any worker; returns the escalation id;
-- `GET /repos/{repo}/conflicts?status=open` — DevOps (`admin.trunk`);
-- `POST /repos/{repo}/conflicts/{id}/claim` and `/resolve` — DevOps; `resolve` records the
-  landed changeset and clears the item.
+| Route | Caller | What it does |
+| --- | --- | --- |
+| `POST /repos/{repo}/conflicts/escalate` | any worker | Files `{ref, head, onto?, base?, note?, report?}`; returns the escalation row |
+| `GET /repos/{repo}/conflicts?status=open\|claimed\|resolved\|all` | DevOps (`admin.trunk`) | The poll-able work list |
+| `POST /repos/{repo}/conflicts/{id}/claim` | DevOps | Moves an open item to `claimed`, records the claimer |
+| `POST /repos/{repo}/conflicts/{id}/resolve` | DevOps | Closes it with a resolution note |
 
-That gives the orchestrator one poll-able list and keeps unresolved merges out of a chat log.
+The queue stores pointers and the conflict report, never content: the DevOps agent re-derives the
+three sides with `POST /repos/{repo}/conflict-context` before resolving and landing. A conflicting
+merge is claimable once; resolving an already-closed item is a `409`.
 
-## Prove it
-
-```sh
-scripts/role-pilot.sh      # strict policy, worker + devops, port 3997
-```
-
-Measured 2026-10-17: the role pilot passes **13/13**, and the collaboration pilot passes
-**41/41** with every repository created by the DevOps seat. The role pilot checks: the DevOps seat creates a repository; a worker's create attempt is 403; a
-worker cannot create a ref (403); the worker lands a changeset on its own lane; the worker's push
-to `main` is 403; the DevOps seat lands that head on `main` and the worker's file is there; the
-worker can read refs, compute a merge base and create a workspace. Deletion is recorded as absent.
+Orchestrator loop: `GET conflicts?status=open` → for each item launch a DevOps agent → agent
+`claim` → reads context → resolves (land or re-create the changeset) → `resolve` with the note.
+The item stays queryable as history.
 
 ## Follow-ups
 

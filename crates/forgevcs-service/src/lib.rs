@@ -10,6 +10,7 @@ pub mod authz;
 pub mod config;
 pub mod db;
 pub mod engine;
+pub mod escalations;
 pub mod facade;
 pub mod http;
 pub mod workspace;

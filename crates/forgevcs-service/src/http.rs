@@ -166,6 +166,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/land", post(facade::land))
         .route("/repos/{repo}/merge-land", post(facade::merge_land))
         .route(
+            "/repos/{repo}/conflicts/escalate",
+            post(facade::escalate_conflict),
+        )
+        .route("/repos/{repo}/conflicts", get(facade::list_conflicts))
+        .route(
+            "/repos/{repo}/conflicts/{id}/claim",
+            post(facade::claim_conflict),
+        )
+        .route(
+            "/repos/{repo}/conflicts/{id}/resolve",
+            post(facade::resolve_conflict),
+        )
+        .route(
             "/repos/{repo}/conflict-context",
             post(facade::conflict_context),
         )
