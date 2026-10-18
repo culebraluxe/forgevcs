@@ -82,6 +82,16 @@ Orchestrator loop: `GET conflicts?status=open` → for each item launch a DevOps
 `claim` → reads context → resolves (land or re-create the changeset) → `resolve` with the note.
 The item stays queryable as history until the DevOps seat clears it.
 
+## Legacy prune (2026-10-18)
+
+The control plane and bucket were cleaned through the DevOps seat: **85 legacy repositories
+(1,167 rows)** deleted with `cleanup-pilot-repos.sh --all`, then the orphan sweep and explicit
+prefix purges removed **50 object keys** (including the old `forgevcs-ci/` and `w3-*` acceptance
+fixtures). The bucket now reports **0 keys** and the only repository left is the process's default
+`forgevcs`, which a boot recreates. Two real bugs were found and fixed during the prune: the
+default repository must be deleted last (token verification needs a booted engine), and the
+hosted W8 teardown needed its bearer token.
+
 ## Prove it
 
 ```sh

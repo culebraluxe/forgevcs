@@ -58,7 +58,12 @@ def main() -> int:
     prefixes = args.prefix or DEFAULT_PREFIXES
     repos = call(args.base, "GET", "/repos", token)["repos"]
     if args.all:
-        doomed = sorted(repo["name"] for repo in repos)
+        # Delete the process's default repository last: token verification uses an engine, and
+        # removing the last booted engine would 503 every remaining delete.
+        doomed = sorted(
+            (repo["name"] for repo in repos),
+            key=lambda name: (name == "forgevcs", name),
+        )
     else:
         doomed = sorted(
             repo["name"]
