@@ -57,9 +57,10 @@ class BackupError(RuntimeError):
 
 
 class Vcs:
-    def __init__(self, base: str, token: str = "") -> None:
+    def __init__(self, base: str, token: str = "", extra_headers: dict | None = None) -> None:
         self.base = base.rstrip("/")
         self.token = token
+        self.extra_headers = extra_headers or {}
 
     def call(self, method: str, path: str, body=None, expect: int = 200):
         data = json.dumps(body).encode() if body is not None else None
@@ -68,6 +69,8 @@ class Vcs:
             request.add_header("content-type", "application/json")
         if self.token:
             request.add_header("authorization", "Bearer " + self.token)
+        for key, value in self.extra_headers.items():
+            request.add_header(key, value)
         try:
             with urllib.request.urlopen(request, timeout=300) as response:
                 return json.loads(response.read() or b"{}")

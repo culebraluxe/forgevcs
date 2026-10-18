@@ -130,7 +130,11 @@ hosted service should be restarted/recycled after a restore so no instance keeps
 
 Drill result (2026-10-18): **8/8** — two changesets plus files, delete, restore, refs and versions
 identical, both file versions byte-identical; teardown deleted the repository and the orphan GC
-removed the leftover blobs.
+removed the leftover blobs. Metadata export uses psql, so backup/restore runs from an operator
+machine, not from a Vercel instance; recycle the hosted deployment after a restore.
+
+The hosted deployment runs `exact-rename-v1`; `scripts/hosted-rename-check.sh` proves it against
+the live service (create repo, land rename, land staged edit, edit follows the rename, delete).
 
 ## Follow-ups
 
