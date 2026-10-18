@@ -292,12 +292,12 @@ pub(crate) async fn init(
         && !app
             .policy
             .current()
-            .can_admin(&caller.principal, scion_policy::AdminPerm::Refs)
+            .can_admin(&caller.principal, scion_policy::AdminPerm::Repos)
     {
         return error_response(
             StatusCode::FORBIDDEN,
             "permission_denied",
-            "creating a repository requires the DevOps seat (admin.refs)",
+            "creating a repository requires the DevOps seat (admin.repos)",
         );
     }
     let engine = if created {
@@ -1673,6 +1673,33 @@ fn landed_json(landed: &[v1::LandedEntry]) -> Vec<Value> {
         .collect()
 }
 
+/// Advancing the trunk ref is the DevOps seat's entitlement, independent of path writes and of
+/// the ref rule: both must allow it. Workers check in on their own refs; they do not land to the
+/// trunk.
+fn require_trunk(
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    ref_name: &str,
+) -> Result<(), Response> {
+    if ref_name != DEFAULT_REF {
+        return Ok(());
+    }
+    let app = engine.context();
+    if app
+        .policy
+        .current()
+        .can_admin(&caller.principal, scion_policy::AdminPerm::Trunk)
+    {
+        Ok(())
+    } else {
+        Err(error_response(
+            StatusCode::FORBIDDEN,
+            "permission_denied",
+            "advancing the trunk ref requires the DevOps seat (admin.trunk)",
+        ))
+    }
+}
+
 /// `POST /repos/{repo}/push` — upload objects, create a changeset, then land or update a ref.
 ///
 /// The three steps are upstream handlers in the order the gRPC clients call them; a failure at
@@ -1713,6 +1740,12 @@ pub(crate) async fn push(
         allow_non_fast_forward,
         allow_empty,
     } = body;
+
+    if matches!(mode.as_str(), "land" | "update")
+        && let Err(response) = require_trunk(&engine, &caller, &ref_name)
+    {
+        return response;
+    }
 
     if let Err(response) = authorize(
         &state,
@@ -2051,6 +2084,9 @@ pub(crate) async fn land(
         Ok(body) => body,
         Err(rejection) => return bad_json(rejection),
     };
+    if let Err(response) = require_trunk(&engine, &caller, &body.ref_name) {
+        return response;
+    }
     let head = match parse_id(&body.head, "head") {
         Ok(value) => value,
         Err(message) => {
@@ -2131,6 +2167,9 @@ pub(crate) async fn merge_land(
         Ok(body) => body,
         Err(rejection) => return bad_json(rejection),
     };
+    if let Err(response) = require_trunk(&engine, &caller, &body.ref_name) {
+        return response;
+    }
     let head = match parse_id(&body.head, "head") {
         Ok(value) => value,
         Err(message) => {
@@ -3148,6 +3187,11 @@ pub(crate) async fn workspace_submit(
             "invalid_argument",
             "message must not be empty",
         );
+    }
+    if matches!(body.mode.as_str(), "land" | "update")
+        && let Err(response) = require_trunk(&engine, &caller, body.ref_name.as_deref().unwrap_or(DEFAULT_REF))
+    {
+        return response;
     }
     let ref_name = body.ref_name.as_deref().unwrap_or(DEFAULT_REF);
     let author = body

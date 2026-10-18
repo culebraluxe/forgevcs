@@ -180,6 +180,8 @@ renames alone remove most agent-move conflicts.
 1. **Resolution contract — shipped** (gap 2): `conflict-context` plus the recipe in §2b.
 2. **Rename detection** (gap 4) — the one engine fix the simple sequential model needs; it
    removes the false `modify_delete` conflicts that rebase-on-land creates after a file move.
+   Approved as Option A: a vendored-engine patch behind an opt-in merge-engine version, so the
+   default engine and the upstream gate keep their current behaviour.
 3. **Merge/conflict metrics and the N-agent soak** (gaps 6, 8): run real DeepSeek agents and
    record conflict rate, land retries, and latency.
 4. **Two-parent land** (gap 1) only if merge-commit topology is wanted; then `merge-land` can

@@ -28,4 +28,6 @@ write = ["group:agents"]
 "lane/a" = { update = ["group:agent-a"] }
 
 [admin]
-refs = ["group:provisioner"]
+refs = ["group:devops"]
+repos = ["group:devops"]
+trunk = ["group:devops"]

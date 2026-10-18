@@ -21,25 +21,47 @@ Smith/Scout/Assay are workers) and to Scion's own permissions:
 | Push to its own lane ref | yes | yes | `[refs]` rule for `agent/<name>` |
 | Push to another agent's lane ref | no (403) | no | `[refs]` rule scoped per agent |
 | Create a ref | no (403) | yes | upstream `CreateRef` requires `admin.refs` |
-| Create a repository | **no (403)** | yes | façade `init` gate on `admin.refs` (this commit) |
-| Delete a repository | **no** | **yes, when it exists** | no endpoint yet; it must take `admin.refs` |
-| Advance `main` / `land` / `merge-land` | **no (403)** | yes | `[refs]` `main = group:devops` in the strict policy |
+| Create a repository | **no (403)** | yes | façade `init` gate on `admin.repos` + no gRPC path creates repos |
+| Delete a repository | **no** | **yes, when it exists** | no endpoint yet; it must take `admin.repos` |
+| Advance `main` / `land` / `merge-land` | **no (403)** | yes | façade `admin.trunk` gate **and** `[refs] main = group:devops`, so gRPC cannot bypass it |
 
-`admin.refs` is the DevOps capability today because it is the closest existing upstream
-permission; a dedicated `admin.repos` permit is an engine-version change and is not required to
-ship the role split.
+Three entitlements make the seat explicit in the engine policy: `admin.repos` (create/delete
+repositories), `admin.refs` (create/delete refs) and `admin.trunk` (advance the trunk ref). They
+are `[admin]` grants, so a policy that does not name the DevOps principal denies by default. The
+façade checks `admin.repos` and `admin.trunk` at the request that would act; the gRPC surface
+cannot be used to bypass trunk advance because the `main` ref rule also names the DevOps group.
 
 ## What is enforced in code vs policy
 
-- **Code (this commit):** `POST /repos/{repo}/init` refuses a principal without `admin.refs`
-  when it would *create* a repository (`created == true`). Calling `init` on an existing
-  repository stays available so any principal can bind its engine on demand.
-- **Policy:** `[refs] main = group:devops` and the per-agent lane rules are the merge-advance and
-  lane-isolation enforcement. The collaboration pilot (`scripts/pilot/acl.toml`) deliberately
-  keeps `main` writable by the trio so it can measure merge/land mechanics; the strict matrix
-  lives in `scripts/pilot/acl-roles.toml`.
-- **Absent:** repository deletion. When it is built it must check the same DevOps seat, and the
-  same gate belongs on any future backup/restore or retention operation.
+- **Code:** `POST /repos/{repo}/init` refuses a principal without `admin.repos` when it would
+  *create* a repository. `push` with `mode:"land"|"update"`, `land`, `merge-land` and workspace
+  `submit` refuse a principal without `admin.trunk` when the target ref is `main`. Calling `init`
+  on an existing repository stays available so any principal can bind its engine on demand.
+- **Policy:** `[refs] main = group:devops` is a second, independent deny for trunk advance (a
+  direct gRPC `UpdateRef` cannot bypass the façade gate), and per-agent lane rules isolate the
+  workers. The collaboration pilot (`scripts/pilot/acl.toml`) deliberately grants `admin.trunk`
+  to the trio so it can measure merge/land mechanics; the strict matrix lives in
+  `scripts/pilot/acl-roles.toml`.
+- **Absent:** repository deletion. When it is built it must check `admin.repos`, and the same gate
+  belongs on any future backup/restore or retention operation.
+
+## Conflict escalation queue (next)
+
+An agent that cannot resolve a conflict should not guess. The intended loop is: worker lands →
+`409` with the report → `conflict-context` for the three sides → the worker resolves if it can;
+if it cannot, it **escalates** and moves on. Escalation is a work item for the DevOps seat that
+the orchestrator launches (Cline/DeepSeek as DevOps).
+
+Planned shape (not implemented yet): a ForgeVCS-owned `forgevcs_conflict_escalations` table
+(repo, ref, head, onto, conflict report, note, status, created/claimed/resolved timestamps,
+resolution), with
+
+- `POST /repos/{repo}/conflicts/escalate` — any worker; returns the escalation id;
+- `GET /repos/{repo}/conflicts?status=open` — DevOps (`admin.trunk`);
+- `POST /repos/{repo}/conflicts/{id}/claim` and `/resolve` — DevOps; `resolve` records the
+  landed changeset and clears the item.
+
+That gives the orchestrator one poll-able list and keeps unresolved merges out of a chat log.
 
 ## Prove it
 

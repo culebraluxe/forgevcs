@@ -51,3 +51,5 @@ write = ["group:agents"]
 
 [admin]
 refs = ["group:provisioner"]
+repos = ["group:provisioner"]
+trunk = ["group:agents"]

@@ -51,6 +51,11 @@ of authority.
   8. `crates/scion-server/src/lib.rs` (W4) — `mod interceptor;` became `pub mod interceptor;`,
      so the façade can call the same `authenticate` the gRPC stack runs (ADR-0002 D4).
      Visibility only; no behaviour changed.
+  9. `crates/scion-policy/src/policy.rs` + `crates/scion-server/src/handlers/admin.rs` (M1) —
+     two DevOps entitlements, `admin.repos` (create/delete repositories) and `admin.trunk`
+     (advance the trunk ref): new `RawAdmin` fields, `AdminPerm` variants, grants and permission
+     names. Additive: a policy without the keys parses and denies by default, so the M0 policy
+     keeps its exact behaviour until it opts in.
 
   No SQL statement's logic changed; only its dialect spelling. Proof is the suite, not
   inspection: 20/20 cases of `meta_store_suite` pass against Neon.

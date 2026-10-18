@@ -35,6 +35,10 @@ pub enum AdminPerm {
     Purge,
     /// `admin.refs` (create/delete refs).
     Refs,
+    /// `admin.repos` (create/delete repositories). The DevOps seat.
+    Repos,
+    /// `admin.trunk` (advance the trunk ref). The DevOps seat.
+    Trunk,
 }
 
 /// A normalized policy principal (SPEC 4.3.8, 6.2).
@@ -123,6 +127,8 @@ struct AdminRules {
     redact: Grant,
     purge: Grant,
     refs: Grant,
+    repos: Grant,
+    trunk: Grant,
 }
 
 /// A validated, normalized policy (SPEC 6.2).
@@ -188,6 +194,10 @@ struct RawAdmin {
     purge: Vec<String>,
     #[serde(default)]
     refs: Vec<String>,
+    #[serde(default)]
+    repos: Vec<String>,
+    #[serde(default)]
+    trunk: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -474,6 +484,8 @@ impl Policy {
         c.grant(&self.admin.redact);
         c.grant(&self.admin.purge);
         c.grant(&self.admin.refs);
+        c.grant(&self.admin.repos);
+        c.grant(&self.admin.trunk);
         let digest = blake3::hash(&c.0);
         let mut first = [0u8; 8];
         first.copy_from_slice(&digest.as_bytes()[..8]);
@@ -561,6 +573,8 @@ impl Policy {
             redact: make_grant(&raw.admin.redact, &closure)?,
             purge: make_grant(&raw.admin.purge, &closure)?,
             refs: make_grant(&raw.admin.refs, &closure)?,
+            repos: make_grant(&raw.admin.repos, &closure)?,
+            trunk: make_grant(&raw.admin.trunk, &closure)?,
         };
 
         let mut p = Policy {
@@ -684,6 +698,8 @@ impl Policy {
             AdminPerm::Redact => self.admin.redact.allows(p),
             AdminPerm::Purge => self.admin.purge.allows(p),
             AdminPerm::Refs => self.admin.refs.allows(p),
+            AdminPerm::Repos => self.admin.repos.allows(p),
+            AdminPerm::Trunk => self.admin.trunk.allows(p),
         }
     }
 
@@ -726,6 +742,8 @@ impl Policy {
                 redact: Grant::anyone(),
                 purge: Grant::anyone(),
                 refs: Grant::anyone(),
+                repos: Grant::anyone(),
+                trunk: Grant::anyone(),
             },
         };
         p.epoch = p.compute_epoch();

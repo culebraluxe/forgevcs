@@ -1,6 +1,8 @@
 # Rename detection — design and engine-version plan
 
-**Date:** 2026-10-17 · **Status:** design only. Nothing in this document is implemented yet.
+**Date:** 2026-10-17 · **Status:** approved as Option A (vendored-engine patch behind an opt-in
+merge-engine version); implementation is the next engine workstream. Nothing in this document
+is implemented yet.
 
 ## Why this is the next engine work
 

@@ -1,9 +1,14 @@
 # ForgeVCS policy (upstream SPEC 6.2; ADR-0002 D4).
 #
-# Deny by default: without a rule naming a principal, nothing can be read or written. The only
-# identities this file grants anything to are the machine principals in `[groups].agents` —
-# Maestro and an OpenCode harness — which is the M0 contract: bots use the service, humans
-# arrive with W5's workspace and W6's delegation.
+# Deny by default: without a rule naming a principal, nothing can be read or written.
+#
+# TWO ROLES. The M0 contract was "all machine principals are agents"; that is no longer the
+# model. Maestro is the orchestrator and holds the single DevOps seat; the OpenCode worker is a
+# worker. Workers check in to their own refs, check out, read, diff and merge-base. Only the
+# DevOps seat may create/delete repositories (`admin.repos`), provision/delete refs
+# (`admin.refs`), or advance the trunk ref (`admin.trunk`) — enforced twice: the façade gates
+# the request and the ref rule below denies the gRPC UpdateRef path too, so a rogue worker
+# cannot reach the trunk by bypassing the façade.
 #
 # The principals themselves are configured in FORGEVCS_SERVICE_PRINCIPALS
 # (`name=<sha256 of secret>`), so rotating a secret does not touch this file.
@@ -16,6 +21,7 @@ version = 1
 
 [groups]
 agents = ["service:maestro", "service:opencode", "service:forgevcs-workspace"]
+devops = ["service:maestro"]
 
 # The `/` rule is required by the parser and is the fallback for every path.
 [[paths]]
@@ -23,13 +29,17 @@ prefix = "/"
 read = ["group:agents"]
 write = ["group:agents"]
 
-# Refs: agents may advance any branch but not force it. Deletion of refs is `admin.refs`,
-# which stays empty (nobody has it) until W5 models repository lifecycle.
-#
 # `main` is an exact rule, not a pattern: upstream bootstraps the root changeset on the ref
-# literally named `main` (`RefName::main()`), and `"refs/heads/*"` does not match it. Without
-# this line a freshly bootstrapped repository has a ref that nobody may advance, so every
-# first push is PERMISSION_DENIED.
+# literally named `main` (`RefName::main()`), and `"refs/heads/*"` does not match it.
+#
+# Trunk advance is the DevOps seat. Workers may still advance ordinary branches/lane refs;
+# `admin.trunk` and this rule are both checked, so the deny does not depend on which surface
+# the caller used.
 [refs]
-"main" = { update = ["group:agents"] }
+"main" = { update = ["group:devops"] }
 "refs/heads/*" = { update = ["group:agents"] }
+
+[admin]
+refs = ["group:devops"]
+repos = ["group:devops"]
+trunk = ["group:devops"]

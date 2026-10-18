@@ -27,6 +27,8 @@ fn perm_name(a: AdminPerm) -> &'static str {
         AdminPerm::Redact => "admin.redact",
         AdminPerm::Purge => "admin.purge",
         AdminPerm::Refs => "admin.refs",
+        AdminPerm::Repos => "admin.repos",
+        AdminPerm::Trunk => "admin.trunk",
     }
 }
 

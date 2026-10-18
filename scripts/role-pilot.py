@@ -238,7 +238,7 @@ def main() -> int:
     delete_status, _ = devops.status("DELETE", f"/repos/{repo}")
     print(
         f"INFO  deletion-today: DELETE /repos/{{repo}} is HTTP {delete_status}; "
-        "no deletion endpoint yet — when built it must require admin.refs (DevOps)"
+        "no deletion endpoint yet — when built it must require admin.repos (DevOps)"
     )
 
     total = worker.checks + devops.checks
