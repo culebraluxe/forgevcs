@@ -374,6 +374,12 @@ impl Engines {
         Ok(engine)
     }
 
+    /// Drop a booted engine (repository deletion). The caller is responsible for having removed
+    /// the repository's rows; no request should be in flight for it.
+    pub fn remove(&self, repo: &str) -> Option<Arc<Engine>> {
+        self.repos_write().remove(repo)
+    }
+
     /// Every booted engine.
     pub fn all(&self) -> Vec<Arc<Engine>> {
         self.repos_read().values().cloned().collect()

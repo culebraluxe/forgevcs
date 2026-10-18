@@ -343,6 +343,58 @@ def main() -> int:
         all(item["id"] != escalation_id for item in after),
         str(after)[:250],
     )
+    history = devops.call("GET", f"/repos/{repo}/conflicts?status=resolved")["escalations"]
+    devops.check(
+        "queue: resolved items stay visible as data",
+        any(item["id"] == escalation_id for item in history),
+        str(history)[:250],
+    )
+    cleared = devops.call("DELETE", f"/repos/{repo}/conflicts/{escalation_id}")
+    devops.check(
+        "queue: DevOps can clear a resolved item",
+        cleared.get("cleared") == escalation_id,
+        str(cleared)[:200],
+    )
+    everything = devops.call("GET", f"/repos/{repo}/conflicts?status=all")["escalations"]
+    devops.check(
+        "queue: the cleared item is gone from history",
+        all(item["id"] != escalation_id for item in everything),
+        str(everything)[:250],
+    )
+
+    # --- repository deletion is the DevOps seat's lifecycle entitlement -------------------
+    doomed = f"{repo}-delete"
+    devops.call("POST", f"/repos/{doomed}/init", {})
+    denied_delete, _ = worker.status("DELETE", f"/repos/{doomed}", {"confirm": doomed})
+    worker.check(
+        "lifecycle: a worker cannot delete a repository (403)",
+        denied_delete == 403,
+        f"HTTP {denied_delete}",
+    )
+    denied_repos, _ = worker.status("GET", "/repos")
+    worker.check(
+        "lifecycle: a worker cannot list repositories (403)",
+        denied_repos == 403,
+        f"HTTP {denied_repos}",
+    )
+    deleted = devops.call("DELETE", f"/repos/{doomed}", {"confirm": doomed})
+    devops.check(
+        "lifecycle: the DevOps seat deleted the repository",
+        deleted["repository"]["deleted"] is True,
+        str(deleted)[:250],
+    )
+    listed = {item["name"] for item in devops.call("GET", "/repos")["repos"]}
+    devops.check(
+        "lifecycle: the deleted repository is gone from the control plane",
+        doomed not in listed,
+        str(sorted(listed))[:250],
+    )
+    gone_status, _ = devops.status("DELETE", f"/repos/{doomed}", {"confirm": doomed})
+    devops.check(
+        "lifecycle: deleting it again is 404",
+        gone_status == 404,
+        f"HTTP {gone_status}",
+    )
 
     # --- basic level: read, merge-base, checkout ------------------------------------------
     worker.call("GET", f"/repos/{repo}/refs")
@@ -356,13 +408,6 @@ def main() -> int:
         str(workspace)[:200],
     )
     worker.call("DELETE", f"/repos/{repo}/workspaces/{workspace['workspace_id']}")
-
-    # --- deletion: absent today, same seat when it exists ---------------------------------
-    delete_status, _ = devops.status("DELETE", f"/repos/{repo}")
-    print(
-        f"INFO  deletion-today: DELETE /repos/{{repo}} is HTTP {delete_status}; "
-        "no deletion endpoint yet — when built it must require admin.repos (DevOps)"
-    )
 
     total = worker.checks + devops.checks
     print(f"OK  {total} checks passed; repository created: {repo}")

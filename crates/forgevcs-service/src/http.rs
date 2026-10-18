@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use scion_core::{EntryInfo, ErrorPayload};
 use scion_obs::{Metrics, Readiness, health_router};
@@ -169,7 +169,16 @@ pub fn router(state: Arc<AppState>) -> Router {
             "/repos/{repo}/conflicts/escalate",
             post(facade::escalate_conflict),
         )
-        .route("/repos/{repo}/conflicts", get(facade::list_conflicts))
+        .route(
+            "/repos/{repo}/conflicts",
+            get(facade::list_conflicts).delete(facade::clear_conflicts),
+        )
+        .route(
+            "/repos/{repo}/conflicts/{id}",
+            delete(facade::delete_conflict),
+        )
+        .route("/repos", get(facade::list_repos))
+        .route("/repos/{repo}", delete(facade::delete_repo))
         .route(
             "/repos/{repo}/conflicts/{id}/claim",
             post(facade::claim_conflict),

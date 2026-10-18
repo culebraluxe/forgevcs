@@ -28,6 +28,8 @@
 #![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
+
+use deadpool_postgres::Pool;
 use std::sync::Arc;
 
 use axum::Json;
@@ -1622,6 +1624,19 @@ pub(crate) struct ResolveEscalationBody {
     resolution: Option<String>,
 }
 
+/// `DELETE /repos/{repo}` — the body must repeat the repository name.
+#[derive(Debug, Deserialize)]
+pub(crate) struct DeleteRepoBody {
+    confirm: String,
+}
+
+/// `DELETE /repos/{repo}/conflicts?status=…`
+#[derive(Debug, Deserialize)]
+pub(crate) struct ClearConflictsQuery {
+    #[serde(default)]
+    status: Option<String>,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -3015,6 +3030,309 @@ pub(crate) async fn resolve_conflict(
             "conflict",
             "escalation is already resolved or absent",
         ),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Repository lifecycle (DevOps seat)
+//
+// Creation is gated in `init` on admin.repos. Deletion is metadata-only on purpose: Scion
+// objects are content-addressed and shared between repositories, so there is no per-repository
+// blob set to remove safely. The rows are deleted in one transaction; blobs stay until a
+// garbage-collection workstream can prove no other repository references them.
+// ---------------------------------------------------------------------------------------------
+
+/// Tables whose rows are keyed by `repo_id` (SPEC 5.2). No foreign keys, so order is only for
+/// readability.
+const SCION_REPO_TABLES: [&str; 13] = [
+    "landed",
+    "ref_log",
+    "refs",
+    "changeset_children",
+    "changesets",
+    "object_uploads",
+    "object_paths",
+    "objects",
+    "derived",
+    "derive_leases",
+    "redactions",
+    "counters",
+    "audit_log",
+];
+
+async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Response> {
+    let mut client = pool.get().await.map_err(|error| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            &format!("deleting repository: {error}"),
+        )
+    })?;
+    let tx = client.transaction().await.map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("deleting repository: {error}"),
+        )
+    })?;
+    let row = tx
+        .query_opt("SELECT repo_id FROM repos WHERE name = $1", &[&repo])
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("reading repository: {error}"),
+            )
+        })?;
+    let Some(row) = row else {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("repository {repo} not found"),
+        ));
+    };
+    let repo_id: i64 = row.get(0);
+    let mut rows = serde_json::Map::new();
+    for table in SCION_REPO_TABLES {
+        let sql = format!("DELETE FROM {table} WHERE repo_id = $1");
+        let removed = tx.execute(&sql, &[&repo_id]).await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("deleting {table}: {error}"),
+            )
+        })?;
+        rows.insert(table.to_owned(), json!(removed));
+    }
+    for table in [
+        "forgevcs_workspaces",
+        "forgevcs_conflict_escalations",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE repo = $1");
+        let removed = tx.execute(&sql, &[&repo]).await.map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("deleting {table}: {error}"),
+            )
+        })?;
+        rows.insert(table.to_owned(), json!(removed));
+    }
+    let removed = tx
+        .execute("DELETE FROM repos WHERE repo_id = $1", &[&repo_id])
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("deleting the repository row: {error}"),
+            )
+        })?;
+    if removed != 1 {
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "the repository row changed during deletion",
+        ));
+    }
+    tx.commit().await.map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("committing repository deletion: {error}"),
+        )
+    })?;
+    Ok(json!({
+        "deleted": true,
+        "repo": repo,
+        "rows": rows,
+        "objects": "retained: Scion blobs are content-addressed and shared; garbage collection is a separate workstream",
+    }))
+}
+
+/// `GET /repos` — every repository in the control plane. DevOps seat.
+pub(crate) async fn list_repos(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Repos,
+        "listing repositories requires the DevOps seat (admin.repos)",
+    ) {
+        return response;
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    let Ok(client) = pool.get().await else {
+        return queue_unavailable();
+    };
+    let rows = match client
+        .query(
+            "SELECT name, created_at::text AS created_at FROM repos ORDER BY name",
+            &[],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("listing repositories: {error}"),
+            );
+        }
+    };
+    let repos: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            json!({
+                "name": row.get::<_, String>("name"),
+                "created_at": row.get::<_, String>("created_at"),
+            })
+        })
+        .collect();
+    (
+        StatusCode::OK,
+        Json(json!({ "service": SERVICE, "status": "ok", "repos": repos })),
+    )
+        .into_response()
+}
+
+/// `DELETE /repos/{repo}` — remove a repository's metadata. DevOps seat only; the body must
+/// repeat the repository name. History rows go in one transaction; shared objects stay.
+pub(crate) async fn delete_repo(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<DeleteRepoBody>, JsonRejection>,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Repos,
+        "deleting a repository requires the DevOps seat (admin.repos)",
+    ) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    if body.confirm != repo {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "confirm must equal the repository name",
+        );
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match delete_repository_rows(pool, &repo).await {
+        Ok(deleted) => {
+            state.engines.remove(&repo);
+            (
+                StatusCode::OK,
+                Json(json!({ "service": SERVICE, "status": "ok", "repository": deleted })),
+            )
+                .into_response()
+        }
+        Err(response) => response,
+    }
+}
+
+/// `DELETE /repos/{repo}/conflicts?status=resolved` — clear queue history. DevOps seat only;
+/// `status=all` clears everything, any other status clears that state.
+pub(crate) async fn clear_conflicts(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    query: Result<Query<ClearConflictsQuery>, QueryRejection>,
+    headers: HeaderMap,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Trunk,
+        "clearing the conflict queue requires the DevOps seat (admin.trunk)",
+    ) {
+        return response;
+    }
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(rejection) => return bad_query(rejection),
+    };
+    let status = query.status.unwrap_or_else(|| "resolved".to_owned());
+    if !crate::escalations::valid_status(&status) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "status must be one of open, claimed, resolved, all",
+        );
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::clear(pool, &repo, &status).await {
+        Ok(removed) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "filter": status,
+                "cleared": removed,
+            })),
+        )
+            .into_response(),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+/// `DELETE /repos/{repo}/conflicts/{id}` — clear one queue item. DevOps seat only.
+pub(crate) async fn delete_conflict(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Trunk,
+        "clearing a conflict requires the DevOps seat (admin.trunk)",
+    ) {
+        return response;
+    }
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::escalations::delete(pool, &repo, &id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(json!({ "service": SERVICE, "status": "ok", "repo": repo, "cleared": id })),
+        )
+            .into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "not_found", "escalation not found"),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
     }
 }

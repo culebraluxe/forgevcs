@@ -181,6 +181,42 @@ pub async fn resolve(
     Ok(rows.first().map(row_json))
 }
 
+/// Delete one escalation (DevOps clearing history). Returns whether a row was removed.
+pub async fn delete(pool: &Pool, repo: &str, id: &str) -> Result<bool, String> {
+    let client = pool.get().await.map_err(|error| error.to_string())?;
+    let removed = client
+        .execute(
+            "DELETE FROM forgevcs_conflict_escalations \
+             WHERE id = $1::text::uuid AND repo = $2",
+            &[&id, &repo],
+        )
+        .await
+        .map_err(|error| format!("deleting escalation: {error}"))?;
+    Ok(removed > 0)
+}
+
+/// Delete every escalation for `repo` in `status`; `all` clears the queue's history.
+pub async fn clear(pool: &Pool, repo: &str, status: &str) -> Result<u64, String> {
+    let client = pool.get().await.map_err(|error| error.to_string())?;
+    let removed = if status == "all" {
+        client
+            .execute(
+                "DELETE FROM forgevcs_conflict_escalations WHERE repo = $1",
+                &[&repo],
+            )
+            .await
+    } else {
+        client
+            .execute(
+                "DELETE FROM forgevcs_conflict_escalations WHERE repo = $1 AND status = $2",
+                &[&repo, &status],
+            )
+            .await
+    }
+    .map_err(|error| format!("clearing escalations: {error}"))?;
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
