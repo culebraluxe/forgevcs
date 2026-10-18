@@ -45,6 +45,7 @@ use scion_core::{ConflictReport, EntryInfo, ErrorPayload, ObjectId};
 use scion_object::{Canonical, RepoPath};
 use scion_proto::{convert, error_from_status, status_from_error, v1};
 use scion_server::AppContext;
+use scion_store::BlobStore;
 use scion_server::context::CallerCtx;
 use scion_server::handlers;
 use serde::Deserialize;
@@ -1642,6 +1643,23 @@ pub(crate) struct ClearConflictsQuery {
 pub(crate) struct GcBody {
     #[serde(default)]
     apply: bool,
+    /// Explicit legacy prefix to purge instead of the orphan sweep (e.g. `forgevcs-ci/`).
+    #[serde(default)]
+    prefix: Option<String>,
+}
+
+/// One exported object key and its bytes (base64). Keys are store-relative
+/// (`r|q/<repo_id>/<kind>/<fan>/<hex>`).
+#[derive(Debug, Deserialize, serde::Serialize)]
+pub(crate) struct BlobEntry {
+    key: String,
+    data: String,
+}
+
+/// `POST /repos/{repo}/blobs/import`
+#[derive(Debug, Deserialize)]
+pub(crate) struct BlobImportBody {
+    entries: Vec<BlobEntry>,
 }
 
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
@@ -3385,7 +3403,11 @@ pub(crate) async fn gc_objects(
     let Some(pool) = state.db.as_ref() else {
         return queue_unavailable();
     };
-    match crate::gc::sweep(&blobs, pool, body.apply).await {
+    let report = match body.prefix.as_deref() {
+        Some(prefix) => crate::gc::purge_prefix(&blobs, prefix, body.apply).await,
+        None => crate::gc::sweep(&blobs, pool, body.apply).await,
+    };
+    match report {
         Ok(report) => (
             StatusCode::OK,
             Json(json!({
@@ -3399,6 +3421,7 @@ pub(crate) async fn gc_objects(
                     "malformed_keys": report.malformed_keys,
                     "malformed_sample": report.malformed_sample,
                     "sample": report.sample,
+                    "malformed_sample": report.malformed_sample,
                     "applied": report.applied,
                 },
             })),
@@ -3406,6 +3429,200 @@ pub(crate) async fn gc_objects(
             .into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Backup transfer (export/import of object bytes)
+//
+// The metadata lives in Postgres and is exported by the backup client through psql; these two
+// routes move the external object bytes, which psql cannot see. Both are DevOps-only and keys
+// are confined to the repository's own two areas (`r/<repo_id>/`, `q/<repo_id>/`).
+// ---------------------------------------------------------------------------------------------
+
+async fn repo_id_for(pool: &Pool, repo: &str) -> Result<i64, Response> {
+    let client = pool.get().await.map_err(|error| {
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            &format!("backup: database: {error}"),
+        )
+    })?;
+    let row = client
+        .query_opt("SELECT repo_id FROM repos WHERE name = $1", &[&repo])
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("backup: reading repository: {error}"),
+            )
+        })?;
+    row.map(|row| row.get::<_, i64>(0)).ok_or_else(|| {
+        error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("repository {repo} not found"),
+        )
+    })
+}
+
+fn store_for_backup(
+    config: &crate::config::Config,
+) -> Result<scion_store_s3::S3BlobStore, Response> {
+    let Some(s3) = config.s3_config() else {
+        return Err(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "object storage is not configured",
+        ));
+    };
+    scion_store_s3::S3BlobStore::new(s3).map_err(|error| status_response(status_from_error(&error)))
+}
+
+/// `GET /repos/{repo}/blobs/export` — every external object of the repository, base64.
+pub(crate) async fn export_blobs(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Repos,
+        "exporting object bytes requires the DevOps seat (admin.repos)",
+    ) {
+        return response;
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    let repo_id = match repo_id_for(pool, &repo).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let blobs = match store_for_backup(&state.config) {
+        Ok(blobs) => blobs,
+        Err(response) => return response,
+    };
+    let mut entries = Vec::new();
+    for area in ["r", "q"] {
+        let prefix = format!("{area}/{repo_id}/");
+        let keys = match blobs.list(&prefix).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    &format!("listing object keys: {error}"),
+                );
+            }
+        };
+        for key in keys {
+            let bytes = match blobs.get(&key).await {
+                Ok(Some(bytes)) => bytes,
+                Ok(None) => continue,
+                Err(error) => {
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "internal",
+                        &format!("reading {key}: {error}"),
+                    );
+                }
+            };
+            entries.push(BlobEntry {
+                key,
+                data: BASE64.encode(&bytes),
+            });
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "service": SERVICE,
+            "status": "ok",
+            "repo": repo,
+            "count": entries.len(),
+            "entries": entries,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /repos/{repo}/blobs/import` — restore external object bytes for a repository.
+pub(crate) async fn import_blobs(
+    State(state): State<Arc<AppState>>,
+    Path(repo): Path<String>,
+    headers: HeaderMap,
+    body: Result<Json<BlobImportBody>, JsonRejection>,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Repos,
+        "importing object bytes requires the DevOps seat (admin.repos)",
+    ) {
+        return response;
+    }
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    let repo_id = match repo_id_for(pool, &repo).await {
+        Ok(id) => id,
+        Err(response) => return response,
+    };
+    let live = format!("r/{repo_id}/");
+    let quarantine = format!("q/{repo_id}/");
+    for entry in &body.entries {
+        if !entry.key.starts_with(&live) && !entry.key.starts_with(&quarantine) {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!("key {} does not belong to repository {repo}", entry.key),
+            );
+        }
+    }
+    let blobs = match store_for_backup(&state.config) {
+        Ok(blobs) => blobs,
+        Err(response) => return response,
+    };
+    for entry in &body.entries {
+        let Ok(bytes) = BASE64.decode(entry.data.as_bytes()) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!("entry {} is not base64", entry.key),
+            );
+        };
+        if let Err(error) = blobs.put(&entry.key, bytes.into()).await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("writing {}: {error}", entry.key),
+            );
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "service": SERVICE,
+            "status": "ok",
+            "repo": repo,
+            "imported": body.entries.len(),
+        })),
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -38,6 +38,11 @@ def main() -> int:
     parser.add_argument("--base", default="http://127.0.0.1:3995")
     parser.add_argument("--devops-secret", required=True)
     parser.add_argument("--apply", action="store_true", help="delete (default: dry run)")
+    parser.add_argument(
+        "--purge-prefix",
+        default=None,
+        help="delete every key under this explicit legacy prefix instead of the orphan sweep",
+    )
     args = parser.parse_args()
 
     token = call(
@@ -46,7 +51,10 @@ def main() -> int:
         "/auth/token",
         body={"service": "devops", "secret": args.devops_secret},
     )["token"]
-    report = call(args.base, "POST", "/admin/gc/objects", token, {"apply": args.apply})["gc"]
+    body = {"apply": args.apply}
+    if args.purge_prefix:
+        body["prefix"] = args.purge_prefix
+    report = call(args.base, "POST", "/admin/gc/objects", token, body)["gc"]
     print(f"INFO  keys              {report['keys']}")
     print(f"INFO  live repositories {report['live_repos']}")
     print(f"INFO  orphan keys       {report['orphan_keys']}")

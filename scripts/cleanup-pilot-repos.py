@@ -45,6 +45,7 @@ def main() -> int:
     parser.add_argument("--base", default="http://127.0.0.1:3996")
     parser.add_argument("--devops-secret", required=True)
     parser.add_argument("--prefix", action="append", default=None)
+    parser.add_argument("--all", action="store_true", help="delete every repository (legacy prune)")
     parser.add_argument("--apply", action="store_true", help="actually delete (default: dry run)")
     args = parser.parse_args()
 
@@ -56,13 +57,16 @@ def main() -> int:
     )["token"]
     prefixes = args.prefix or DEFAULT_PREFIXES
     repos = call(args.base, "GET", "/repos", token)["repos"]
-    doomed = sorted(
-        repo["name"]
-        for repo in repos
-        if any(repo["name"].startswith(prefix) for prefix in prefixes)
-    )
+    if args.all:
+        doomed = sorted(repo["name"] for repo in repos)
+    else:
+        doomed = sorted(
+            repo["name"]
+            for repo in repos
+            if any(repo["name"].startswith(prefix) for prefix in prefixes)
+        )
     print(f"INFO  {len(repos)} repositories in the control plane")
-    print(f"INFO  prefixes {', '.join(prefixes)}")
+    print("INFO  mode      " + ("ALL (legacy prune)" if args.all else ", ".join(prefixes)))
     print(f"INFO  matched {len(doomed)} repositories")
     for name in doomed:
         print(f"  - {name}")

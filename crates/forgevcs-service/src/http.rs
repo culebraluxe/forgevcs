@@ -179,6 +179,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route("/repos", get(facade::list_repos))
         .route("/admin/gc/objects", post(facade::gc_objects))
+        .route("/repos/{repo}/blobs/export", get(facade::export_blobs))
+        .route("/repos/{repo}/blobs/import", post(facade::import_blobs))
         .route("/repos/{repo}", delete(facade::delete_repo))
         .route(
             "/repos/{repo}/conflicts/{id}/claim",

@@ -53,6 +53,35 @@ fn repo_id_of_key(key: &str) -> Option<i64> {
     None
 }
 
+/// Delete every key under an explicit prefix (legacy namespaces). Dry-run unless `apply`.
+pub async fn purge_prefix(
+    blobs: &dyn BlobStore,
+    prefix: &str,
+    apply: bool,
+) -> Result<GcReport, String> {
+    let keys = blobs
+        .list(prefix)
+        .await
+        .map_err(|error| format!("gc: listing object keys: {error}"))?;
+    let mut report = GcReport {
+        keys: keys.len(),
+        orphan_keys: keys.len(),
+        sample: keys.iter().take(20).cloned().collect(),
+        applied: apply,
+        ..GcReport::default()
+    };
+    if apply {
+        for key in &keys {
+            blobs
+                .delete(key)
+                .await
+                .map_err(|error| format!("gc: deleting {key}: {error}"))?;
+            report.deleted_keys += 1;
+        }
+    }
+    Ok(report)
+}
+
 /// Sweep the bucket for keys of deleted repositories.
 pub async fn sweep(blobs: &dyn BlobStore, pool: &Pool, apply: bool) -> Result<GcReport, String> {
     let client = pool

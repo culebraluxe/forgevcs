@@ -107,10 +107,35 @@ metadata rows)**; the first GC sweep (2026-10-18) then deleted **12 orphan objec
 (72 unmatched keys were W3 acceptance fixture files under `forgevcs-ci/w3-*`, not engine objects,
 and were reported and kept).
 
+## Backup and restore (implemented)
+
+A repository archive is a zip of the full repository state:
+
+- `manifest.json` — repo, deterministic repo_id, refs (name/target/version), row and blob counts;
+- `rows/<table>.copy` — psql `COPY` of every `repo_id`-keyed Scion table;
+- `blobs.json` — external object bytes from the DevOps blob-transfer routes.
+
+```sh
+scripts/repo-backup.sh  backup  --repo <name> --zip archives/<name>.zip
+scripts/repo-backup.sh  restore --repo <name> --zip archives/<name>.zip          # repo must be absent
+scripts/repo-backup.sh  restore --repo <name> --zip archives/<name>.zip --replace
+scripts/backup-acceptance.sh   # the drill: create -> zip -> delete -> restore -> verify
+```
+
+Restore recreates the same repository name, which is what makes it line up: ForgeVCS derives
+`repo_id` deterministically from the name, so the archived rows and blob keys are already correct.
+The script creates the repository (bootstrap), removes those bootstrap rows, `COPY`s the archive
+back in, and re-uploads the blobs. It refuses to overwrite unless `--replace` is given, and the
+hosted service should be restarted/recycled after a restore so no instance keeps a cached engine.
+
+Drill result (2026-10-18): **8/8** — two changesets plus files, delete, restore, refs and versions
+identical, both file versions byte-identical; teardown deleted the repository and the orphan GC
+removed the leftover blobs.
+
 ## Follow-ups
 
-1. Backup/restore drill — GC now reclaims blobs of deleted repositories, but a tested
-   backup/restore is still the gate for calling deletion production-grade.
+1. Schedule the backup drill (script exists and passes) and decide an archive retention policy;
+   GC now reclaims blobs of deleted repositories.
 2. Unify the collaboration pilot policy to the strict matrix once the merge work is stable (its
    permissive `main` rule exists only to test CAS/rebase mechanics).
 3. If the model asks for a third tier (e.g. reviewer), add it as policy groups first, not as a
