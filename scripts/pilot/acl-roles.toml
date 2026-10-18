@@ -24,7 +24,7 @@ read = ["group:agents"]
 write = ["group:agents"]
 
 [refs]
-"main" = { update = ["group:devops"] }
+"main" = { update = ["group:devops", "service:forgevcs-workspace"] }
 "lane/a" = { update = ["group:agent-a"] }
 
 [admin]

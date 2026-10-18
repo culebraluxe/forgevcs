@@ -94,7 +94,9 @@ queue flow runs end to end with a real `409` (worker escalates; workers cannot l
 DevOps lists, claims and resolves; the open list clears), resolved items stay visible as data,
 DevOps clears them, and the DevOps seat deletes a repository (the worker's attempt is 403, the
 repository leaves the control plane, and a second delete is 404). The collaboration pilot passes
-**41/41** with every repository created by the DevOps seat.
+**41/41** with every repository created by the DevOps seat. The first real cleanup on 2026-10-17
+deleted **72 burn-in repositories (5,419 metadata rows)** through this endpoint; object blobs were
+retained as designed.
 
 ## Follow-ups
 

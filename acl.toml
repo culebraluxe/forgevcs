@@ -36,7 +36,10 @@ write = ["group:agents"]
 # `admin.trunk` and this rule are both checked, so the deny does not depend on which surface
 # the caller used.
 [refs]
-"main" = { update = ["group:devops"] }
+# The internal workspace principal also updates `main`: the façade checks the external
+# caller's `admin.trunk` before submitting, then the working copy lands with its own
+# (unmintable) principal. Without it, workspace submit is 403 for everyone.
+"main" = { update = ["group:devops", "service:forgevcs-workspace"] }
 "refs/heads/*" = { update = ["group:agents"] }
 
 [admin]
