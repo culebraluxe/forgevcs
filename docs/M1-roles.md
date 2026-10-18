@@ -23,6 +23,7 @@ Smith/Scout/Assay are workers) and to Scion's own permissions:
 | Create a ref | no (403) | yes | upstream `CreateRef` requires `admin.refs` |
 | Create a repository | **no (403)** | yes | façade `init` gate on `admin.repos` + no gRPC path creates repos |
 | List repositories (`GET /repos`) | **no (403)** | yes | `admin.repos` |
+| Object GC (`POST /admin/gc/objects`) | **no (403)** | yes | `admin.repos`; dry run unless `apply` |
 | Delete a repository (`DELETE /repos/{repo}`) | **no (403)** | yes | façade gate on `admin.repos`; the body must repeat the name; metadata rows in one transaction, shared blobs retained |
 | Advance `main` / `land` / `merge-land` | **no (403)** | yes | façade `admin.trunk` gate **and** `[refs] main = group:devops`, so gRPC cannot bypass it |
 
@@ -46,10 +47,12 @@ cannot be used to bypass trunk advance because the `main` ref rule also names th
   workers. The collaboration pilot (`scripts/pilot/acl.toml`) deliberately grants `admin.trunk`
   to the trio so it can measure merge/land mechanics; the strict matrix lives in
   `scripts/pilot/acl-roles.toml`.
-- **Objects are not deleted with a repository.** Scion blobs are content-addressed and shared,
-  so a per-repository blob set cannot be removed safely; deletion is metadata-only and object GC
-  stays a separate workstream. A backup/restore drill is still absent and is the gate for calling
-  deletion production-ready.
+- **Objects are not deleted with a repository**, but they are no longer orphans forever:
+  Scion keys are repository-scoped (`/r/<repo_id>/…`), so `POST /admin/gc/objects` deletes keys
+  whose repo_id is gone from `repos` and nothing else. It is dry-run by default, malformed keys
+  are reported and never deleted, and it is gated to `admin.repos`
+  (`scripts/gc-orphan-blobs.sh`). A backup/restore drill is still absent and is the gate for
+  calling deletion production-ready.
 
 ## Conflict escalation queue (implemented)
 
@@ -90,22 +93,24 @@ smoke does the same for its two repositories unless `KEEP_SMOKE_REPOS=1`; tests 
 growing mess. `cleanup-pilot-repos.sh --apply` is for older leftovers.
 ```
 
-Measured 2026-10-17: the role pilot passes **29/29**. It proves the DevOps seat creates a
+Measured 2026-10-17/18: the role pilot passes **31/31**. It proves the DevOps seat creates a
 repository, a worker's create/delete/list is 403, a worker cannot create a ref, the worker lands
 on its own lane, a worker's trunk advance is 403, DevOps lands the worker's head on `main` and
 the file is there, the worker can read refs, compute a merge base and create a workspace, the
 queue flow runs end to end with a real `409` (worker escalates; workers cannot list or claim;
 DevOps lists, claims and resolves; the open list clears), resolved items stay visible as data,
 DevOps clears them, and the DevOps seat deletes a repository (the worker's attempt is 403, the
-repository leaves the control plane, and a second delete is 404). The collaboration pilot passes
-**41/41** with every repository created by the DevOps seat. The first real cleanup on 2026-10-17
-deleted **72 burn-in repositories (5,419 metadata rows)** through this endpoint; object blobs were
-retained as designed.
+repository leaves the control plane, and a second delete is 404), and object GC is a DevOps-only
+dry run that deletes nothing. The collaboration pilot passes **41/41** with every repository created
+by the DevOps seat. The first real cleanup on 2026-10-17 deleted **72 burn-in repositories (5,419
+metadata rows)**; the first GC sweep (2026-10-18) then deleted **12 orphan object keys and left 0**
+(72 unmatched keys were W3 acceptance fixture files under `forgevcs-ci/w3-*`, not engine objects,
+and were reported and kept).
 
 ## Follow-ups
 
-1. Object garbage collection and a backup/restore drill — the two things that make repository
-   deletion production-grade; deletion is metadata-only today and blobs are retained.
+1. Backup/restore drill — GC now reclaims blobs of deleted repositories, but a tested
+   backup/restore is still the gate for calling deletion production-grade.
 2. Unify the collaboration pilot policy to the strict matrix once the merge work is stable (its
    permissive `main` rule exists only to test CAS/rebase mechanics).
 3. If the model asks for a third tier (e.g. reviewer), add it as policy groups first, not as a

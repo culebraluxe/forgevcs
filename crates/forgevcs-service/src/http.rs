@@ -178,6 +178,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             delete(facade::delete_conflict),
         )
         .route("/repos", get(facade::list_repos))
+        .route("/admin/gc/objects", post(facade::gc_objects))
         .route("/repos/{repo}", delete(facade::delete_repo))
         .route(
             "/repos/{repo}/conflicts/{id}/claim",

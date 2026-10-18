@@ -414,6 +414,22 @@ def main() -> int:
         f"HTTP {gone_status}",
     )
 
+    # --- object GC is the DevOps seat's storage entitlement -------------------------------
+    denied_gc, _ = worker.status("POST", "/admin/gc/objects", {})
+    worker.check(
+        "gc: a worker cannot sweep object storage (403)",
+        denied_gc == 403,
+        f"HTTP {denied_gc}",
+    )
+    sweep = devops.call("POST", "/admin/gc/objects", {})
+    devops.check(
+        "gc: the DevOps dry run reports keys and deletes nothing",
+        sweep["gc"]["applied"] is False
+        and sweep["gc"]["deleted_keys"] == 0
+        and sweep["gc"]["keys"] >= sweep["gc"]["orphan_keys"],
+        str(sweep)[:250],
+    )
+
     # --- basic level: read, merge-base, checkout ------------------------------------------
     worker.call("GET", f"/repos/{repo}/refs")
     worker.check("basic level: the worker can read refs", True)

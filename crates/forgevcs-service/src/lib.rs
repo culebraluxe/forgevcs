@@ -12,5 +12,6 @@ pub mod db;
 pub mod engine;
 pub mod escalations;
 pub mod facade;
+pub mod gc;
 pub mod http;
 pub mod workspace;

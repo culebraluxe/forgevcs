@@ -1637,6 +1637,13 @@ pub(crate) struct ClearConflictsQuery {
     status: Option<String>,
 }
 
+/// `POST /admin/gc/objects` — dry-run unless `apply` is true.
+#[derive(Debug, Deserialize)]
+pub(crate) struct GcBody {
+    #[serde(default)]
+    apply: bool,
+}
+
 fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
     let mut framed = Vec::new();
     for item in items {
@@ -3333,6 +3340,70 @@ pub(crate) async fn delete_conflict(
         )
             .into_response(),
         Ok(false) => error_response(StatusCode::NOT_FOUND, "not_found", "escalation not found"),
+        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Object garbage collection (DevOps seat)
+// ---------------------------------------------------------------------------------------------
+
+/// `POST /admin/gc/objects` — delete blobs whose repository no longer exists. Scion keys are
+/// repository-scoped, so an orphan has one exact meaning here; dry-run unless `apply` is true.
+pub(crate) async fn gc_objects(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Result<Json<GcBody>, JsonRejection>,
+) -> Response {
+    let (auth_engine, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_devops(
+        &auth_engine,
+        &caller,
+        scion_policy::AdminPerm::Repos,
+        "object garbage collection requires the DevOps seat (admin.repos)",
+    ) {
+        return response;
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return bad_json(rejection),
+    };
+    let Some(s3) = state.config.s3_config() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable",
+            "object storage is not configured",
+        );
+    };
+    let blobs = match scion_store_s3::S3BlobStore::new(s3) {
+        Ok(blobs) => blobs,
+        Err(error) => return status_response(status_from_error(&error)),
+    };
+    let Some(pool) = state.db.as_ref() else {
+        return queue_unavailable();
+    };
+    match crate::gc::sweep(&blobs, pool, body.apply).await {
+        Ok(report) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "gc": {
+                    "keys": report.keys,
+                    "live_repos": report.live_repos,
+                    "orphan_keys": report.orphan_keys,
+                    "deleted_keys": report.deleted_keys,
+                    "malformed_keys": report.malformed_keys,
+                    "malformed_sample": report.malformed_sample,
+                    "sample": report.sample,
+                    "applied": report.applied,
+                },
+            })),
+        )
+            .into_response(),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
     }
 }
