@@ -28,7 +28,7 @@ rows behind. The `cleanup-pilot-repos.sh` script covers older leftovers.
 The merge path itself is analysed in `docs/M1-merge-analysis.md`: the inherited Scion model,
 the conflict sites the pilot exercises, and the ordered work to grow it.
 
-## Result — 2026-10-17, PASS 45/45
+## Result — 2026-10-18, PASS 46/46
 
 ```text
 identity      each worker and the DevOps seat mint a token; /auth/whoami names each
@@ -52,8 +52,10 @@ context(land)  base=parent, ours=tip, theirs=head readable in one call for the r
 resolution    explicit content + land; the server never writes conflict markers
 rename        A lands old.txt -> new.txt; B's staged edit to old.txt follows the rename and
               lands cleanly on new.txt (engine version exact-rename-v1)
+merge-rename  an explicit Merge(a, b) resolves an edit at the rename destination on the other
+              side (no false modify/delete; the destination carries the edit)
 teardown      every repository created by the run is deleted, pass or fail
-OK  45 checks passed across 3 agents, the DevOps seat and 7 repositories
+OK  46 checks passed across 3 agents, the DevOps seat and 7 repositories
 ```
 
 The engine log carries the mechanism, not just the verdict. In the shared-repository round the

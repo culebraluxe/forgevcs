@@ -940,6 +940,69 @@ def main() -> int:
         f"tip {followed_tip}",
     )
 
+    # --- stage 2: the explicit Merge(a, b) path follows a rename ------------------------
+    #
+    # Base has merge/old.txt. Agent A edits it; agent B renames it to merge/new.txt in a
+    # changeset. Merging A into B must resolve the edit at the rename destination instead of
+    # reporting a modify/delete conflict.
+    merge_base_tip, _ = main_target(lead, rename_repo)
+    merge_old = "stage2/old.txt"
+    merge_new = "stage2/new.txt"
+    merge_base = clients[first].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(merge_base_tip, merge_old, BLOB_A, len(CONTENT_A), B64_A, "merge base file"),
+    )["ref"]["target"]
+    merge_edit = clients[first].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(
+            merge_base,
+            merge_old,
+            BLOB_B,
+            len(CONTENT_B),
+            B64_B,
+            "edit on the merge side",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    merge_rename = clients[second].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(
+            merge_base,
+            merge_old,
+            BLOB_A,
+            len(CONTENT_A),
+            B64_A,
+            "rename on the other merge side",
+            mode="none",
+            delta=[
+                {"path": merge_new, "op": 1, "mode": 1, "id": BLOB_A, "size": len(CONTENT_A)},
+                {"path": merge_old, "op": 2},
+            ],
+        ),
+    )["changeset"]["id"]
+    merge_renamed = lead.call(
+        "POST",
+        f"/repos/{rename_repo}/merge",
+        {
+            "a": merge_edit,
+            "b": merge_rename,
+            "meta": {
+                "author": "ForgeVCS agent pilot <pilot@example.test>",
+                "message": "merge an edit with a rename",
+            },
+            "change_id": secrets.token_hex(16),
+        },
+    )["changeset"]["id"]
+    clients[first].check(
+        "merge-rename: the merge landed at the rename destination",
+        file_at(lead, rename_repo, merge_renamed, merge_new) == CONTENT_B.decode()
+        and file_at(lead, rename_repo, merge_renamed, merge_old) is None,
+        f"changeset {merge_renamed}",
+    )
+
     total = sum(client.checks for client in clients.values())
     print(f"OK  {total} checks passed across 3 agents and {len(created)} repositories")
     teardown()

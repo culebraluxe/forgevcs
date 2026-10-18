@@ -77,14 +77,19 @@ impl History {
 
         // Exact-content rename awareness (opt-in engine version). A rename on the onto side or
         // in this changeset would otherwise turn an edit into a false modify/delete conflict.
-        let inputs = if rename::rename_engine_enabled() {
-            self.apply_exact_renames(&b_root, &o_root, &cs.delta, inputs)
+        let (inputs, forced_adds) = if rename::rename_engine_enabled() {
+            self.apply_renames(&b_root, &o_root, &cs.delta, inputs)
                 .await?
         } else {
-            inputs
+            (inputs, std::collections::BTreeSet::new())
         };
 
-        let resolution = self.resolve_paths(inputs).await?;
+        let mut resolution = self.resolve_paths(inputs).await?;
+        // A re-anchored path that does not exist on the onto side is an add relative to it; the
+        // synthesized content is the merged entry, so the delta baseline must be absent.
+        for path in forced_adds {
+            resolution.ours.insert(path, None);
+        }
         if let Some(err) = resolution.conflict_error("rebase") {
             return Err(err);
         }
@@ -110,24 +115,25 @@ impl History {
 }
 
 impl History {
-    /// `exact-rename-v1`: move an edit that targets a renamed path onto the rename destination.
+    /// The opt-in rename engine: move edits onto rename destinations (exact and similar
+    /// renames, see `rename.rs`).
     ///
-    /// Two orientations are handled, both exact-content only (see `rename.rs`):
+    /// Two orientations are handled:
     ///
-    /// - **theirs renamed** (`C` deletes `P` and adds `Q` with `P`'s base content): the edit at
-    ///   `P` is resolved at `Q` with `base = P`, and `P` is deleted relative to the onto tree.
+    /// - **theirs renamed** (`C` deletes `P` and adds `Q`): the edit at `P` is resolved at `Q`
+    ///   with `base = P`, and `P` is deleted relative to the onto tree.
     /// - **ours renamed** (`onto` deleted `P` and added `Q`): the edit at `P` is re-anchored to
     ///   `Q`, where the onto side supplies the current content.
     ///
     /// A rename/rename to different destinations is an explicit `add_add` conflict rather than a
     /// silent duplicate. Everything else is left to the SPEC 8.3 rules.
-    async fn apply_exact_renames(
+    async fn apply_renames(
         &self,
         b_root: &ObjectId,
         o_root: &ObjectId,
         delta: &[DeltaEntry],
         mut inputs: Vec<PathInput>,
-    ) -> Result<Vec<PathInput>> {
+    ) -> Result<(Vec<PathInput>, std::collections::BTreeSet<RepoPath>)> {
         let mut base: BTreeMap<RepoPath, EntryInfo> = BTreeMap::new();
         for input in &inputs {
             if let Some(entry) = input.b {
@@ -135,30 +141,21 @@ impl History {
             }
         }
 
-        let mut puts: BTreeMap<ObjectId, Vec<(RepoPath, EntryInfo)>> = BTreeMap::new();
+        // Theirs: a Delete + an added Put are rename candidates.
+        let mut their_deleted = Vec::new();
+        let mut their_added = Vec::new();
         for entry in delta {
-            if let DeltaOp::Put { mode, id, size } = entry.op {
-                puts.entry(id)
-                    .or_default()
-                    .push((entry.path.clone(), EntryInfo { mode, id, size }));
-            }
-        }
-
-        let mut their: BTreeMap<RepoPath, (RepoPath, EntryInfo)> = BTreeMap::new();
-        for entry in delta {
-            if !matches!(entry.op, DeltaOp::Delete) {
-                continue;
-            }
-            let Some(b) = base.get(&entry.path) else {
-                continue;
-            };
-            let Some(paths) = puts.get(&b.id) else {
-                continue;
-            };
-            if let [only] = paths.as_slice()
-                && only.0 != entry.path
-            {
-                their.insert(entry.path.clone(), only.clone());
+            match entry.op {
+                DeltaOp::Delete => {
+                    if let Some(base_entry) = base.get(&entry.path) {
+                        their_deleted.push((entry.path.clone(), *base_entry));
+                    }
+                }
+                DeltaOp::Put { mode, id, size } => {
+                    if !base.contains_key(&entry.path) {
+                        their_added.push((entry.path.clone(), EntryInfo { mode, id, size }));
+                    }
+                }
             }
         }
 
@@ -166,16 +163,30 @@ impl History {
             .iter()
             .any(|input| input.b.is_some() && input.o.is_none() && input.t.is_some());
         let needs_ours = ours_candidate
-            || their.values().any(|(target, _)| {
-                inputs
-                    .iter()
-                    .any(|input| &input.path == target && input.o.is_some())
-            });
-        let mut our: BTreeMap<RepoPath, (RepoPath, EntryInfo)> = BTreeMap::new();
+            || their_added
+                .iter()
+                .any(|(target, _)| inputs.iter().any(|i| &i.path == target && i.o.is_some()));
+        let (mut our_deleted, mut our_added) = (Vec::new(), Vec::new());
         if needs_ours {
             let diff = self.file_diff(Some(b_root), o_root, None).await?;
-            our = rename::exact_renames(&diff);
+            (our_deleted, our_added) = rename::deletions_and_additions(&diff);
         }
+
+        let max = self.cfg.limits.merge_max_text_bytes;
+        let mut ids = std::collections::BTreeSet::new();
+        for (_, entry) in their_deleted.iter().chain(&our_deleted) {
+            if entry.size <= max {
+                ids.insert(entry.id);
+            }
+        }
+        for (_, entry) in their_added.iter().chain(&our_added) {
+            if entry.size <= max {
+                ids.insert(entry.id);
+            }
+        }
+        let contents = self.rename_contents(&ids).await?;
+        let their = rename::detect_renames(&their_deleted, &their_added, &contents);
+        let our = rename::detect_renames(&our_deleted, &our_added, &contents);
 
         for (old, (ours_target, ours_entry)) in &our {
             if let Some((theirs_target, theirs_entry)) = their.get(old)
@@ -211,6 +222,7 @@ impl History {
             .map(|(index, input)| (input.path.clone(), index))
             .collect();
 
+        let mut forced_adds = std::collections::BTreeSet::new();
         for (old, (target, target_entry)) in &their {
             let (Some(&old_index), Some(&target_index)) = (position.get(old), position.get(target))
             else {
@@ -220,6 +232,9 @@ impl History {
             else {
                 continue;
             };
+            if inputs[target_index].o.is_none() {
+                forced_adds.insert(target.clone());
+            }
             inputs[old_index] = PathInput {
                 path: old.clone(),
                 b: Some(ours_entry),
@@ -259,7 +274,7 @@ impl History {
             };
         }
         drop(reader);
-        Ok(inputs)
+        Ok((inputs, forced_adds))
     }
 }
 

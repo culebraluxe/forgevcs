@@ -1,8 +1,8 @@
 # Rename detection — design and engine-version plan
 
-**Date:** 2026-10-17 · **Status:** stage 1 implemented — exact-content rename awareness in
-rebase/land behind `FORGEVCS_MERGE_ENGINE=exact-rename-v1`. The merge path (`Merge(a,b)`) is not
-rename-aware yet, similarity detection is stage 2, and the default engine is unchanged.
+**Date:** 2026-10-17 · **Status:** stages 1 and 2 implemented — rename awareness in both the
+rebase/land path and the explicit `Merge(a,b)` path, with exact-content matching plus line-based
+similarity, behind `FORGEVCS_MERGE_ENGINE=exact-rename-v1`. The default engine is unchanged.
 
 ## Why this is the next engine work
 
@@ -127,18 +127,32 @@ upstream gate is untouched. The pilot enables the engine for its local service a
 use case end to end: A lands `old.txt -> new.txt`, B had staged an edit to `old.txt` from the
 pre-rename base, B lands and the edit follows the rename to `new.txt`.
 
-### Stage 1 limits
+## Implemented — stage 2 (merge path and similarity)
 
-- Exact content only; rename + edit in the same changeset needs stage 2 (similarity).
-- `Merge(a, b)` is not rename-aware yet; the branch/land path is.
-- Directory renames are handled per file (they are exact renames of each unchanged file).
-- Both-sides-rename-to-different-paths is an explicit conflict; it is not auto-resolved.
+- **Similarity.** When no exact id match exists, deletions and additions of one side are compared
+  by line-set Jaccard similarity; pairs at or above `0.5` are renames. Binary contents, contents
+  over `merge_max_text_bytes`, redacted objects and ambiguous matches fall back to delete + add.
+  Assignment is deterministic: exact matches first (unique target required), then descending
+  similarity with ascending paths as the tie-break.
+- **Merge path.** `Merge(a, b)` uses the same re-anchoring as rebase: a rename on either side
+  resolves the other side's edit at the destination, with `base` = the pre-rename path, and the
+  merge delta records the delete plus the add relative to `a`.
+- Proof: the collaboration pilot lands an edit across a rename on the **merge** path (46/46), and
+  the upstream unit tests cover exact, similar, unrelated, binary and ambiguous detection (18).
+
+### Remaining limits
+
+- Directory renames are handled per file (each unchanged file is a rename); no directory identity.
+- Both sides renaming the same path to different destinations is an explicit `add_add` conflict.
+- Similarity is a heuristic (line-set Jaccard, fixed threshold); a tuned engine version would
+  record the threshold in history.
+- Redacted or binary contents never participate in rename detection.
 
 ## Work plan
 
 1. ~~Detection module with unit tests.~~ Done.
 2. ~~Rebase integration behind the opt-in engine, with the pilot fixture.~~ Done.
-3. Merge integration (`Merge(a, b)`) for explicit merges — next.
-4. Config/versioning: the env switch is in place; a recorded merge-engine version in history is
-   still an engine-version concern.
-5. Stage 2 (similarity) and directory-rename polish as a later increment.
+3. ~~Merge integration (`Merge(a, b)`) for explicit merges.~~ Done.
+4. ~~Stage 2 similarity detection.~~ Done.
+5. Config/versioning: the env switch is in place; recording the merge-engine version in history
+   and tuning the similarity threshold are later engine-version work.
