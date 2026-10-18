@@ -77,6 +77,7 @@ fi
 if [ "${KEEP_SMOKE_REPOS:-0}" != "1" ]; then
   for repo in "$W4_REPO" "$W5_REPO"; do
     CODE=$(curl_json -o /tmp/forgevcs-w8-delete -w '%{http_code}' -X DELETE "$BASE/repos/$repo" \
+      -H "authorization: Bearer $TOKEN" \
       -H 'content-type: application/json' -d "{\"confirm\":\"$repo\"}")
     if [ "$CODE" = 200 ]; then
       echo "TEARDOWN  deleted $repo"
