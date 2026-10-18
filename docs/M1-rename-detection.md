@@ -1,8 +1,8 @@
 # Rename detection — design and engine-version plan
 
-**Date:** 2026-10-17 · **Status:** approved as Option A (vendored-engine patch behind an opt-in
-merge-engine version); implementation is the next engine workstream. Nothing in this document
-is implemented yet.
+**Date:** 2026-10-17 · **Status:** stage 1 implemented — exact-content rename awareness in
+rebase/land behind `FORGEVCS_MERGE_ENGINE=exact-rename-v1`. The merge path (`Merge(a,b)`) is not
+rename-aware yet, similarity detection is stage 2, and the default engine is unchanged.
 
 ## Why this is the next engine work
 
@@ -108,15 +108,37 @@ versioned (`DerivedType.version`) and may not change stage-1 results. This is wh
   (rename/rename, rename/modify, rename/delete, directory rename, case-only rename, rename into a
   directory that exists on the other side).
 
+## Implemented — stage 1 (rebase/land)
+
+`upstream/crates/scion-history/src/rename.rs` detects exact renames in one side's `FileDiff`
+(delete `P` + add `Q` with `P`'s base id; ambiguous candidates are left alone). `rebase.rs`
+consults it when `FORGEVCS_MERGE_ENGINE=exact-rename-v1`:
+
+- **theirs renamed** (the changeset deletes `P` and adds `Q`): the edit at `P` is resolved at
+  `Q` with `base = P`, and `P` is deleted relative to the onto tree;
+- **ours renamed** (the onto tip deleted `P` and added `Q`): the edit at `P` is re-anchored to
+  `Q` with the onto side's content, using a lazy `FileDiff(base, onto)` only when a conflict
+  candidate exists;
+- **rename/rename to different destinations** returns an explicit `add_add` conflict instead of
+  silently keeping both paths.
+
+The default engine (`line-diff3-v1`, variable unset) keeps the vendored behaviour, so the
+upstream gate is untouched. The pilot enables the engine for its local service and proves the
+use case end to end: A lands `old.txt -> new.txt`, B had staged an edit to `old.txt` from the
+pre-rename base, B lands and the edit follows the rename to `new.txt`.
+
+### Stage 1 limits
+
+- Exact content only; rename + edit in the same changeset needs stage 2 (similarity).
+- `Merge(a, b)` is not rename-aware yet; the branch/land path is.
+- Directory renames are handled per file (they are exact renames of each unchanged file).
+- Both-sides-rename-to-different-paths is an explicit conflict; it is not auto-resolved.
+
 ## Work plan
 
-1. Detection module (`scion-history/src/rename.rs`) with unit tests for exact renames and
-   ambiguity fallback — no behaviour change yet.
-2. Merge integration, gated by the new engine option, with the case table above as tests.
-3. Rebase integration (the Land path) with the lazy onto-side diff; this is the case the pilot
-   will exercise end to end.
-4. Config/versioning plumbing (`FORGEVCS_MERGE_ENGINE`, recorded in docs), differential tests,
-   and a pilot check: A renames, B edits, B lands cleanly.
-5. Stage 2 (similarity) as a separate engine-version increment.
-
-Steps 1–4 are the rename work the class of agent workflows needs; step 5 is an enhancement.
+1. ~~Detection module with unit tests.~~ Done.
+2. ~~Rebase integration behind the opt-in engine, with the pilot fixture.~~ Done.
+3. Merge integration (`Merge(a, b)`) for explicit merges — next.
+4. Config/versioning: the env switch is in place; a recorded merge-engine version in history is
+   still an engine-version concern.
+5. Stage 2 (similarity) and directory-rename polish as a later increment.

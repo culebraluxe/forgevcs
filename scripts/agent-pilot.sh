@@ -31,6 +31,8 @@ export FORGEVCS_BUCKET="${FORGEVCS_BUCKET:-forgevcs-objects}"
 # test file so the hosted deployment's policy stays exactly as committed.
 export FORGEVCS_POLICY_PATH="${FORGEVCS_POLICY_PATH:-$ROOT/scripts/pilot/acl.toml}"
 export FORGEVCS_AUTH_MODE="${FORGEVCS_AUTH_MODE:-SCION_ONLY}"
+# Opt into the exact-rename merge engine for this pilot; the vendored default is unchanged.
+export FORGEVCS_MERGE_ENGINE="${FORGEVCS_MERGE_ENGINE:-exact-rename-v1}"
 export PORT="${PORT:-3998}"
 
 # Throwaway pilot identities. The engine takes `name=<sha256 of secret>`; the client mints a

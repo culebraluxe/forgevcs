@@ -56,6 +56,10 @@ of authority.
      (advance the trunk ref): new `RawAdmin` fields, `AdminPerm` variants, grants and permission
      names. Additive: a policy without the keys parses and denies by default, so the M0 policy
      keeps its exact behaviour until it opts in.
+ 10. `crates/scion-history/src/rename.rs` (**new**) + `rebase.rs` (M1) — exact-content rename
+     detection for rebase/land, enabled only when `FORGEVCS_MERGE_ENGINE=exact-rename-v1`.
+     With the variable unset (the default, including the vendored gate) the behaviour is
+     unchanged; the tests in the module assert detection and its safe fallbacks.
 
   No SQL statement's logic changed; only its dialect spelling. Proof is the suite, not
   inspection: 20/20 cases of `meta_store_suite` pass against Neon.

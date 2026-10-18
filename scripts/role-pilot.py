@@ -45,6 +45,23 @@ B64_A = base64.b64encode(CONTENT_A).decode()
 B64_B = base64.b64encode(CONTENT_B).decode()
 DEFAULT_REF = "main"
 
+# JUnit-style teardown: the repositories this client creates are removed at the end, pass or fail.
+_CLEANUP: dict = {"devops": None, "repos": []}
+
+
+def teardown() -> None:
+    repos = _CLEANUP.get("repos") or []
+    devops = _CLEANUP.get("devops")
+    if not repos or devops is None:
+        return
+    for repo in list(repos):
+        try:
+            devops.call("DELETE", f"/repos/{repo}", {"confirm": repo})
+            print(f"TEARDOWN  deleted {repo}")
+        except Exception as error:  # noqa: BLE001
+            print(f"TEARDOWN  could not delete {repo}: {error}", file=sys.stderr)
+    repos.clear()
+
 
 class RoleError(RuntimeError):
     pass
@@ -147,6 +164,7 @@ def main() -> int:
     devops = Client(base, mint(base, "devops", secrets_by_name["devops"]))
     stamp = time.strftime("%y%m%d%H%M%S") + secrets.token_hex(2)
     repo = f"role-pilot-{stamp}"
+    _CLEANUP.update(devops=devops, repos=[repo])
 
     print(f"INFO  engine {base}")
     print(f"INFO  repo   {repo}")
@@ -411,6 +429,7 @@ def main() -> int:
 
     total = worker.checks + devops.checks
     print(f"OK  {total} checks passed; repository created: {repo}")
+    teardown()
     return 0
 
 
@@ -419,4 +438,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except RoleError as error:
         print(f"FAIL  {error}", file=sys.stderr)
+        teardown()
         raise SystemExit(1)

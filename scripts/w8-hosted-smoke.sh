@@ -72,5 +72,19 @@ else
   FAIL=1
 fi
 
+# JUnit-style teardown: remove the repositories this run created. Set KEEP_SMOKE_REPOS=1 to keep
+# them as evidence. A teardown failure is reported but does not change the acceptance verdict.
+if [ "${KEEP_SMOKE_REPOS:-0}" != "1" ]; then
+  for repo in "$W4_REPO" "$W5_REPO"; do
+    CODE=$(curl_json -o /tmp/forgevcs-w8-delete -w '%{http_code}' -X DELETE "$BASE/repos/$repo" \
+      -H 'content-type: application/json' -d "{\"confirm\":\"$repo\"}")
+    if [ "$CODE" = 200 ]; then
+      echo "TEARDOWN  deleted $repo"
+    else
+      echo "TEARDOWN  could not delete $repo (HTTP $CODE): $(head -c 160 /tmp/forgevcs-w8-delete)" >&2
+    fi
+  done
+fi
+
 [ "$FAIL" = 0 ] && echo "W8_HOSTED=PASS" || echo "W8_HOSTED=FAIL"
 exit "$FAIL"

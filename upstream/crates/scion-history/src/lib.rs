@@ -22,6 +22,7 @@ mod land;
 mod merge;
 mod rebase;
 mod refs;
+mod rename;
 mod tree;
 
 pub use config::{HistoryConfig, LandConfig};

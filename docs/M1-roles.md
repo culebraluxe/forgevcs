@@ -84,6 +84,10 @@ The item stays queryable as history until the DevOps seat clears it.
 ```sh
 scripts/role-pilot.sh              # strict policy, worker + devops, port 3997
 scripts/cleanup-pilot-repos.sh     # dry run: list burn-in repos the DevOps seat may delete
+
+Both pilots delete the repositories they create in teardown (pass or fail), and the hosted W8
+smoke does the same for its two repositories unless `KEEP_SMOKE_REPOS=1`; tests no longer leave a
+growing mess. `cleanup-pilot-repos.sh --apply` is for older leftovers.
 ```
 
 Measured 2026-10-17: the role pilot passes **29/29**. It proves the DevOps seat creates a

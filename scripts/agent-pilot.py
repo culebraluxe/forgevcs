@@ -62,6 +62,24 @@ B64_B = base64.b64encode(CONTENT_B).decode()
 
 DEFAULT_REF = "main"
 
+# JUnit-style teardown: every repository this client creates is deleted at the end, whether the
+# checks passed or failed. The context is filled once the DevOps client exists.
+_CLEANUP: dict = {"base": None, "devops": None, "repos": []}
+
+
+def teardown() -> None:
+    repos = _CLEANUP.get("repos") or []
+    devops = _CLEANUP.get("devops")
+    if not repos or devops is None:
+        return
+    for repo in list(repos):
+        try:
+            devops.call("DELETE", f"/repos/{repo}", {"confirm": repo})
+            print(f"TEARDOWN  deleted {repo}")
+        except Exception as error:  # noqa: BLE001 - teardown must not mask the real failure
+            print(f"TEARDOWN  could not delete {repo}: {error}", file=sys.stderr)
+    repos.clear()
+
 
 class PilotError(RuntimeError):
     """A graded check failed."""
@@ -137,12 +155,15 @@ def push_body(
     message: str,
     ref_name: str = DEFAULT_REF,
     mode: str = "land",
+    delta: list | None = None,
+    objects: list | None = None,
 ) -> dict:
     return {
-        "objects": [{"id": blob, "data": data}],
+        "objects": objects or [{"id": blob, "data": data}],
         "changeset": {
             "parents": [parent],
-            "delta": [{"path": path, "op": 1, "mode": 1, "id": blob, "size": size}],
+            "delta": delta
+            or [{"path": path, "op": 1, "mode": 1, "id": blob, "size": size}],
             "meta": {
                 "author": "ForgeVCS agent pilot <pilot@example.test>",
                 "message": message,
@@ -233,6 +254,7 @@ def main() -> int:
     tokens = {principal: mint(base, principal, secret) for principal, secret in agents}
     clients = {principal: Client(base, token) for principal, token in tokens.items()}
     devops = clients["devops"]
+    _CLEANUP.update(base=base, devops=devops, repos=created)
 
     print(f"INFO  engine {base}")
     print(f"INFO  agents {', '.join(tokens)}")
@@ -843,9 +865,84 @@ def main() -> int:
         f"tip {resolved_tip}",
     )
 
+    # --- rename use case: an edit follows a rename on land -------------------------------
+    #
+    # A lands rename old.txt -> new.txt (same blob id). B had already staged an edit to
+    # old.txt from the pre-rename base and then lands. Without rename detection this is a
+    # false modify/delete conflict; with FORGEVCS_MERGE_ENGINE=exact-rename-v1 the edit
+    # follows the rename and lands cleanly.
+    rename_repo = f"agent-pilot-{stamp}-rename"
+    created.append(rename_repo)
+    init_repo(devops, rename_repo)
+    rename_tip, _ = main_target(lead, rename_repo)
+    base_push = clients[first].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(rename_tip, "old.txt", BLOB_A, len(CONTENT_A), B64_A, "base file"),
+    )
+    rename_tip = base_push["ref"]["target"]
+    edit = clients[second].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(
+            rename_tip,
+            "old.txt",
+            BLOB_B,
+            len(CONTENT_B),
+            B64_B,
+            "edit before rename",
+            mode="none",
+        ),
+    )["changeset"]["id"]
+    renamed = clients[first].call(
+        "POST",
+        f"/repos/{rename_repo}/push",
+        push_body(
+            rename_tip,
+            "old.txt",
+            BLOB_A,
+            len(CONTENT_A),
+            B64_A,
+            "rename old.txt -> new.txt",
+            delta=[
+                {"path": "new.txt", "op": 1, "mode": 1, "id": BLOB_A, "size": len(CONTENT_A)},
+                {"path": "old.txt", "op": 2},
+            ],
+        ),
+    )
+    clients[first].check(
+        "rename: agent A landed old.txt -> new.txt",
+        renamed["ref"]["version"] > 1,
+        str(renamed.get("ref")),
+    )
+    renamed_tip = renamed["ref"]["target"]
+    clients[first].check(
+        "rename: the old path is gone and the new path has the content",
+        file_at(lead, rename_repo, renamed_tip, "old.txt") is None
+        and file_at(lead, rename_repo, renamed_tip, "new.txt") == CONTENT_A.decode(),
+        f"tip {renamed_tip}",
+    )
+    followed = clients[second].call(
+        "POST",
+        f"/repos/{rename_repo}/land",
+        {"ref": DEFAULT_REF, "head": edit},
+    )
+    followed_tip = followed["ref"]["target"]
+    clients[second].check(
+        "rename: the edit landed after the rename without a conflict",
+        followed["ref"]["version"] > 1,
+        str(followed.get("ref")),
+    )
+    clients[second].check(
+        "rename: the edit follows the rename to new.txt",
+        file_at(lead, rename_repo, followed_tip, "old.txt") is None
+        and file_at(lead, rename_repo, followed_tip, "new.txt") == CONTENT_B.decode(),
+        f"tip {followed_tip}",
+    )
+
     total = sum(client.checks for client in clients.values())
     print(f"OK  {total} checks passed across 3 agents and {len(created)} repositories")
-    print("INFO  repositories created (no deletion endpoint yet): " + ", ".join(created))
+    teardown()
     return 0
 
 
@@ -854,4 +951,5 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except PilotError as error:
         print(f"FAIL  {error}", file=sys.stderr)
+        teardown()
         raise SystemExit(1)

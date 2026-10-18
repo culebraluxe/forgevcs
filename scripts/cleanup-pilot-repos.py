@@ -16,7 +16,7 @@ import sys
 import urllib.error
 import urllib.request
 
-DEFAULT_PREFIXES = ["agent-pilot-", "role-pilot-"]
+DEFAULT_PREFIXES = ["agent-pilot-", "role-pilot-", "forgevcs-w4-", "forgevcs-w5-"]
 
 
 class CleanupError(RuntimeError):
