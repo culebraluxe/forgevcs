@@ -121,12 +121,47 @@ same arguments → choose bytes for each conflicting path → push the resolved 
 (`mode:"land"`) → done. The server never writes markers; `versions` are capped at 1 MiB, and a
 larger side is described by `size` for a `/file` read.
 
+## 2c. Paused conflicts — resolve/continue (R2, shipped)
+
+A refused land/merge/rebase is now **persisted** instead of being only a one-shot `409`. The
+façade stores a paused conflict (`forgevcs_paused_conflicts`, in-memory for a storage-less
+process) with the operation, target ref + version, the four orientation changesets
+(`head`/`base`/`ours`/`theirs`), the conflict report and the readable three-way sides captured
+under the caller's read policy. The initial conflict response keeps its upstream `details` and
+adds a top-level `conflict` record (`id`, `operation`, `status`, `ref`, `resolve_parent`, `sides`).
+
+```text
+land / push(mode=land) / merge-land / merge / rebase
+   └─ 409 + conflict{id, status: open}
+        │
+        ├─ GET  /repos/{repo}/conflicts?scope=paused&status=…   list paused conflicts
+        ├─ GET  /repos/{repo}/conflicts/{id}                    show one (persisted sides)
+        ├─ POST /repos/{repo}/conflicts/{id}/resolve            {changeset} — must be a single-parent
+        │                                                        child of `resolve_parent`
+        └─ POST /repos/{repo}/conflicts/{id}/continue           land the resolved changeset
+```
+
+- `resolve` only accepts an `open` conflict and validates the resolved changeset's parent; a
+  second resolve, a wrong parent or a missing changeset is refused.
+- `continue` only accepts a `resolved` conflict, checks the ref is still at the version observed
+  at pause (stale → `409 conflict` with `stale:true` and the current target/version), then lands
+  through the ordinary `Land` handler so write-path and ref-CAS checks still apply.
+- Operations without a target ref (`merge`, `rebase`) can be resolved and are continued with an
+  explicit `ref` (the CLI's `conflicts continue --ref`).
+- Only the principal that hit the conflict, or a repository administrator, may resolve/continue
+  it: the stored sides were read under the creator's read policy.
+
+CLI: `forgevcs conflicts list|show|resolve|continue`. Tests: paused-store state machine
+(open→resolved→continued, compare-and-set, unknown ids, stale/parent decisions) plus the CLI
+route tests; the live end-to-end (conflict → resolve → continue → linear ref) runs in the local
+Postgres+moto harness (QA evidence, not in the hermetic gate).
+
 ## 3. What is missing, in dependency order
 
 | # | Gap | Today | Impact at 10 agents × 8 h | Where it lives |
 | --- | --- | --- | --- | --- |
 | 1 | No two-parent landing | `merge-land` squashes the merge result into one linear commit | **conditional**: only if merge-commit topology is wanted; trunk-linear landing never needs it | upstream `land.rs` / façade policy |
-| 2 | Resolution workflow | conflict-context endpoint shipped this commit; the recipe is in §2b | none for the simple model; an agent still chooses the bytes | façade + client contract |
+| 2 | Resolution workflow | **shipped (R2)**: `conflict-context` (§2b) plus persisted paused conflicts with `resolve`/`continue` (§2c) | none for the simple model; an agent still chooses the bytes | façade + client contract |
 | 3 | Criss-cross histories | `AMBIGUOUS_MERGE_BASE` (SPEC line 1479, future row line 1757) | **conditional**: only if merges exist (lane-to-lane or imported Git); trunk-linear history cannot criss-cross | merge engine version bump |
 | 4 | No rename/copy detection | renames are delete + add; merge treats them as such (SPEC line 1756, future row) | **bites the simple model**: a rename in one lane plus an edit in another is a false `modify_delete` conflict during land's rebase | derived type + merge engine version bump |
 | 5 | Merge-aware policy | merge needs `write` on every delta path; conflict payload is filtered by `read` (write.rs:69) | a path an agent may write but not read produces a filtered/hidden conflict — the agent cannot see what it must decide | policy model |

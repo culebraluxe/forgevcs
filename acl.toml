@@ -2,52 +2,82 @@
 #
 # Deny by default: without a rule naming a principal, nothing can be read or written.
 #
-# TWO ROLES. The M0 contract was "all machine principals are agents"; that is no longer the
-# model. Maestro is the orchestrator and holds the single DevOps seat; the OpenCode worker is a
-# worker. Workers check in to their own refs, check out, read, diff and merge-base. Only the
-# DevOps seat may create/delete repositories (`admin.repos`), provision/delete refs
-# (`admin.refs`), or advance the trunk ref (`admin.trunk`) — enforced twice: the façade gates
-# the request and the ref rule below denies the gRPC UpdateRef path too, so a rogue worker
-# cannot reach the trunk by bypassing the façade.
+# THREE THINGS THIS FILE DECIDES
+#   1. what each principal may read/write by PATH (this file, path prefixes);
+#   2. what each principal may update by REF and which admin seat it holds (this file);
+#   3. which principal owns/reads/writes a REPOSITORY (NOT this file: `forgevcs_repo_acl`,
+#      configured with FORGEVCS_REPO_ACLS or claimed by the first successful `init`).
+# Repository identity is a second, mandatory layer (FVCS-01); `admin.repos` bypasses the
+# repository layer for administration but never the path/ref rules below.
+#
+# ROLES (NARROWED 2026-10-19, R3)
+#   devops     the single DevOps seat: root path write, repo lifecycle, ref provisioning,
+#              trunk advance. Service principal `service:maestro` and the human operator
+#              `github:culebraluxe` (docs/WORK-ORDER-HUMAN-CLI.md).
+#   agents     external workers. They may read the repository, and WRITE ONLY UNDER `lane/`
+#              (`lane/a/**`, `lane/b/**`, …) plus update lane refs. They no longer have write
+#              on `/`: `src/**`, docs, manifests and the root are DevOps/human-only.
+#   workspace  `service:forgevcs-workspace` has no mintable secret; the engine mints it for the
+#              private Unix-socket gRPC client. It keeps root write because the façade checks the
+#              external caller's path policy first, then the working copy lands with this
+#              principal; without root write, workspace submit is 403 for everyone.
+#
+# PER-AGENT LANE SCOPES. This checked-in policy grants every worker the whole `lane/` namespace:
+# the shipping deployment has one worker (`service:opencode`). A pilot that needs *per-agent*
+# lanes (agent-a writes `lane/a` only, agent-b writes `lane/b` only) loads
+# `scripts/pilot/acl-lanes.toml` via FORGEVCS_POLICY_PATH; `scripts/lane-scope-acceptance.sh`
+# proves that variant live (lane/a allowed, lane/b refused, cross-repo refused, human CLI works).
+# To narrow this file for a real multi-worker deployment, add one `[[paths]]` block per lane
+# (`prefix = "/lane/a"`, `write = ["group:agent-a"]`) and the matching `[refs]` entries.
 #
 # The principals themselves are configured in FORGEVCS_SERVICE_PRINCIPALS
 # (`name=<sha256 of secret>`), so rotating a secret does not touch this file.
-#
-# `service:forgevcs-workspace` has no secret: the engine mints its token internally for the
-# private Unix-socket gRPC client that scion-wc uses. It is privileged because the façade checks
-# the external caller's policy before asking the working copy to read or write a path.
 
 version = 1
 
 [groups]
-# `github:culebraluxe` is the human operator's first-class identity (docs/WORK-ORDER-HUMAN-CLI.md).
-# A human configured in FORGEVCS_HUMAN_PRINCIPALS mints a token through POST /auth/human-token and
-# is then authenticated as the same `github:<login>` principal the browser login issues; it is an
-# ordinary policy member, granted the worker paths and the single DevOps seat because this human
-# runs the repository lifecycle for ForgeVCS.
-agents = ["service:maestro", "service:opencode", "service:forgevcs-workspace", "github:culebraluxe"]
+# Everyone who may read repository paths. Keep the internal workspace principal here so the
+# working copy can materialize a tree for an authorized external caller.
+readers = ["service:maestro", "service:opencode", "service:forgevcs-workspace", "github:culebraluxe"]
+# External workers: lane-write only. Add a worker here only if it may push somewhere under lane/.
+agents = ["service:opencode"]
+# The single DevOps seat. Maestro is the orchestrator; the human operator has the same grants.
 devops = ["service:maestro", "github:culebraluxe"]
+provisioner = ["service:maestro", "github:culebraluxe"]
 
-# The `/` rule is required by the parser and is the fallback for every path.
+# The `/` rule is required by the parser and is the fallback for every path. Write on `/` is
+# no longer granted to `group:agents` (R3): workers reach writes only through the lane rule below.
+# An agent pushing an EMPTY delta still hits this coarse gate and is refused (fail safe, FVCS-02).
 [[paths]]
 prefix = "/"
-read = ["group:agents"]
+read = ["group:readers"]
+write = ["group:devops", "service:forgevcs-workspace"]
+
+# The workers' write scope: everything under `lane/`, nothing outside it. Per-agent lane scopes
+# replace this single rule in a multi-worker pilot (see header + scripts/pilot/acl-lanes.toml).
+[[paths]]
+prefix = "/lane"
+read = ["group:readers"]
 write = ["group:agents"]
 
 # `main` is an exact rule, not a pattern: upstream bootstraps the root changeset on the ref
-# literally named `main` (`RefName::main()`), and `"refs/heads/*"` does not match it.
+# literally named `main` (`RefName::main()`).
 #
-# Trunk advance is the DevOps seat. Workers may still advance ordinary branches/lane refs;
-# `admin.trunk` and this rule are both checked, so the deny does not depend on which surface
-# the caller used.
+# Trunk advance is the DevOps seat. Workers may still advance ordinary lane refs; `admin.trunk`
+# and this rule are both checked, so the deny does not depend on which surface the caller used.
 [refs]
 # The internal workspace principal also updates `main`: the façade checks the external
 # caller's `admin.trunk` before submitting, then the working copy lands with its own
 # (unmintable) principal. Without it, workspace submit is 403 for everyone.
 "main" = { update = ["group:devops", "service:forgevcs-workspace"] }
+# Lane refs are the workers' writable history (`lane/a`, `lane/b`, `lane/a/feature`, …).
+"lane/*" = { update = ["group:agents"] }
+# Kept for compatibility with refs named in the git-style namespace.
 "refs/heads/*" = { update = ["group:agents"] }
 
 [admin]
+# Ref/repository provisioning stays with the DevOps seat: narrowing paths must not take
+# `admin.refs` away from service principals that provision lane refs.
 refs = ["group:devops"]
 repos = ["group:devops"]
 trunk = ["group:devops"]
@@ -67,15 +97,11 @@ trunk = ["group:devops"]
 #
 #   {"pilot-a":{"owner":"service:agent-a","writers":["service:agent-a"]}}
 #
-# `admin.repos` (the DevOps seat, below) bypasses repository identity for administration but does
+# `admin.repos` (the DevOps seat, above) bypasses repository identity for administration but does
 # NOT bypass the path/ref rules in this file. An ownerless repository is denied to agents.
 #
 # Path-prefix pushes (FVCS-02): `POST /repos/{repo}/push` authorizes each changeset delta path
 # instead of requiring write on `/`, so a principal whose write grant is `lane/a/**` can push
 # exactly those paths. Repository and ref provisioning still require the coarse root/ref gates.
-# IMPORTANT: this file still grants `write` on `/` to `group:agents` (the pre-FVCS-02 default), so
-# every agent keeps write everywhere until an operator narrows this rule to the lane prefixes an
-# agent may push (e.g. replace `write = ["group:agents"]` on `/` with per-lane `[[paths]]` rules).
-# Until then the push gate is path-fine but the policy still grants every path.
 #
 # See docs/M1-repo-acl-and-path-scopes.md.

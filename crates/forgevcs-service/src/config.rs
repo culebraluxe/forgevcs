@@ -7,6 +7,7 @@
 
 use std::env;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use scion_store_s3::S3Config;
 
@@ -76,6 +77,10 @@ pub struct Config {
     /// `POST /auth/human-token` and is then the same `github:<login>` principal the browser
     /// login issues; the secret itself is never stored here.
     pub human_principals: Option<String>,
+    /// Per-workspace write-lease lifetime (`FORGEVCS_WORKSPACE_LEASE_TTL_SECS`; 300 s by
+    /// default). A lease that is not heartbeated within this window is stale and may be taken
+    /// over by another writer.
+    pub workspace_lease_ttl_secs: Option<u64>,
 }
 
 impl Config {
@@ -110,6 +115,8 @@ impl Config {
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
             repo_acls: get(&["FORGEVCS_REPO_ACLS"]),
             human_principals: get(&["FORGEVCS_HUMAN_PRINCIPALS"]),
+            workspace_lease_ttl_secs: get(&["FORGEVCS_WORKSPACE_LEASE_TTL_SECS"])
+                .and_then(|raw| raw.parse::<u64>().ok()),
         }
     }
 
@@ -121,6 +128,14 @@ impl Config {
     /// Metadata pool size.
     pub fn max_connections(&self) -> usize {
         usize::from(self.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS))
+    }
+
+    /// Per-workspace write-lease lifetime (`FORGEVCS_WORKSPACE_LEASE_TTL_SECS`, default 5 min).
+    pub fn workspace_lease_ttl(&self) -> Duration {
+        Duration::from_secs(
+            self.workspace_lease_ttl_secs
+                .unwrap_or(crate::lease::DEFAULT_TTL_SECS),
+        )
     }
 
     /// The `acl.toml` to load.
@@ -160,6 +175,9 @@ impl Config {
         if let Some(raw) = &self.human_principals {
             crate::human::parse_configured(raw)
                 .map_err(|error| format!("FORGEVCS_HUMAN_PRINCIPALS is invalid: {error}"))?;
+        }
+        if self.workspace_lease_ttl_secs == Some(0) {
+            return Err("FORGEVCS_WORKSPACE_LEASE_TTL_SECS must be at least 1 second".to_owned());
         }
         if let Some(mode) = &self.auth_mode
             && !matches!(
@@ -393,5 +411,26 @@ mod tests {
 
         let cfg = config(&[("AWS_ACCESS_KEY_ID", "ak"), ("AWS_SECRET_ACCESS_KEY", "sk")]);
         assert_eq!(cfg.validate(), Ok(()));
+    }
+
+    /// R4: the lease lifetime defaults to five minutes and is overridable, but a zero TTL would
+    /// make every lease instantly stale, so it is refused at startup.
+    #[test]
+    fn workspace_lease_ttl_defaults_to_five_minutes_and_is_validated() {
+        let cfg = config(&[]);
+        assert_eq!(cfg.workspace_lease_ttl(), Duration::from_secs(300));
+        assert_eq!(cfg.validate(), Ok(()));
+
+        let cfg = config(&[("FORGEVCS_WORKSPACE_LEASE_TTL_SECS", "60")]);
+        assert_eq!(cfg.workspace_lease_ttl(), Duration::from_secs(60));
+        assert_eq!(cfg.validate(), Ok(()));
+
+        let cfg = config(&[("FORGEVCS_WORKSPACE_LEASE_TTL_SECS", "0")]);
+        assert!(
+            cfg.validate()
+                .err()
+                .is_some_and(|error| error.contains("FORGEVCS_WORKSPACE_LEASE_TTL_SECS")),
+            "a zero lease TTL must be refused, not accepted as instantly stale"
+        );
     }
 }

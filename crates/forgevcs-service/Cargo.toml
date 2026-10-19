@@ -41,7 +41,7 @@ tokio-stream = { workspace = true }
 tempfile = { workspace = true }
 uuid = { workspace = true }
 deadpool-postgres = { workspace = true }
-tokio-postgres = { workspace = true, features = ["with-serde_json-1"] }
+tokio-postgres = { workspace = true, features = ["with-serde_json-1", "with-uuid-1"] }
 tokio-postgres-rustls = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }

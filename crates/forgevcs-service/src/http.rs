@@ -28,6 +28,7 @@ use crate::config::{self, Config};
 use crate::engine::{Engine, Engines};
 use crate::facade;
 use crate::human::HumanPrincipals;
+use crate::paused_conflicts::PausedConflicts;
 
 /// Service name reported by every probe and façade response.
 pub const SERVICE: &str = "forgevcs";
@@ -49,6 +50,8 @@ pub struct AppState {
     pub db: Option<Pool>,
     /// Configured human principals for the browserless token path (`FORGEVCS_HUMAN_PRINCIPALS`).
     pub humans: Arc<HumanPrincipals>,
+    /// Paused conflict state: a `409` conflict persisted so it can be resolved and continued.
+    pub paused: Arc<PausedConflicts>,
 }
 
 impl AppState {
@@ -182,7 +185,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         )
         .route(
             "/repos/{repo}/conflicts/{id}",
-            delete(facade::delete_conflict),
+            get(facade::show_conflict).delete(facade::delete_conflict),
         )
         .route("/repos", get(facade::list_repos))
         .route("/admin/gc/objects", post(facade::gc_objects))
@@ -196,6 +199,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route(
             "/repos/{repo}/conflicts/{id}/resolve",
             post(facade::resolve_conflict),
+        )
+        .route(
+            "/repos/{repo}/conflicts/{id}/continue",
+            post(facade::continue_conflict),
         )
         .route(
             "/repos/{repo}/conflict-context",
@@ -425,6 +432,7 @@ mod tests {
                 .as_deref()
                 .and_then(|url| crate::db::build_pool(url).ok()),
             humans: Arc::new(HumanPrincipals::from_config(&config)),
+            paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
         }))
     }
@@ -539,6 +547,7 @@ mod tests {
                 .as_deref()
                 .and_then(|url| crate::db::build_pool(url).ok()),
             humans: Arc::new(HumanPrincipals::default()),
+            paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
         }));
         let (status, _, body) = send(

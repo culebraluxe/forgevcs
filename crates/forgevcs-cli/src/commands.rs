@@ -33,6 +33,46 @@ pub async fn execute(global: GlobalOptions, command: Command) -> Result<Value> {
         } => auth_mint(&settings, &login, secret_file.as_deref(), show_token).await,
         Command::AuthLogout => auth_logout(&settings),
         Command::Health => health(&settings).await,
+        Command::ConflictsList { repo, status } => {
+            let client = authenticated(&settings)?;
+            client
+                .get(
+                    &format!("/repos/{repo}/conflicts"),
+                    &[
+                        ("scope".to_owned(), "paused".to_owned()),
+                        ("status".to_owned(), status),
+                    ],
+                )
+                .await
+        }
+        Command::ConflictsShow { repo, id } => {
+            let client = authenticated(&settings)?;
+            client
+                .get(&format!("/repos/{repo}/conflicts/{id}"), &[])
+                .await
+        }
+        Command::ConflictsResolve {
+            repo,
+            id,
+            changeset,
+        } => {
+            let client = authenticated(&settings)?;
+            client
+                .post(
+                    &format!("/repos/{repo}/conflicts/{id}/resolve"),
+                    &json!({ "changeset": changeset }),
+                )
+                .await
+        }
+        Command::ConflictsContinue { repo, id, ref_name } => {
+            let client = authenticated(&settings)?;
+            client
+                .post(
+                    &format!("/repos/{repo}/conflicts/{id}/continue"),
+                    &json!({ "ref": ref_name }),
+                )
+                .await
+        }
         Command::Init { repo } => {
             let client = authenticated(&settings)?;
             client

@@ -44,12 +44,34 @@ pub(crate) enum ApiError {
     Internal(String),
     /// A failure mapped from an upstream `tonic::Status`. The HTTP status and envelope `code`
     /// are already mapped; `details` is the decoded `scion.v1.ErrorDetail` payload, when any.
+    /// `extra` carries additive top-level fields (e.g. the paused `conflict` record) without
+    /// changing the error envelope's existing shape.
     Upstream {
         status: StatusCode,
         code: &'static str,
         message: String,
         details: Option<Box<Value>>,
+        extra: Option<Box<Value>>,
     },
+    /// 409 — another live owner holds the workspace write lease (R4). Carries the current owner,
+    /// fencing token and expiry so the caller can back off or surface the conflict instead of
+    /// retrying blindly.
+    WorkspaceLeaseConflict(Box<LeaseConflictDetails>),
+}
+
+/// The current holder reported by a workspace write-lease conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseConflictDetails {
+    /// Workspace that is leased.
+    pub workspace_id: String,
+    /// Repository the workspace belongs to.
+    pub repo: String,
+    /// Principal that holds the lease.
+    pub owner: String,
+    /// Fencing token of the current lease.
+    pub lease_id: String,
+    /// Unix seconds when the current lease expires (a stale lease may be taken over after this).
+    pub expires_at_unix: i64,
 }
 
 impl ApiError {
@@ -81,37 +103,117 @@ impl ApiError {
     pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
-}
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, code, message, details) = match self {
-            Self::InvalidArgument(message) => {
-                (StatusCode::BAD_REQUEST, "invalid_argument", message, None)
-            }
-            Self::Unauthenticated(message) => {
-                (StatusCode::UNAUTHORIZED, "unauthenticated", message, None)
-            }
-            Self::PermissionDenied(message) => {
-                (StatusCode::FORBIDDEN, "permission_denied", message, None)
-            }
-            Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message, None),
-            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message, None),
-            Self::Unavailable(message) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                message,
-                None,
-            ),
-            Self::Internal(message) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal", message, None)
-            }
+    /// Decode the `Aborted` status the workspace layer returns for a held lease into the typed
+    /// 409. Returns `None` for any status that is not a lease conflict (e.g. an upstream abort).
+    pub(crate) fn lease_conflict_from_status(status: &tonic::Status) -> Option<Self> {
+        if status.code() != tonic::Code::Aborted {
+            return None;
+        }
+        let owner = metadata_string(status, crate::lease::METADATA_OWNER)?;
+        Some(Self::WorkspaceLeaseConflict(Box::new(
+            LeaseConflictDetails {
+                workspace_id: metadata_string(status, crate::lease::METADATA_WORKSPACE_ID)
+                    .unwrap_or_default(),
+                repo: metadata_string(status, crate::lease::METADATA_REPO).unwrap_or_default(),
+                owner,
+                lease_id: metadata_string(status, crate::lease::METADATA_LEASE_ID)
+                    .unwrap_or_default(),
+                expires_at_unix: metadata_string(status, crate::lease::METADATA_EXPIRES_AT)
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default(),
+            },
+        )))
+    }
+
+    /// Attach additive top-level fields to an upstream error envelope (e.g. `conflict`).
+    pub(crate) fn with_extra(self, extra: Value) -> Self {
+        match self {
             Self::Upstream {
                 status,
                 code,
                 message,
                 details,
-            } => (status, code, message, details),
+                ..
+            } => Self::Upstream {
+                status,
+                code,
+                message,
+                details,
+                extra: Some(Box::new(extra)),
+            },
+            other => other,
+        }
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message, details, extra) = match self {
+            Self::InvalidArgument(message) => (
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                message,
+                None,
+                None,
+            ),
+            Self::Unauthenticated(message) => (
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
+                message,
+                None,
+                None,
+            ),
+            Self::PermissionDenied(message) => (
+                StatusCode::FORBIDDEN,
+                "permission_denied",
+                message,
+                None,
+                None,
+            ),
+            Self::NotFound(message) => (StatusCode::NOT_FOUND, "not_found", message, None, None),
+            Self::Conflict(message) => (StatusCode::CONFLICT, "conflict", message, None, None),
+            Self::Unavailable(message) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "unavailable",
+                message,
+                None,
+                None,
+            ),
+            Self::Internal(message) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                message,
+                None,
+                None,
+            ),
+            Self::Upstream {
+                status,
+                code,
+                message,
+                details,
+                extra,
+            } => (status, code, message, details, extra),
+            Self::WorkspaceLeaseConflict(boxed) => {
+                let details = *boxed;
+                (
+                    StatusCode::CONFLICT,
+                    "workspace_lease_conflict",
+                    format!(
+                        "workspace {} is leased by {} until unix {}",
+                        details.workspace_id, details.owner, details.expires_at_unix
+                    ),
+                    Some(Box::new(json!({
+                        "kind": "workspace_lease",
+                        "workspace_id": details.workspace_id,
+                        "repo": details.repo,
+                        "owner": details.owner,
+                        "lease_id": details.lease_id,
+                        "expires_at_unix": details.expires_at_unix,
+                    }))),
+                    None,
+                )
+            }
         };
         let mut body = json!({
             "service": SERVICE,
@@ -123,6 +225,13 @@ impl IntoResponse for ApiError {
             && let Some(object) = body.as_object_mut()
         {
             object.insert("details".to_owned(), *details);
+        }
+        if let Some(extra) = extra
+            && let (Some(object), Some(fields)) = (body.as_object_mut(), extra.as_object())
+        {
+            for (key, value) in fields {
+                object.insert(key.clone(), value.clone());
+            }
         }
         (status, Json(body)).into_response()
     }
@@ -150,6 +259,7 @@ impl From<tonic::Status> for ApiError {
             code: slug,
             message: status.message().to_owned(),
             details: error_payload_json(&error.payload).map(Box::new),
+            extra: None,
         }
     }
 }
@@ -188,7 +298,10 @@ fn entry_payload_json(entry: &EntryInfo) -> Value {
 }
 
 /// A `MERGE_CONFLICT` payload as JSON (SPEC 8.3): every conflict plus the clean entries.
-fn conflict_report_json(report: &scion_core::ConflictReport) -> Value {
+///
+/// Also used when a paused conflict is persisted, so `show` returns the same report shape the
+/// initial `409 details.report` carried.
+pub(crate) fn conflict_report_json(report: &scion_core::ConflictReport) -> Value {
     let conflicts: Vec<Value> = report
         .conflicts
         .iter()
@@ -218,6 +331,15 @@ fn conflict_report_json(report: &scion_core::ConflictReport) -> Value {
         })
         .collect();
     json!({ "conflicts": conflicts, "clean_entries": clean_entries })
+}
+
+/// One metadata value as UTF-8 text, when present and printable.
+fn metadata_string(status: &tonic::Status, key: &str) -> Option<String> {
+    status
+        .metadata()
+        .get(key)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned)
 }
 
 /// The `scion.v1.ErrorDetail` payload as JSON, when the status carries one.
@@ -383,5 +505,50 @@ mod tests {
         assert_eq!(http, StatusCode::CONFLICT);
         assert_eq!(body["code"], "conflict");
         assert_eq!(body["details"]["kind"], "merge_conflict");
+    }
+
+    /// R4: a workspace write-lease conflict is its own typed 409. The body names the current
+    /// owner, fencing token and expiry, so the losing writer can back off instead of retrying.
+    #[tokio::test]
+    async fn a_workspace_lease_conflict_is_a_typed_409_with_the_current_owner() {
+        let workspace = "00000000-0000-0000-0000-0000000000aa";
+        let lease = "00000000-0000-0000-0000-0000000000bb";
+        let mut status = tonic::Status::aborted("workspace is leased");
+        {
+            let metadata = status.metadata_mut();
+            for (key, value) in [
+                (crate::lease::METADATA_OWNER, "service:agent-a"),
+                (crate::lease::METADATA_WORKSPACE_ID, workspace),
+                (crate::lease::METADATA_REPO, "pilot"),
+                (crate::lease::METADATA_LEASE_ID, lease),
+                (crate::lease::METADATA_EXPIRES_AT, "1700000300"),
+            ] {
+                metadata.insert(
+                    key,
+                    tonic::metadata::MetadataValue::try_from(value).expect("metadata value"),
+                );
+            }
+        }
+        let error = ApiError::lease_conflict_from_status(&status).expect("typed lease conflict");
+        let (http, body) = body_of(error).await;
+        assert_eq!(http, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "workspace_lease_conflict");
+        assert_eq!(body["details"]["kind"], "workspace_lease");
+        assert_eq!(body["details"]["owner"], "service:agent-a");
+        assert_eq!(body["details"]["workspace_id"], workspace);
+        assert_eq!(body["details"]["repo"], "pilot");
+        assert_eq!(body["details"]["lease_id"], lease);
+        assert_eq!(body["details"]["expires_at_unix"], 1_700_000_300);
+    }
+
+    #[test]
+    fn a_non_lease_abort_is_not_misread_as_a_lease_conflict() {
+        assert!(
+            ApiError::lease_conflict_from_status(&tonic::Status::aborted("plain abort")).is_none()
+        );
+        assert!(
+            ApiError::lease_conflict_from_status(&tonic::Status::failed_precondition("merge"))
+                .is_none()
+        );
     }
 }

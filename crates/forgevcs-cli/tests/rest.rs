@@ -422,6 +422,40 @@ async fn every_command_hits_its_façade_route() {
             "DELETE",
             "/repos/repo/workspaces/ws-1",
         ),
+        (
+            vec!["conflicts", "list", "repo", "--status", "open"],
+            "GET",
+            "/repos/repo/conflicts?scope=paused&status=open",
+        ),
+        (
+            vec!["conflicts", "show", "repo", "conflict-id"],
+            "GET",
+            "/repos/repo/conflicts/conflict-id",
+        ),
+        (
+            vec![
+                "conflicts",
+                "resolve",
+                "repo",
+                "conflict-id",
+                "--changeset",
+                "c1resolved",
+            ],
+            "POST",
+            "/repos/repo/conflicts/conflict-id/resolve",
+        ),
+        (
+            vec![
+                "conflicts",
+                "continue",
+                "repo",
+                "conflict-id",
+                "--ref",
+                "main",
+            ],
+            "POST",
+            "/repos/repo/conflicts/conflict-id/continue",
+        ),
     ];
     for (command, method, path) in commands {
         let before = mock.captured.lock().expect("captured").len();

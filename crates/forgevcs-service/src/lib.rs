@@ -17,5 +17,7 @@ pub mod facade;
 pub mod gc;
 pub mod http;
 pub mod human;
+pub mod lease;
+pub mod paused_conflicts;
 pub mod repo_acl;
 pub mod workspace;

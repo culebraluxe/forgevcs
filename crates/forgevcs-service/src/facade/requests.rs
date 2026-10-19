@@ -400,18 +400,35 @@ pub(crate) struct EscalateBody {
     pub(crate) report: Option<Value>,
 }
 
-/// `GET /repos/{repo}/conflicts?status=…`
+/// `GET /repos/{repo}/conflicts?scope=paused&status=…`
 #[derive(Debug, Deserialize)]
 pub(crate) struct ConflictQueueQuery {
     #[serde(default)]
     pub(crate) status: Option<String>,
+    /// `paused` selects the resolve/continue workflow; absent lists the escalation queue.
+    #[serde(default)]
+    pub(crate) scope: Option<String>,
 }
 
-/// `POST /repos/{repo}/conflicts/{id}/resolve`
+/// `POST /repos/{repo}/conflicts/{id}/resolve`.
+///
+/// The same route serves two resources: a paused conflict resolves with `changeset` (the
+/// changeset that contains the resolution), while an escalation resolves with a `resolution`
+/// note. A paused conflict id wins; escalation bodies never carry `changeset`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResolveEscalationBody {
     #[serde(default)]
     pub(crate) resolution: Option<String>,
+    #[serde(default)]
+    pub(crate) changeset: Option<String>,
+}
+
+/// `POST /repos/{repo}/conflicts/{id}/continue` — land a resolved paused conflict.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ContinueConflictBody {
+    /// Required only when the paused operation had no target ref (merge/rebase).
+    #[serde(rename = "ref", default)]
+    pub(crate) ref_name: Option<String>,
 }
 
 /// `DELETE /repos/{repo}` — the body must repeat the repository name.

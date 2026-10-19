@@ -42,6 +42,22 @@ pub enum Command {
     },
     /// `auth logout` — remove the locally stored token and session.
     AuthLogout,
+    /// `conflicts list <repo> [--status …]` — list paused conflicts.
+    ConflictsList { repo: String, status: String },
+    /// `conflicts show <repo> <id>` — one paused conflict with its persisted sides.
+    ConflictsShow { repo: String, id: String },
+    /// `conflicts resolve <repo> <id> --changeset <id>` — resolve with a changeset.
+    ConflictsResolve {
+        repo: String,
+        id: String,
+        changeset: String,
+    },
+    /// `conflicts continue <repo> <id> [--ref <ref>]` — land the resolved changeset.
+    ConflictsContinue {
+        repo: String,
+        id: String,
+        ref_name: Option<String>,
+    },
     /// `health` — probe `/health`, `/ready` and `/version`.
     Health,
     /// `init <repo>` — create/initialize a repository.
@@ -146,6 +162,23 @@ COMMANDS:
     health
         Probe /health, /ready and /version.
 
+    conflicts list <repo> [--status open|resolved|continued|all]
+        List paused conflicts: a land/merge/rebase that returned 409 `conflict` is persisted with
+        its operation, ref, changesets, report and readable base/ours/theirs sides.
+
+    conflicts show <repo> <id>
+        One paused conflict, including the persisted sides (no re-derivation needed).
+
+    conflicts resolve <repo> <id> --changeset <changeset-id>
+        Mark an OPEN conflict resolved. The changeset must be a single-parent child of the paused
+        continuation (shown as `resolve_parent`); it is the changeset that contains your resolution
+        (create it with `push --mode none`).
+
+    conflicts continue <repo> <id> [--ref <ref>]
+        Land the resolved changeset. Refuses when the conflict is not resolved yet, or when the ref
+        moved since the pause (stale: re-open by replaying the operation). `--ref` is required only
+        for operations with no target ref (`merge`, `rebase`).
+
     init <repo>
         POST /repos/{repo}/init — create or bind a repository.
 
@@ -231,6 +264,7 @@ fn parse_command(command: &str, rest: &[String]) -> Result<Command> {
             opts.no_positional("health")?;
             Ok(Command::Health)
         }
+        "conflicts" => parse_conflicts(rest),
         "init" => {
             let opts = Options::parse(rest, &[], &[])?;
             Ok(Command::Init {
@@ -387,6 +421,54 @@ fn parse_auth(rest: &[String]) -> Result<Command> {
             Ok(Command::AuthLogout)
         }
         other => bail!("unknown auth subcommand {other:?} (expected status, mint, logout)"),
+    }
+}
+
+fn parse_conflicts(rest: &[String]) -> Result<Command> {
+    let Some(sub) = rest.first() else {
+        bail!("conflicts needs a subcommand: list, show, resolve, continue");
+    };
+    match sub.as_str() {
+        "list" => {
+            let opts = Options::parse(&rest[1..], &["--status"], &[])?;
+            let repo = opts.one_positional("conflicts list <repo>")?;
+            let status = opts.value("--status").unwrap_or_else(|| "open".to_owned());
+            if !matches!(status.as_str(), "open" | "resolved" | "continued" | "all") {
+                bail!("--status must be one of open, resolved, continued, all (got {status:?})");
+            }
+            Ok(Command::ConflictsList { repo, status })
+        }
+        "show" => {
+            let opts = Options::parse(&rest[1..], &[], &[])?;
+            let (repo, id) = opts.two_positional("conflicts show <repo> <id>")?;
+            Ok(Command::ConflictsShow { repo, id })
+        }
+        "resolve" => {
+            let opts = Options::parse(&rest[1..], &["--changeset"], &[])?;
+            let (repo, id) =
+                opts.two_positional("conflicts resolve <repo> <id> --changeset <id>")?;
+            Ok(Command::ConflictsResolve {
+                repo,
+                id,
+                changeset: required(
+                    &opts,
+                    "--changeset",
+                    "conflicts resolve needs --changeset <changeset-id>",
+                )?,
+            })
+        }
+        "continue" => {
+            let opts = Options::parse(&rest[1..], &["--ref"], &[])?;
+            let (repo, id) = opts.two_positional("conflicts continue <repo> <id> [--ref <ref>]")?;
+            Ok(Command::ConflictsContinue {
+                repo,
+                id,
+                ref_name: opts.value("--ref"),
+            })
+        }
+        other => {
+            bail!("unknown conflicts subcommand {other:?} (expected list, show, resolve, continue)")
+        }
     }
 }
 
@@ -564,6 +646,22 @@ mod tests {
     #[test]
     fn every_command_parses() {
         assert!(matches!(command(&["health"]), Command::Health));
+        assert!(matches!(
+            command(&["conflicts", "list", "repo", "--status", "open"]),
+            Command::ConflictsList { repo, status } if repo == "repo" && status == "open"
+        ));
+        assert!(matches!(
+            command(&["conflicts", "show", "repo", "id"]),
+            Command::ConflictsShow { .. }
+        ));
+        assert!(matches!(
+            command(&["conflicts", "resolve", "repo", "id", "--changeset", "c1"]),
+            Command::ConflictsResolve { changeset, .. } if changeset == "c1"
+        ));
+        assert!(matches!(
+            command(&["conflicts", "continue", "repo", "id", "--ref", "main"]),
+            Command::ConflictsContinue { ref_name: Some(ref_name), .. } if ref_name == "main"
+        ));
         assert!(matches!(command(&["auth", "status"]), Command::AuthStatus));
         assert!(matches!(
             command(&["auth", "mint", "--login", "culebraluxe"]),

@@ -1,0 +1,54 @@
+# ForgeVCS lane-scope pilot policy (LOCAL acceptance only).
+#
+# Loaded by `scripts/lane-scope-acceptance.sh` through FORGEVCS_POLICY_PATH. It is NOT the policy
+# the service ships with (that is `acl.toml`, which grants workers the whole `lane/` namespace);
+# this file is the strict, per-agent variant that proves R3 live:
+#
+#   agent-a   read everything, write `lane/a/**` only, update `lane/a` only
+#   agent-b   read everything, write `lane/b/**` only, update `lane/b` only
+#   devops    root path write, `admin.refs`/`admin.repos`/`admin.trunk` provisioning
+#   human     `github:culebraluxe` has the devops grants (so the human CLI keeps working)
+#   workspace `service:forgevcs-workspace` keeps root write for workspace submit
+#
+# The acceptance proves: agent-a push under lane/a succeeds; agent-a push under lane/b is 403;
+# agent-a reads/writes another repository (repo ACL) is 403; the human CLI can mint, read, push
+# under root and use a workspace; devops can still provision lane refs (`admin.refs`).
+
+version = 1
+
+[groups]
+readers = [
+    "service:agent-a",
+    "service:agent-b",
+    "service:devops",
+    "service:forgevcs-workspace",
+    "github:culebraluxe",
+]
+agent-a = ["service:agent-a"]
+agent-b = ["service:agent-b"]
+devops = ["service:devops", "github:culebraluxe"]
+
+[[paths]]
+prefix = "/"
+read = ["group:readers"]
+write = ["group:devops", "service:forgevcs-workspace"]
+
+[[paths]]
+prefix = "/lane/a"
+read = ["group:readers"]
+write = ["group:agent-a"]
+
+[[paths]]
+prefix = "/lane/b"
+read = ["group:readers"]
+write = ["group:agent-b"]
+
+[refs]
+"main" = { update = ["group:devops", "service:forgevcs-workspace"] }
+"lane/a" = { update = ["group:agent-a"] }
+"lane/b" = { update = ["group:agent-b"] }
+
+[admin]
+refs = ["group:devops"]
+repos = ["group:devops"]
+trunk = ["group:devops"]

@@ -40,6 +40,11 @@ async fn main() -> anyhow::Result<()> {
     {
         tracing::warn!(%error, "conflict escalation queue schema unavailable");
     }
+    let paused =
+        Arc::new(forgevcs_service::paused_conflicts::PausedConflicts::from_pool(db.clone()));
+    if let Err(error) = paused.ensure_schema().await {
+        tracing::warn!(%error, "paused conflict schema unavailable");
+    }
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
     tracing::info!(
@@ -62,6 +67,7 @@ async fn main() -> anyhow::Result<()> {
         authz,
         db,
         humans,
+        paused,
     });
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown())

@@ -295,7 +295,22 @@ pub(crate) fn conflict_hunks_json(conflict: &scion_core::Conflict) -> Value {
     )
 }
 
+/// Render a workspace-layer failure, preferring the typed R4 lease conflict over the generic
+/// upstream mapping. Used by the workspace envelope and by handlers that build their own success
+/// body (`destroy`), so a lease conflict reads the same on every workspace endpoint.
+pub(crate) fn workspace_error(status: Status) -> Response {
+    match ApiError::lease_conflict_from_status(&status) {
+        Some(error) => error.into_response(),
+        None => ApiError::from(status).into_response(),
+    }
+}
+
 /// Render one WorkspaceService reply as the workspace endpoint's envelope.
+///
+/// A workspace write lease conflict (R4) arrives as an `Aborted` status carrying the current
+/// owner in metadata. It is rendered as the typed `workspace_lease_conflict` 409 rather than the
+/// generic upstream conflict, so a writer learns who holds the lease instead of guessing why the
+/// write failed.
 pub(crate) fn workspace_result(repo: String, result: Result<Value, Status>) -> Response {
     match result {
         Ok(value) => (
@@ -308,6 +323,6 @@ pub(crate) fn workspace_result(repo: String, result: Result<Value, Status>) -> R
             })),
         )
             .into_response(),
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => workspace_error(status),
     }
 }

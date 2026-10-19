@@ -1,9 +1,11 @@
 # M1 — repository-scoped ACL (FVCS-01) and path-prefix push scopes (FVCS-02)
 
-**Status:** implemented 2026-10-18 (WO FVCS-01 + FVCS-02, production packet P0-1/P0-2).
-**Scope:** `crates/forgevcs-service/src/{repo_acl.rs,authz.rs,facade.rs,config.rs}`, `acl.toml`
-(comments only), this doc. No vendored `upstream/` change; no migration file; no database change
-was executed to write this.
+**Status:** implemented 2026-10-18 (WO FVCS-01 + FVCS-02, production packet P0-1/P0-2); the
+checked-in policy was narrowed to lane prefixes 2026-10-19 (R3, below).
+**Scope:** `crates/forgevcs-service/src/{repo_acl.rs,authz.rs,facade.rs,config.rs}`, `acl.toml`,
+`scripts/pilot/acl-lanes.toml`, `scripts/lane-scope-acceptance.{sh,py}`, this doc. No vendored
+`upstream/` change; no migration file; no migration runner; no deploy; no production database
+change was executed to write this.
 
 ## The two gaps this closes
 
@@ -94,12 +96,22 @@ repository layer because the owner does not exist until after the engine boots;
 Result: an agent with `write = ["service:agent-a"]` on prefix `lane/a` (and no root write) can
 push `lane/a/**` and is refused `lane/b/**` or `src/**`; ref scopes still work.
 
-**Rollout note.** The checked-in `acl.toml` still grants `write` on `/` to `group:agents` — the
-pre-FVCS-02 default every agent depended on. The push gate is now path-fine, but the *policy* only
-restricts paths once an operator narrows that root grant to the lane prefixes an agent may write.
-That is a policy decision per deployment (path grants differ per lane), so this change documents
-the migration and tests the mechanism rather than silently taking write away from every agent and
-breaking a live pilot.
+**Rollout note (R3, 2026-10-19).** The checked-in `acl.toml` is now narrowed: write on `/` is the
+DevOps seat (`service:maestro`, `github:culebraluxe`) plus the internal
+`service:forgevcs-workspace` principal; workers (`group:agents`, currently `service:opencode`)
+write only under `lane/` and update `lane/*` refs. `admin.refs` / `admin.repos` / `admin.trunk`
+stay with the DevOps seat, so service-principal ref provisioning is unchanged. A per-agent pilot
+variant (`scripts/pilot/acl-lanes.toml`: agent-a → `lane/a`, agent-b → `lane/b`) is proved live by
+`scripts/lane-scope-acceptance.sh`, which boots ONE local service instance against the
+`.env.local` Neon branch and asserts: agent-a write under `lane/a/**` allowed; `lane/b/**` and
+`src/**` refused (403); agent-b `lane/b/**` allowed (the refusal is scoping, not a global deny);
+cross-repository read and write refused (403); `ref create` still works (`admin.refs` intact);
+and the human `forgevcs` CLI still mints a token, reads, writes a root path, pulls object bytes
+and uses a workspace. The policy change is a file the single instance loads at boot — no
+migration, no migration runner, no restart hook, no multi-instance rollout. To narrow a real
+multi-worker deployment, add one `[[paths]]` block per lane (`prefix = "/lane/<name>"`,
+`write = ["group:agent-<name>"]`) and the matching `[refs]` entry; `acl.toml` carries the recipe
+in its header.
 
 ## `acl.toml`
 
@@ -111,9 +123,35 @@ rules and now documents where repository identity is evaluated and how to pre-as
 ## Tests / acceptance evidence
 
 ```sh
-cargo test -q -p forgevcs-service --lib --bins
-upstream/scripts/check.sh
+cargo test -q -p forgevcs-service --lib --bins   # 90 lib tests, 0 failed (2026-10-19)
+cargo test -q -p forgevcs-cli                    # 44 tests, 0 failed (human CLI)
+upstream/scripts/check.sh                        # gate PASS, 1348 passed / 0 failed
+scripts/lane-scope-acceptance.sh                 # live R3 proof, LANE_SCOPE=PASS (18 checks)
+scripts/prune-auth-decisions.sh                  # R6 dry run (docs/AUTH-DECISION-RETENTION.md)
 ```
+
+The live R3 evidence (2026-10-19, single local instance on the `.env.local` Neon branch
+`forgevcs-ci`, policy `scripts/pilot/acl-lanes.toml`; the two uniquely-named repositories are
+created and deleted by the client, human decision rows remain as audit):
+
+```
+PASS  devops: created the two acceptance repositories
+PASS  devops: ref create still works (admin.refs intact)
+PASS  path scope: agent-a push under lane/a is allowed
+PASS  path scope: agent-a push under lane/b is refused (403, path policy)
+PASS  path scope: agent-a push under src/ is refused (403, path policy)
+PASS  path scope: agent-b push under lane/b is allowed
+PASS  repository scope: agent-a read of the other repository is refused (403, repo ACL)
+PASS  repository scope: agent-a write to the other repository is refused (403, repo ACL)
+PASS  human CLI: auth mint/status/refs/log/ref create/push under src//pull/workspace
+LANE_SCOPE=PASS
+```
+
+The checked-in `acl.toml` was also exercised live with the same harness shape: `maestro`/`opencode`
+principals, `opencode` write under `lane/a/**` and `lane/b/**` allowed (the shipping policy grants
+the whole `lane/` prefix), `opencode` write under `src/**` refused with the path-policy reason,
+`maestro` `ref create` still 200 (`admin.refs` intact), and the human `github:culebraluxe` seat
+mints, reads, provisions a ref and writes `src/**` (root/devops grants intact).
 
 New tests (all offline; no database, no model, no network):
 

@@ -41,7 +41,7 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
-use scion_core::ObjectId;
+use scion_core::{ConflictReport, ObjectId};
 use scion_object::{Canonical, RepoPath};
 use scion_proto::{convert, status_from_error, v1};
 use scion_server::AppContext;
@@ -57,6 +57,7 @@ use crate::repo_acl::ClaimOutcome;
 use crate::api_error::{ApiError, ApiResult};
 use crate::engine::Engine;
 use crate::http::{AppState, SERVICE, authenticate, caller_request};
+use crate::paused_conflicts::{self, ContinueOutcome, NewConflict, Record, ResolveOutcome};
 
 mod repo;
 mod requests;
@@ -1207,7 +1208,35 @@ pub(crate) async fn push(
                     });
                     landed = json!(landed_json(&response.landed));
                 }
-                Err(status) => return ApiError::from(status).into_response(),
+                Err(status) => {
+                    let base = first_parent(&app, &caller, &changeset_id).await;
+                    match ref_state(&engine, &caller, &ref_name).await {
+                        Ok((ours, _)) => {
+                            let paused = pause_conflict(
+                                &state,
+                                &engine,
+                                &caller,
+                                &repo,
+                                PauseRequest {
+                                    operation: "push",
+                                    ref_name: Some(ref_name.clone()),
+                                    head: changeset_id,
+                                    resolve_parent: changeset_id,
+                                    ours,
+                                    theirs: changeset_id,
+                                    base,
+                                },
+                                &status,
+                            )
+                            .await;
+                            match paused {
+                                Some(response) => return response,
+                                None => return ApiError::from(status).into_response(),
+                            }
+                        }
+                        Err(_) => return ApiError::from(status).into_response(),
+                    }
+                }
             }
         }
         _ => {
@@ -1356,7 +1385,31 @@ pub(crate) async fn rebase(
             )
                 .into_response()
         }
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => {
+            let app = engine.context();
+            let base = first_parent(&app, &caller, &changeset).await;
+            match pause_conflict(
+                &state,
+                &engine,
+                &caller,
+                &repo,
+                PauseRequest {
+                    operation: "rebase",
+                    ref_name: None,
+                    head: changeset,
+                    resolve_parent: changeset,
+                    ours: onto,
+                    theirs: changeset,
+                    base,
+                },
+                &status,
+            )
+            .await
+            {
+                Some(response) => response,
+                None => ApiError::from(status).into_response(),
+            }
+        }
     }
 }
 
@@ -1423,7 +1476,31 @@ pub(crate) async fn merge(
             )
                 .into_response()
         }
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => {
+            let app = engine.context();
+            let base = merge_base_id(&app, &caller, &a, &b).await;
+            match pause_conflict(
+                &state,
+                &engine,
+                &caller,
+                &repo,
+                PauseRequest {
+                    operation: "merge",
+                    ref_name: None,
+                    head: a,
+                    resolve_parent: a,
+                    ours: a,
+                    theirs: b,
+                    base,
+                },
+                &status,
+            )
+            .await
+            {
+                Some(response) => response,
+                None => ApiError::from(status).into_response(),
+            }
+        }
     }
 }
 
@@ -1488,7 +1565,34 @@ pub(crate) async fn land(
             )
                 .into_response()
         }
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => {
+            let app = engine.context();
+            let base = first_parent(&app, &caller, &head).await;
+            match ref_state(&engine, &caller, &body.ref_name).await {
+                Ok((ours, _)) => match pause_conflict(
+                    &state,
+                    &engine,
+                    &caller,
+                    &repo,
+                    PauseRequest {
+                        operation: "land",
+                        ref_name: Some(body.ref_name.clone()),
+                        head,
+                        resolve_parent: head,
+                        ours,
+                        theirs: head,
+                        base,
+                    },
+                    &status,
+                )
+                .await
+                {
+                    Some(response) => response,
+                    None => ApiError::from(status).into_response(),
+                },
+                Err(_) => ApiError::from(status).into_response(),
+            }
+        }
     }
 }
 
@@ -1594,7 +1698,30 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return ApiError::from(status).into_response(),
+        Err(status) => {
+            let base = merge_base_id(&app, &caller, &tip, &head).await;
+            match pause_conflict(
+                &state,
+                &engine,
+                &caller,
+                &repo,
+                PauseRequest {
+                    operation: "merge-land",
+                    ref_name: Some(body.ref_name.clone()),
+                    head: tip,
+                    resolve_parent: tip,
+                    ours: tip,
+                    theirs: head,
+                    base,
+                },
+                &status,
+            )
+            .await
+            {
+                Some(response) => return response,
+                None => return ApiError::from(status).into_response(),
+            }
+        }
     };
     let merged_id = match ObjectId::from_bytes(&merged.changeset_id) {
         Ok(id) => id,
@@ -1783,6 +1910,48 @@ async fn changeset_parents(
     }
 }
 
+/// The readable three-way bundle for a conflict report: per-path hunks/entries and the
+/// base/ours/theirs bytes (capped per side). This is the shape `conflict-context` returns and the
+/// shape a paused conflict persists, so `show` needs no engine round trip.
+async fn conflict_sides(
+    app: &Arc<AppContext>,
+    caller: &CallerCtx,
+    base: Option<&ObjectId>,
+    ours: &ObjectId,
+    theirs: &ObjectId,
+    report: &ConflictReport,
+) -> Result<(Vec<Value>, Vec<Value>), Status> {
+    let mut conflicts = Vec::new();
+    let mut clean_entries = Vec::new();
+    for conflict in &report.conflicts {
+        let base_data = read_version(app, caller, base, &conflict.path).await?;
+        let ours_data = read_version(app, caller, Some(ours), &conflict.path).await?;
+        let theirs_data = read_version(app, caller, Some(theirs), &conflict.path).await?;
+        conflicts.push(json!({
+            "path": String::from_utf8_lossy(&conflict.path).into_owned(),
+            "kind": conflict.kind.as_str(),
+            "hunks": conflict_hunks_json(conflict),
+            "entries": {
+                "base": entry_info_json(conflict.base.as_ref()),
+                "ours": entry_info_json(conflict.ours.as_ref()),
+                "theirs": entry_info_json(conflict.theirs.as_ref()),
+            },
+            "versions": {
+                "base": version_json(base_data),
+                "ours": version_json(ours_data),
+                "theirs": version_json(theirs_data),
+            },
+        }));
+    }
+    for clean in &report.clean_entries {
+        clean_entries.push(json!({
+            "path": String::from_utf8_lossy(&clean.path).into_owned(),
+            "entry": entry_info_json(clean.entry.as_ref()),
+        }));
+    }
+    Ok((conflicts, clean_entries))
+}
+
 /// `POST /repos/{repo}/conflict-context` — the three sides of a refused merge or rebase.
 ///
 /// A `409 conflict` from `merge`, `merge-land`, `rebase` or a contended `land` carries the
@@ -1948,46 +2117,14 @@ pub(crate) async fn conflict_context(
                 .into_response();
         };
 
-    let mut conflicts = Vec::new();
-    let mut clean_entries = Vec::new();
-    if let Some(report) = &report {
-        for conflict in &report.conflicts {
-            let base_data = match read_version(&app, &caller, base.as_ref(), &conflict.path).await {
-                Ok(data) => data,
-                Err(status) => return ApiError::from(status).into_response(),
-            };
-            let ours_data = match read_version(&app, &caller, Some(&ours), &conflict.path).await {
-                Ok(data) => data,
-                Err(status) => return ApiError::from(status).into_response(),
-            };
-            let theirs_data = match read_version(&app, &caller, Some(&theirs), &conflict.path).await
-            {
-                Ok(data) => data,
-                Err(status) => return ApiError::from(status).into_response(),
-            };
-            conflicts.push(json!({
-                "path": String::from_utf8_lossy(&conflict.path).into_owned(),
-                "kind": conflict.kind.as_str(),
-                "hunks": conflict_hunks_json(conflict),
-                "entries": {
-                    "base": entry_info_json(conflict.base.as_ref()),
-                    "ours": entry_info_json(conflict.ours.as_ref()),
-                    "theirs": entry_info_json(conflict.theirs.as_ref()),
-                },
-                "versions": {
-                    "base": version_json(base_data),
-                    "ours": version_json(ours_data),
-                    "theirs": version_json(theirs_data),
-                },
-            }));
+    let (conflicts, clean_entries) = if let Some(report) = &report {
+        match conflict_sides(&app, &caller, base.as_ref(), &ours, &theirs, report).await {
+            Ok(sides) => sides,
+            Err(status) => return ApiError::from(status).into_response(),
         }
-        for clean in &report.clean_entries {
-            clean_entries.push(json!({
-                "path": String::from_utf8_lossy(&clean.path).into_owned(),
-                "entry": entry_info_json(clean.entry.as_ref()),
-            }));
-        }
-    }
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     (
         StatusCode::OK,
@@ -2006,6 +2143,210 @@ pub(crate) async fn conflict_context(
         })),
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Paused conflicts (resolve/continue workflow)
+//
+// A conflict used to be terminal: the caller re-derived the sides with `conflict-context` and
+// pushed again. Here the refused operation is persisted so the caller can resolve it (with a
+// changeset that resolves the conflict) and continue (land it), with a stale-ref guard.
+// ---------------------------------------------------------------------------------------------
+
+/// One refused operation, ready to be persisted as a paused conflict.
+struct PauseRequest {
+    operation: &'static str,
+    ref_name: Option<String>,
+    head: ObjectId,
+    resolve_parent: ObjectId,
+    ours: ObjectId,
+    theirs: ObjectId,
+    base: Option<ObjectId>,
+}
+
+/// The ref tip and version, resolved through the same upstream handler every read uses.
+async fn ref_state(
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    ref_name: &str,
+) -> Result<(ObjectId, u64), Status> {
+    let app = engine.context();
+    let resolved = handlers::object::resolve_ref(
+        &app,
+        caller_request(
+            v1::ResolveRefRequest {
+                name: ref_name.to_owned(),
+                at_version: None,
+            },
+            caller,
+        ),
+    )
+    .await?
+    .into_inner();
+    let target =
+        ObjectId::from_bytes(&resolved.target).map_err(|error| status_from_error(&error))?;
+    Ok((target, resolved.version))
+}
+
+/// The first parent of a changeset, when it has one and the caller may read it.
+async fn first_parent(
+    app: &Arc<AppContext>,
+    caller: &CallerCtx,
+    id: &ObjectId,
+) -> Option<ObjectId> {
+    changeset_parents(app, caller, id)
+        .await
+        .ok()
+        .and_then(|parents| parents.first().copied())
+}
+
+/// The unique merge base of two changesets, when one exists and the caller may read it.
+async fn merge_base_id(
+    app: &Arc<AppContext>,
+    caller: &CallerCtx,
+    a: &ObjectId,
+    b: &ObjectId,
+) -> Option<ObjectId> {
+    let bases = handlers::query::merge_base(
+        app,
+        caller_request(
+            v1::MergeBaseRequest {
+                a: convert::id_bytes(a),
+                b: convert::id_bytes(b),
+            },
+            caller,
+        ),
+    )
+    .await
+    .ok()?
+    .into_inner()
+    .bases;
+    match bases.as_slice() {
+        [one] => ObjectId::from_bytes(one).ok(),
+        _ => None,
+    }
+}
+
+/// Persist a refused operation and return the augmented `409` response, or `None` when the
+/// status is not a merge conflict or the store is unavailable (the caller then returns the
+/// original status unchanged).
+async fn pause_conflict(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    request: PauseRequest,
+    status: &Status,
+) -> Option<Response> {
+    let report = conflict_report_of(status)?;
+    let app = engine.context();
+    let sides = match conflict_sides(
+        &app,
+        caller,
+        request.base.as_ref(),
+        &request.ours,
+        &request.theirs,
+        &report,
+    )
+    .await
+    {
+        Ok((conflicts, clean_entries)) => {
+            json!({ "conflicts": conflicts, "clean_entries": clean_entries })
+        }
+        Err(error) => {
+            tracing::warn!(%error, "paused conflict sides could not be read; storing the report only");
+            json!({ "conflicts": [], "clean_entries": [], "error": error.message() })
+        }
+    };
+    let (ref_version, ref_target) = match request.ref_name.as_deref() {
+        Some(name) => match ref_state(engine, caller, name).await {
+            Ok((target, version)) => (
+                Some(i64::try_from(version).unwrap_or(i64::MAX)),
+                Some(target.to_text()),
+            ),
+            Err(_) => (None, None),
+        },
+        None => (None, None),
+    };
+    let new = NewConflict {
+        repo: repo.to_owned(),
+        operation: request.operation.to_owned(),
+        ref_name: request.ref_name,
+        ref_version,
+        ref_target,
+        head: request.head.to_text(),
+        resolve_parent: request.resolve_parent.to_text(),
+        base: request.base.map(|id| id.to_text()),
+        ours: request.ours.to_text(),
+        theirs: request.theirs.to_text(),
+        report: crate::api_error::conflict_report_json(&report),
+        sides,
+        created_by: caller.principal.id_string(),
+    };
+    match state.paused.open(new).await {
+        Ok(record) => Some(paused_error_response(status, &record)),
+        Err(error) => {
+            tracing::warn!(%error, "could not persist paused conflict");
+            None
+        }
+    }
+}
+
+/// The conflict response with the persisted record attached, keeping the upstream `details`.
+fn paused_error_response(status: &Status, record: &Record) -> Response {
+    ApiError::from(status.clone())
+        .with_extra(json!({ "conflict": paused_conflicts::record_json(record) }))
+        .into_response()
+}
+
+/// Only the principal that hit the conflict or a repository administrator may resolve/continue
+/// it: the persisted sides were read under the creator's read policy.
+fn can_manage_conflict(engine: &Arc<Engine>, caller: &CallerCtx, record: &Record) -> bool {
+    record.created_by == caller.principal.id_string()
+        || engine
+            .context()
+            .policy
+            .current()
+            .can_admin(&caller.principal, AdminCapability::Repositories.permit())
+}
+
+/// Refuse a paused conflict that is not open (resolve) with the current state attached.
+fn not_open_response(record: &Record) -> Response {
+    ApiError::conflict(format!(
+        "conflict {} is not open (status={}); resolve only applies to an open conflict",
+        record.id, record.status
+    ))
+    .with_extra(json!({ "conflict": paused_conflicts::record_json(record) }))
+    .into_response()
+}
+
+/// Whether the ref moved since the conflict was paused. A missing recorded version (the ref
+/// could not be resolved at pause time) cannot be shown stale; the land itself then reports a
+/// CAS/ref mismatch.
+fn stale_ref(record: &Record, current_version: u64) -> bool {
+    record
+        .ref_version
+        .is_some_and(|paused| i64::try_from(current_version).unwrap_or(i64::MAX) != paused)
+}
+
+/// A resolving changeset must be the single child of the paused continuation.
+fn valid_resolution_parent(parents: &[ObjectId], expected: &str) -> bool {
+    matches!(parents, [parent] if parent.to_text() == expected)
+}
+
+/// Refuse a continue whose ref moved since the conflict was paused.
+fn stale_response(record: &Record, current_version: u64, current_target: &ObjectId) -> Response {
+    ApiError::conflict(format!(
+        "stale conflict: ref {:?} moved since the conflict was paused",
+        record.ref_name.as_deref().unwrap_or("?")
+    ))
+    .with_extra(json!({
+        "conflict": paused_conflicts::record_json(record),
+        "stale": true,
+        "current_version": current_version,
+        "current_target": current_target.to_text(),
+    }))
+    .into_response()
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2124,6 +2465,45 @@ pub(crate) async fn list_conflicts(
         Ok(query) => query,
         Err(rejection) => return ApiError::from(rejection).into_response(),
     };
+    if query.scope.as_deref() == Some("paused") {
+        // The paused workflow is the caller's own conflict state, not the DevOps escalation
+        // queue: repository read is enough to list it.
+        if let Err(error) = authorize(
+            &state,
+            &engine,
+            &caller,
+            &repo,
+            Action::Read,
+            Some("/"),
+            None,
+        )
+        .await
+        {
+            return error.into_response();
+        }
+        let status = query.status.unwrap_or_else(|| "open".to_owned());
+        if !paused_conflicts::valid_status(&status) {
+            return ApiError::invalid_argument(
+                "status must be one of open, resolved, continued, all",
+            )
+            .into_response();
+        }
+        return match state.paused.list(&repo, &status).await {
+            Ok(records) => (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "scope": "paused",
+                    "filter": status,
+                    "conflicts": records.iter().map(paused_conflicts::record_json).collect::<Vec<_>>(),
+                })),
+            )
+                .into_response(),
+            Err(error) => ApiError::internal(error).into_response(),
+        };
+    }
     if let Err(error) = require_devops(
         &engine,
         &caller,
@@ -2220,6 +2600,27 @@ pub(crate) async fn resolve_conflict(
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
     };
+    if uuid::Uuid::parse_str(&id).is_err() {
+        return ApiError::invalid_argument("id is not a UUID").into_response();
+    }
+    // Paused conflicts and the DevOps escalation queue share this route (as they share the
+    // `/conflicts` route for listing). A paused id wins; escalation bodies never carry
+    // `changeset`, so the dispatch is unambiguous.
+    match state.paused.get(&repo, &id).await {
+        Ok(Some(record)) => {
+            return resolve_paused_conflict(
+                &state,
+                &engine,
+                &caller,
+                &repo,
+                &record,
+                body.changeset.as_deref(),
+            )
+            .await;
+        }
+        Ok(None) => {}
+        Err(error) => return ApiError::internal(error).into_response(),
+    }
     if let Err(error) = require_devops(
         &engine,
         &caller,
@@ -2227,9 +2628,6 @@ pub(crate) async fn resolve_conflict(
         "resolving a conflict requires the DevOps seat (admin.trunk)",
     ) {
         return error.into_response();
-    }
-    if uuid::Uuid::parse_str(&id).is_err() {
-        return ApiError::invalid_argument("id is not a UUID").into_response();
     }
     let Some(pool) = state.db.as_ref() else {
         return queue_unavailable().into_response();
@@ -2255,6 +2653,245 @@ pub(crate) async fn resolve_conflict(
             .into_response(),
         Ok(None) => ApiError::conflict("escalation is already resolved or absent").into_response(),
         Err(error) => ApiError::internal(error).into_response(),
+    }
+}
+
+/// `GET /repos/{repo}/conflicts/{id}` — one paused conflict with its persisted sides.
+pub(crate) async fn show_conflict(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(error) => return error.into_response(),
+    };
+    if let Err(error) = authorize(
+        &state,
+        &engine,
+        &caller,
+        &repo,
+        Action::Read,
+        Some("/"),
+        None,
+    )
+    .await
+    {
+        return error.into_response();
+    }
+    match state.paused.get(&repo, &id).await {
+        Ok(Some(record)) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "conflict": paused_conflicts::record_json(&record),
+            })),
+        )
+            .into_response(),
+        Ok(None) => ApiError::not_found(format!("paused conflict {id} not found")).into_response(),
+        Err(error) => ApiError::internal(error).into_response(),
+    }
+}
+
+/// Resolve a paused conflict with a single-parent changeset that continues `resolve_parent`.
+async fn resolve_paused_conflict(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    record: &Record,
+    changeset: Option<&str>,
+) -> Response {
+    if !can_manage_conflict(engine, caller, record) {
+        return ApiError::permission_denied(
+            "only the principal that hit the conflict or a repository administrator may resolve it",
+        )
+        .into_response();
+    }
+    if let Err(error) = authorize_repository(state, engine, caller, repo, Action::Write).await {
+        return error.into_response();
+    }
+    if record.status != "open" {
+        return not_open_response(record);
+    }
+    let Some(raw_changeset) = changeset else {
+        return ApiError::invalid_argument(
+            "resolve needs a resolved changeset (the changeset that contains the resolution)",
+        )
+        .into_response();
+    };
+    let resolved = match parse_id(raw_changeset, "changeset") {
+        Ok(id) => id,
+        Err(message) => return ApiError::invalid_argument(message).into_response(),
+    };
+    let app = engine.context();
+    let parents = match changeset_parents(&app, caller, &resolved).await {
+        Ok(parents) => parents,
+        Err(status) => return ApiError::from(status).into_response(),
+    };
+    if !valid_resolution_parent(&parents, &record.resolve_parent) {
+        return ApiError::invalid_argument(format!(
+            "resolved changeset must be a single-parent child of {} (the paused continuation)",
+            record.resolve_parent
+        ))
+        .into_response();
+    }
+    match state
+        .paused
+        .resolve(
+            repo,
+            &record.id,
+            &caller.principal.id_string(),
+            &resolved.to_text(),
+        )
+        .await
+    {
+        Ok(ResolveOutcome::Resolved(record)) => (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "conflict": paused_conflicts::record_json(&record),
+            })),
+        )
+            .into_response(),
+        Ok(ResolveOutcome::NotFound) => {
+            ApiError::not_found(format!("paused conflict {} not found", record.id)).into_response()
+        }
+        Ok(ResolveOutcome::NotOpen(record)) => not_open_response(&record),
+        Err(error) => ApiError::internal(error).into_response(),
+    }
+}
+
+/// `POST /repos/{repo}/conflicts/{id}/continue` — land the resolved changeset.
+///
+/// The ref must still be at the version observed when the conflict was paused (stale refusal);
+/// the land itself re-checks write on every delta path and the ref CAS, so a concurrent winner is
+/// reported the normal way rather than silently overwriting it.
+pub(crate) async fn continue_conflict(
+    State(state): State<Arc<AppState>>,
+    Path((repo, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Json<ContinueConflictBody>, JsonRejection>,
+) -> Response {
+    let (_, caller) = match authenticate(&state, &headers) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let engine = match repo_engine(&state, &repo).await {
+        Ok(engine) => engine,
+        Err(error) => return error.into_response(),
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return ApiError::from(rejection).into_response(),
+    };
+    if let Err(error) = authorize_repository(&state, &engine, &caller, &repo, Action::Write).await {
+        return error.into_response();
+    }
+    let record = match state.paused.get(&repo, &id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => {
+            return ApiError::not_found(format!("paused conflict {id} not found")).into_response();
+        }
+        Err(error) => return ApiError::internal(error).into_response(),
+    };
+    if !can_manage_conflict(&engine, &caller, &record) {
+        return ApiError::permission_denied(
+            "only the principal that hit the conflict or a repository administrator may continue it",
+        )
+        .into_response();
+    }
+    if record.status != "resolved" {
+        return ApiError::conflict(format!(
+            "conflict {} is not resolved (status={}); resolve it before continuing",
+            record.id, record.status
+        ))
+        .with_extra(json!({ "conflict": paused_conflicts::record_json(&record) }))
+        .into_response();
+    }
+    let Some(raw_resolved) = record.resolved_changeset.as_deref() else {
+        return ApiError::internal("resolved conflict has no resolved changeset").into_response();
+    };
+    let resolved = match parse_id(raw_resolved, "resolved_changeset") {
+        Ok(id) => id,
+        Err(message) => return ApiError::internal(message).into_response(),
+    };
+    let ref_name = match record.ref_name.clone().or(body.ref_name) {
+        Some(ref_name) => ref_name,
+        None => {
+            return ApiError::invalid_argument(format!(
+                "conflict {} was paused by a {} with no target ref; pass ref to continue",
+                record.id, record.operation
+            ))
+            .into_response();
+        }
+    };
+    let (current_target, current_version) = match ref_state(&engine, &caller, &ref_name).await {
+        Ok(state) => state,
+        Err(status) => return ApiError::from(status).into_response(),
+    };
+    if stale_ref(&record, current_version) {
+        return stale_response(&record, current_version, &current_target);
+    }
+    let app = engine.context();
+    let request = v1::LandRequest {
+        r#ref: ref_name.clone(),
+        head: convert::id_bytes(&resolved),
+        // The caller chose the resolved bytes; a resolution that equals the tip is an intentional
+        // empty change, not a land failure.
+        allow_empty: true,
+    };
+    match handlers::write::land(&app, caller_request(request, &caller)).await {
+        Ok(response) => {
+            let response = response.into_inner();
+            match state
+                .paused
+                .continue_landed(
+                    &repo,
+                    &record.id,
+                    &id_text(&response.target),
+                    response.version,
+                )
+                .await
+            {
+                Ok(ContinueOutcome::Continued(record)) => (
+                    StatusCode::OK,
+                    Json(json!({
+                        "service": SERVICE,
+                        "status": "ok",
+                        "repo": repo,
+                        "conflict": paused_conflicts::record_json(&record),
+                        "ref": {
+                            "name": ref_name,
+                            "target": id_text(&response.target),
+                            "version": response.version,
+                        },
+                        "landed": landed_json(&response.landed),
+                    })),
+                )
+                    .into_response(),
+                Ok(ContinueOutcome::NotFound) => {
+                    ApiError::not_found(format!("paused conflict {} not found", record.id))
+                        .into_response()
+                }
+                Ok(ContinueOutcome::NotResolved(record)) => ApiError::conflict(format!(
+                    "conflict {} is no longer resolved (status={})",
+                    record.id, record.status
+                ))
+                .with_extra(json!({ "conflict": paused_conflicts::record_json(&record) }))
+                .into_response(),
+                Err(error) => ApiError::internal(error).into_response(),
+            }
+        }
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -2943,7 +3580,10 @@ pub(crate) async fn workspace_materialize(
         Ok(rev) => rev,
         Err(error) => return error.into_response(),
     };
-    let result = engine.workspaces().materialize(&id, &rev, body.force).await;
+    let result = engine
+        .workspaces()
+        .materialize(&id, &rev, body.force, &caller.principal)
+        .await;
     workspace_result(repo, result)
 }
 
@@ -3231,7 +3871,7 @@ pub(crate) async fn workspace_destroy(
     {
         return error.into_response();
     }
-    match engine.workspaces().destroy(&id).await {
+    match engine.workspaces().destroy(&id, &caller.principal).await {
         Ok(()) => (
             StatusCode::OK,
             Json(json!({
@@ -3243,7 +3883,7 @@ pub(crate) async fn workspace_destroy(
             })),
         )
             .into_response(),
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => workspace_error(status),
     }
 }
 
@@ -3368,6 +4008,58 @@ mod tests {
         assert_eq!(encoding_name(v1::Encoding::Zstd as i32), "zstd");
         assert_eq!(encoding_name(0), "unspecified");
     }
+    fn paused_record(status: &str, ref_version: Option<i64>) -> Record {
+        Record {
+            id: "conflict-id".to_owned(),
+            repo: "repo".to_owned(),
+            operation: "land".to_owned(),
+            status: status.to_owned(),
+            ref_name: Some("main".to_owned()),
+            ref_version,
+            ref_target: Some("c1tip".to_owned()),
+            head: "c1head".to_owned(),
+            resolve_parent: "c1head".to_owned(),
+            base: None,
+            ours: "c1tip".to_owned(),
+            theirs: "c1head".to_owned(),
+            report: serde_json::json!({}),
+            sides: serde_json::json!({}),
+            created_by: "github:culebraluxe".to_owned(),
+            created_at: 1,
+            resolved_changeset: Some("c1resolved".to_owned()),
+            resolved_by: Some("github:culebraluxe".to_owned()),
+            resolved_at: Some(2),
+            continued_target: None,
+            continued_version: None,
+            continued_at: None,
+        }
+    }
+
+    #[test]
+    fn a_moved_ref_is_stale_and_an_unknown_version_is_not_provable() {
+        let paused = paused_record("resolved", Some(7));
+        assert!(stale_ref(&paused, 8), "a newer ref version is stale");
+        assert!(!stale_ref(&paused, 7), "the paused version is current");
+        let unknown = paused_record("resolved", None);
+        assert!(
+            !stale_ref(&unknown, 8),
+            "an unrecorded version cannot be proven stale"
+        );
+    }
+
+    #[test]
+    fn the_resolved_changeset_must_be_the_single_paused_child() {
+        let expected = ObjectId::hash_blob(b"head");
+        let other = ObjectId::hash_blob(b"other");
+        assert!(valid_resolution_parent(&[expected], &expected.to_text()));
+        assert!(!valid_resolution_parent(&[], &expected.to_text()));
+        assert!(!valid_resolution_parent(
+            &[expected, other],
+            &expected.to_text()
+        ));
+        assert!(!valid_resolution_parent(&[other], &expected.to_text()));
+    }
+
     /// FVCS-02: the push façade feeds every changeset delta path into the authorizer. A regression
     /// that drops the paths would silently fall back to the coarse write-on-`/` gate this work
     /// removed, so the extraction is asserted directly.

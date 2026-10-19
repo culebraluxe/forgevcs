@@ -13,6 +13,7 @@
 //! and multi-instance routing therefore do not lose a workspace ID.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -31,6 +32,7 @@ use tonic::Status;
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::lease::{LeaseError, LeaseGrant, PgLeaseStore, WorkspaceLease};
 
 /// Default author of a workspace commit.
 pub const DEFAULT_AUTHOR: &[u8] = b"ForgeVCS workspace <workspace@example.test>";
@@ -109,6 +111,9 @@ pub struct WorkspaceService {
     client: ScionClient,
     repo: String,
     pool: Pool,
+    /// Per-workspace write lease (R4). Every path that persists a workspace change acquires it
+    /// first, so two agents writing the same workspace cannot silently overwrite each other.
+    lease: WorkspaceLease,
 }
 
 const CREATE_WORKSPACES: &str = r#"
@@ -130,6 +135,16 @@ CREATE TABLE IF NOT EXISTS forgevcs_workspace_files (
 )
 "#;
 
+/// Create the workspace tables when they do not exist. Shared by the boot path and the R4
+/// Postgres lease test, which needs a workspace row to hold a lease on.
+pub(crate) async fn ensure_schema(pool: &Pool) -> Result<(), String> {
+    let client = pool.get().await.map_err(|error| error.to_string())?;
+    client
+        .batch_execute(&format!("{CREATE_WORKSPACES}; {CREATE_FILES}"))
+        .await
+        .map_err(|error| format!("creating workspace tables: {error}"))
+}
+
 impl WorkspaceService {
     /// Build a service over the engine's internal gRPC client and the shared Postgres pool.
     pub async fn connect(client: ScionClient, repo: &str, config: &Config) -> Result<Self, String> {
@@ -138,18 +153,53 @@ impl WorkspaceService {
             .as_deref()
             .ok_or_else(|| "workspace persistence needs FORGEVCS_DATABASE_URL".to_owned())?;
         let pool = crate::db::build_pool(url)?;
-        {
-            let client = pool.get().await.map_err(|error| error.to_string())?;
-            client
-                .batch_execute(&format!("{CREATE_WORKSPACES}; {CREATE_FILES}"))
-                .await
-                .map_err(|error| format!("creating workspace tables: {error}"))?;
-        }
+        ensure_schema(&pool).await?;
+        crate::lease::ensure_schema(&pool).await?;
+        let lease = WorkspaceLease::new(
+            Arc::new(PgLeaseStore::new(pool.clone())),
+            config.workspace_lease_ttl(),
+        );
         Ok(Self {
             client,
             repo: repo.to_owned(),
             pool,
+            lease,
         })
+    }
+
+    /// The lease owner for a caller: the authenticated principal's stable id string. The lease is
+    /// per principal, not per process, so a restarted agent can re-acquire its own workspace.
+    fn owner(who: &Principal) -> String {
+        who.id_string()
+    }
+
+    fn workspace_uuid(id: &str) -> WsResult<Uuid> {
+        Uuid::parse_str(id)
+            .map_err(|_| Status::not_found(format!("workspace {id:?} does not exist")))
+    }
+
+    /// Acquire the write lease for a caller, mapping a lease conflict onto the typed status the
+    /// façade renders as HTTP 409 with the current owner.
+    async fn acquire_lease(&self, id: &str, who: &Principal) -> WsResult<LeaseGrant> {
+        let workspace_id = Self::workspace_uuid(id)?;
+        self.lease
+            .acquire(
+                workspace_id,
+                &self.repo,
+                &Self::owner(who),
+                SystemTime::now(),
+            )
+            .await
+            .map_err(LeaseError::into_status)
+    }
+
+    /// Renew the lease immediately before persisting a change. If the lease was taken over while
+    /// this request was working, the change is abandoned instead of overwriting the new owner.
+    async fn renew_lease(&self, grant: &LeaseGrant) -> WsResult<LeaseGrant> {
+        self.lease
+            .heartbeat(grant, SystemTime::now())
+            .await
+            .map_err(LeaseError::into_status)
     }
 
     async fn entry(&self, id: &str) -> WsResult<Arc<Entry>> {
@@ -307,12 +357,23 @@ impl WorkspaceService {
         Ok((id, state))
     }
 
-    /// Move an existing workspace to another ref/changeset.
-    pub async fn materialize(&self, id: &str, rev: &str, force: bool) -> WsResult<Value> {
+    /// Move an existing workspace to another ref/changeset. Holds the workspace write lease
+    /// while the goto rewrites the working copy and persists the new state.
+    pub async fn materialize(
+        &self,
+        id: &str,
+        rev: &str,
+        force: bool,
+        who: &Principal,
+    ) -> WsResult<Value> {
+        let grant = self.acquire_lease(id, who).await?;
         let entry = self.entry(id).await?;
         let _guard = entry.lock.lock().await;
         let mut wc = self.open(&entry)?;
         let report = wc.goto(rev, force).await.map_err(scion)?;
+        // Renew before persisting: if another owner took the lease over while the goto ran, the
+        // rebuilt working copy must not overwrite theirs.
+        self.renew_lease(&grant).await?;
         self.persist_state(id, wc.state()).await?;
         if report.preserved_dirty.is_empty() {
             self.clear_files(id).await?;
@@ -434,6 +495,9 @@ impl WorkspaceService {
         if mode == Mode::Tree {
             return Err(Status::invalid_argument("cannot write a tree entry"));
         }
+        // Acquire before restoring the working copy, so this request starts from the overlay the
+        // previous owner left (and cannot race a live writer).
+        let grant = self.acquire_lease(id, who).await?;
         let entry = self.entry(id).await?;
         let _guard = entry.lock.lock().await;
         let root = SafeRoot::open(entry.dir.path()).map_err(scion)?;
@@ -446,6 +510,9 @@ impl WorkspaceService {
                 return Err(Status::invalid_argument("cannot write a tree entry"));
             }
         }
+        // Renew immediately before the persisted overlay changes; losing the lease aborts the
+        // write instead of last-writer-winning.
+        self.renew_lease(&grant).await?;
         self.persist_file(id, &path, mode, data, false).await?;
         Ok(json!({
             "workspace_id": id,
@@ -472,10 +539,12 @@ impl WorkspaceService {
         if !policy.can_write(who, &path) {
             return Err(Status::permission_denied("write on the path denied"));
         }
+        let grant = self.acquire_lease(id, who).await?;
         let entry = self.entry(id).await?;
         let _guard = entry.lock.lock().await;
         let root = SafeRoot::open(entry.dir.path()).map_err(scion)?;
         root.remove(&path).map_err(scion)?;
+        self.renew_lease(&grant).await?;
         self.persist_file(id, &path, Mode::File, &[], true).await?;
         Ok(json!({
             "workspace_id": id,
@@ -485,6 +554,9 @@ impl WorkspaceService {
     }
 
     /// Commit the workspace, then land it on `ref_name` (or leave it unlanded with `mode=none`).
+    ///
+    /// The lease is acquired before the working copy is restored and released on every exit
+    /// path, so the next writer continues immediately instead of waiting for expiry.
     pub async fn submit(
         &self,
         id: &str,
@@ -492,15 +564,33 @@ impl WorkspaceService {
         policy: &Policy,
         who: &Principal,
     ) -> WsResult<Value> {
+        if request.mode != "land" && request.mode != "none" {
+            return Err(Status::invalid_argument("mode must be land or none"));
+        }
+        let grant = self.acquire_lease(id, who).await?;
+        let result = self.submit_holding(id, request, policy, who, &grant).await;
+        if let Err(error) = self.lease.release(&grant, SystemTime::now()).await {
+            // The commit/land outcome is already decided; a failed release only means the lease
+            // will be recovered by expiry (or the next writer's audited takeover).
+            tracing::warn!(workspace_id = id, %error, "releasing workspace lease failed");
+        }
+        result
+    }
+
+    async fn submit_holding(
+        &self,
+        id: &str,
+        request: SubmitRequest<'_>,
+        policy: &Policy,
+        who: &Principal,
+        grant: &LeaseGrant,
+    ) -> WsResult<Value> {
         let SubmitRequest {
             message,
             author,
             ref_name,
             mode,
         } = request;
-        if mode != "land" && mode != "none" {
-            return Err(Status::invalid_argument("mode must be land or none"));
-        }
         let entry = self.entry(id).await?;
         let _guard = entry.lock.lock().await;
         let mut wc = self.open(&entry)?;
@@ -525,6 +615,7 @@ impl WorkspaceService {
                 "update on ref {ref_name} denied"
             )));
         }
+        self.renew_lease(grant).await?;
         let commit = wc
             .commit_with_report(message, author, None)
             .await
@@ -532,6 +623,8 @@ impl WorkspaceService {
         let report = report_json(&commit);
         let mut ref_value = Value::Null;
         if mode == "land" {
+            // The ref move is the critical write: verify the lease is still ours, then land.
+            self.renew_lease(grant).await?;
             let landed = wc.land(&parsed_ref).await.map_err(scion)?;
             ref_value = land_json(&landed);
         }
@@ -546,10 +639,10 @@ impl WorkspaceService {
         }))
     }
 
-    /// Destroy a workspace and its temporary directory.
-    pub async fn destroy(&self, id: &str) -> WsResult<()> {
-        Uuid::parse_str(id)
-            .map_err(|_| Status::not_found(format!("workspace {id:?} does not exist")))?;
+    /// Destroy a workspace and its temporary directory. The caller must hold the write lease; the
+    /// release is audited after the workspace row (and its lease row) are gone.
+    pub async fn destroy(&self, id: &str, who: &Principal) -> WsResult<()> {
+        let grant = self.acquire_lease(id, who).await?;
         let client = self.pool.get().await.map_err(internal)?;
         let deleted = client
             .execute(
@@ -562,6 +655,11 @@ impl WorkspaceService {
             return Err(Status::not_found(format!(
                 "workspace {id:?} does not exist"
             )));
+        }
+        if let Err(error) = self.lease.record_released(&grant, SystemTime::now()).await {
+            // The workspace is already gone; a missing audit row is a warning, not a failed
+            // destroy (the row it describes no longer exists to protect).
+            tracing::warn!(workspace_id = id, %error, "recording workspace lease release failed");
         }
         Ok(())
     }

@@ -173,8 +173,10 @@ passed 1343/0. No upstream file changed; the failure is recorded here rather tha
 
 ## 7. Remaining gaps
 
-- **Concurrent writes to one workspace from two instances** are not serialized across the
-  database; the per-workspace mutex is process-local. V0 assumes one active editor per workspace.
+- **Concurrent writes to one workspace from two instances** are now serialized by the DB-backed
+  workspace write lease (R4, `docs/R4-workspace-lease.md`): a second writer gets a typed 409 with
+  the current owner instead of overwriting; stale leases are taken over after expiry with an
+  audit row. The process-local mutex remains as the in-process fast path.
 - **Paused rebases are not restored exactly**: the pending operation is persisted in `WcState`,
   but conflict-file materialization/resolution state is not part of the overlay.
 - **Rebase/conflict operations** (`rebase`, `resolve`, `abort`) are in `scion-wc` but not exposed

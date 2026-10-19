@@ -51,8 +51,12 @@ deliberate: isolation before load, load before scale, offsite before calling it 
 
 ## P1 — production posture (after P0)
 
-1. **Conflict resolution workflow** — paused-conflict state + `resolve`/`continue` endpoints;
-   today conflicts are read-then-repush by hand. (2–3 days)
+1. **Conflict resolution workflow** — **shipped (R2)**: a refused land/merge/rebase persists a
+   paused conflict (repo/ref/version, operation, side changesets, report and readable file sides);
+   `GET /repos/{repo}/conflicts?scope=paused`, `GET /conflicts/{id}`,
+   `POST /conflicts/{id}/resolve` and `POST /conflicts/{id}/continue` plus the
+   `forgevcs conflicts` CLI. Stale/invalid conflicts are refused; continue lands through the
+   ordinary `Land` checks.
 2. **Two-parent landing** — harden `merge-land` (re-merge when tip moves) and decide whether
    `POST /land` on a merge head is needed; otherwise document the linear-stack contract. (1 day)
 3. **Human login + secret rotation** — browser/GitHub session path, per-agent revocation/rotation
