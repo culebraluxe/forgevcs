@@ -15,9 +15,10 @@
 # collide over. Paths stay readable/writable by all agents because a real codebase shares
 # files across agents; isolation is in history, not in directories.
 #
-# `admin.refs` is both the provisioning seat (CreateRef) and the repository-lifecycle seat:
-# the façade now refuses `POST /repos/{repo}/init` to a principal without `admin.refs`, so
-# only the DevOps principal can create a repository. This collaboration pilot keeps `main`
+# `admin.refs` is the ref-provisioning seat (upstream CreateRef). Repository lifecycle is a
+# separate permit: `admin.repos` gates `POST /repos/{repo}/init` and the deletion endpoint, so
+# only the DevOps principal can create or delete a repository; a ref grant is never substituted
+# for repository authority. This collaboration pilot keeps `main`
 # writable by the trio so it can measure merge/land mechanics; the strict authority matrix is
 # scripts/pilot/acl-roles.toml and scripts/role-pilot.sh.
 

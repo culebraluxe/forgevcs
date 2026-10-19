@@ -6,6 +6,8 @@
 //! routes would prove nothing about the service. `main.rs` keeps startup, shutdown and the
 //! `axum::serve` call.
 
+mod api_error;
+
 pub mod authz;
 pub mod config;
 pub mod db;

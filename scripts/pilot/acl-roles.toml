@@ -5,10 +5,9 @@
 #   worker            checkout, read, diff, merge-base, push to its own lane ref
 #   devops (admin)    create repository, provision refs, advance `main`
 #
-# A worker cannot create a repository (façade gate on `admin.refs`), cannot create refs
-# (upstream CreateRef requires `admin.refs`), and cannot advance `main` (ref rule). There is
-# no repository deletion endpoint yet; when one is built it must take the same `admin.refs`
-# seat, not a worker permission.
+# A worker cannot create a repository (façade gate on `admin.repos`), cannot create refs
+# (upstream CreateRef requires `admin.refs`), and cannot advance `main` (ref rule). Repository
+# deletion takes the same `admin.repos` seat, not a worker permission.
 
 version = 1
 

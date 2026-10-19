@@ -11,21 +11,22 @@
 //!
 //! - JSON request/response shapes for the five operations, using `ObjectId` text form
 //!   (`b1…`, `t1…`, `c1…`) and base64 for raw object bytes;
-//! - one place that turns a `tonic::Status` into the service's error envelope, shared with the
-//!   probes and auth endpoints;
+//! - the service's typed error envelope, in [`crate::api_error`] so the probes, the auth
+//!   endpoints and every façade handler share one status/code mapping;
 //! - a gRPC-framed in-memory stream for `UploadObjects`, whose handler takes
 //!   `Streaming<UploadItem>` rather than a vector. The handler itself is unchanged; only the
 //!   wire framing that tonic normally supplies is built here.
+//!
+//! The module is decomposed so a handler reads as orchestration and nothing else:
+//!
+//! - [`requests`] — the JSON request/query DTOs and their `scion.v1` conversion (pure);
+//! - [`responses`] — proto reply / id / timestamp → JSON mapping (pure apart from the envelope);
+//! - [`repo`] — the thin repository resolver that answers 404-vs-boot in one place.
 //!
 //! `POST /repos/{repo}/refs` would be more RESTful as a list, but there is no upstream
 //! `ListRefs` RPC. `GET /refs` therefore reads `MetaStore::list_refs` directly after the same
 //! `read` on `/` check `GetRefLog` would perform. It is the one read that does not go through a
 //! handler, and it is called out in `docs/W4-engine-wiring.md` §8.
-
-// A façade helper returns the HTTP response it would send on failure. Boxing that response
-// would only move the allocation to every call site; `axum::Response` is the natural error type
-// for these functions.
-#![allow(clippy::result_large_err)]
 
 use std::collections::BTreeMap;
 
@@ -40,25 +41,30 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
-use prost::Message as _;
-use scion_core::{ConflictReport, EntryInfo, ErrorPayload, ObjectId};
+use scion_core::ObjectId;
 use scion_object::{Canonical, RepoPath};
-use scion_proto::{convert, error_from_status, status_from_error, v1};
+use scion_proto::{convert, status_from_error, v1};
 use scion_server::AppContext;
 use scion_server::context::CallerCtx;
 use scion_server::handlers;
 use scion_store::BlobStore;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use tonic::Status;
 
-use crate::authz::Action;
+use crate::authz::{Action, AdminCapability};
 use crate::repo_acl::ClaimOutcome;
 
+use crate::api_error::{ApiError, ApiResult};
 use crate::engine::Engine;
-use crate::http::{
-    AppState, SERVICE, authenticate, caller_request, error_response, status_response,
-};
+use crate::http::{AppState, SERVICE, authenticate, caller_request};
+
+mod repo;
+mod requests;
+mod responses;
+
+use repo::{repo_engine, valid_repo_name};
+use requests::*;
+use responses::*;
 
 /// Default ref the push/pull/commits endpoints address.
 const DEFAULT_REF: &str = "main";
@@ -66,139 +72,55 @@ const DEFAULT_REF: &str = "main";
 const DEFAULT_LIMIT: u32 = 100;
 /// Largest page this façade forwards; upstream clamps to the same value.
 const MAX_LIMIT: u32 = 1000;
-/// Delta op for a Put (`1`).
-const DELTA_PUT: u32 = 1;
 
 // ---------------------------------------------------------------------------------------------
-// Shared helpers
+// Shared helpers: authorization
 // ---------------------------------------------------------------------------------------------
 
-/// `POST /repos/{repo}/init` creates a repository, so the name becomes a path segment, a
-/// `repos.name` row and a log field. Lowercase keeps it URL- and policy-predictable; the
-/// dot rules keep a name from becoming a path traversal if a later layer ever uses it as one.
-fn valid_repo_name(name: &str) -> bool {
-    crate::repo_acl::valid_repo_name(name)
-}
-
-/// The engine for an addressed repository, or 404. Reads never create a repository: a typo in
-/// a path must not mint one.
-async fn repo_engine(state: &AppState, repo: &str) -> Result<Arc<Engine>, Response> {
-    if let Some(engine) = state.engine_for(repo) {
-        return Ok(engine);
-    }
-    // The process may not have booted this repository yet (a different Vercel instance, or a
-    // restart). Boot it only if the `repos` row already exists, so a typo still cannot create a
-    // repository as a side effect of a read.
-    let Some(db) = &state.db else {
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "repository registry is unavailable",
-        ));
-    };
-    let client = db.get().await.map_err(|error| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            &format!("repository registry connection: {error}"),
-        )
-    })?;
-    let exists = client
-        .query_opt("SELECT 1 FROM repos WHERE name = $1", &[&repo])
+/// Run the Scion/Culebra A/B decision for one request (W6). Scion is authoritative in the
+/// default mode; see `authz.rs` for the combination rules.
+async fn authorize(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    action: Action,
+    path: Option<&str>,
+    ref_name: Option<&str>,
+) -> ApiResult<()> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    match state
+        .authz
+        .authorize(&policy, &caller.principal, repo, action, path, ref_name)
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                &format!("repository registry query: {error}"),
-            )
-        })?;
-    if exists.is_none() {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("repository {repo:?} does not exist; POST /repos/{repo}/init first"),
-        ));
+    {
+        Ok(decision) if decision.allow => Ok(()),
+        Ok(decision) => Err(ApiError::permission_denied(decision.reason)),
+        Err(status) => Err(ApiError::from(status)),
     }
-    state
-        .engines
-        .get_or_boot(&state.config, repo)
+}
+
+/// Repository provisioning (`init`) runs before the repository has an owner, so it evaluates the
+/// path/ref policy only; the owner is claimed immediately after the engine boots (FVCS-01).
+async fn authorize_provisioning(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    action: Action,
+) -> ApiResult<()> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    match state
+        .authz
+        .authorize_provisioning(&policy, &caller.principal, repo, action, Some("/"), None)
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "unavailable",
-                &format!("booting repository {repo:?}: {error:#}"),
-            )
-        })
-}
-
-fn bad_json(rejection: JsonRejection) -> Response {
-    error_response(
-        StatusCode::BAD_REQUEST,
-        "invalid_argument",
-        &rejection.body_text(),
-    )
-}
-
-fn bad_query(rejection: QueryRejection) -> Response {
-    error_response(
-        StatusCode::BAD_REQUEST,
-        "invalid_argument",
-        &rejection.body_text(),
-    )
-}
-
-/// The JSON name of a `scion.v1` item status.
-fn item_status(status: i32) -> &'static str {
-    match status {
-        x if x == v1::ItemStatus::Ok as i32 => "ok",
-        x if x == v1::ItemStatus::NotFound as i32 => "not_found",
-        x if x == v1::ItemStatus::Denied as i32 => "denied",
-        x if x == v1::ItemStatus::Redacted as i32 => "redacted",
-        _ => "unspecified",
+    {
+        Ok(decision) if decision.allow => Ok(()),
+        Ok(decision) => Err(ApiError::permission_denied(decision.reason)),
+        Err(status) => Err(ApiError::from(status)),
     }
-}
-
-/// The JSON name of a `scion.v1` payload encoding.
-fn encoding_name(encoding: i32) -> &'static str {
-    match encoding {
-        x if x == v1::Encoding::Raw as i32 => "raw",
-        x if x == v1::Encoding::Zstd as i32 => "zstd",
-        _ => "unspecified",
-    }
-}
-
-fn timestamp_json(timestamp: Option<&v1::Timestamp>) -> Value {
-    timestamp.map_or(Value::Null, |t| {
-        json!({
-            "seconds": t.seconds,
-            "tz_offset_minutes": t.tz_offset_minutes,
-        })
-    })
-}
-
-fn bytes_text(bytes: &[u8]) -> String {
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
-fn id_text(bytes: &[u8]) -> String {
-    ObjectId::from_bytes(bytes).map_or_else(|_| hex::encode(bytes), |id| id.to_text())
-}
-
-fn parse_id(raw: &str, field: &str) -> Result<ObjectId, String> {
-    ObjectId::parse_text(raw).map_err(|error| format!("{field}: {}", error.message))
-}
-
-fn parse_change_id(raw: &str) -> Result<Vec<u8>, String> {
-    let bytes = hex::decode(raw).map_err(|error| format!("change_id is not hex: {error}"))?;
-    if bytes.len() != 16 {
-        return Err(format!(
-            "change_id must be 16 bytes (32 hex digits), got {} bytes",
-            bytes.len()
-        ));
-    }
-    Ok(bytes)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -211,76 +133,29 @@ fn parse_change_id(raw: &str) -> Result<Vec<u8>, String> {
 /// root changeset and ref `main`, so this is a real initialization rather than a row insert.
 /// Idempotent: a second call returns `created:false` with the same refs.
 ///
-/// Authorization is `write` on `/` under the current policy. There is no dedicated
-/// `admin.repos` permission yet (ADR-0002 D6), and the check runs on the verifier engine's
-/// policy because the target engine does not exist until after it.
-/// Run the Scion/Culebra A/B decision for one request (W6). Scion is authoritative in the
-/// default mode; see `authz.rs` for the combination rules.
-async fn authorize(
-    state: &Arc<AppState>,
-    engine: &Arc<Engine>,
-    caller: &CallerCtx,
-    repo: &str,
-    action: Action,
-    path: Option<&str>,
-    ref_name: Option<&str>,
-) -> Result<(), Response> {
-    let app = engine.context();
-    let policy = app.policy.current();
-    match state
-        .authz
-        .authorize(&policy, &caller.principal, repo, action, path, ref_name)
-        .await
-    {
-        Ok(decision) if decision.allow => Ok(()),
-        Ok(decision) => Err(status_response(Status::permission_denied(decision.reason))),
-        Err(status) => Err(status_response(status)),
-    }
-}
-
-/// Repository provisioning (`init`) runs before the repository has an owner, so it evaluates the
-/// path/ref policy only; the owner is claimed immediately after the engine boots (FVCS-01).
-async fn authorize_provisioning(
-    state: &Arc<AppState>,
-    engine: &Arc<Engine>,
-    caller: &CallerCtx,
-    repo: &str,
-    action: Action,
-) -> Result<(), Response> {
-    let app = engine.context();
-    let policy = app.policy.current();
-    match state
-        .authz
-        .authorize_provisioning(&policy, &caller.principal, repo, action, Some("/"), None)
-        .await
-    {
-        Ok(decision) if decision.allow => Ok(()),
-        Ok(decision) => Err(status_response(Status::permission_denied(decision.reason))),
-        Err(status) => Err(status_response(status)),
-    }
-}
-
+/// Authorization is `write` on `/` under the current policy, plus `admin.repos`
+/// ([`AdminCapability::Repositories`]) when the request would create the repository. The check
+/// runs on the verifier engine's policy because the target engine does not exist until after it.
 pub(crate) async fn init(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if !valid_repo_name(&repo) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
+        return ApiError::invalid_argument(
             "repository names must be 1-100 lowercase [a-z0-9._-] characters, not start with \
              '.', and not contain '..'",
-        );
+        )
+        .into_response();
     }
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) =
+    if let Err(error) =
         authorize_provisioning(&state, &auth_engine, &caller, &repo, Action::Write).await
     {
-        return response;
+        return error.into_response();
     }
     let app = auth_engine.context();
     if !app
@@ -288,50 +163,38 @@ pub(crate) async fn init(
         .current()
         .can_write(&caller.principal, &RepoPath::root())
     {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-            "creating a repository requires write on /",
-        );
+        return ApiError::permission_denied("creating a repository requires write on /")
+            .into_response();
     }
 
     let created = state.engine_for(&repo).is_none();
     // Repository lifecycle is a DevOps seat, not a worker permission: workers check in, read
-    // and merge-base, but creating (and, when implemented, deleting) a repository needs the
-    // single `admin.refs` seat. `admin.refs` is the closest existing upstream permission to a
-    // DevOps capability; a dedicated `admin.repos` permit would be an engine-version change.
+    // and merge-base, but creating and deleting a repository needs `admin.repos`
+    // (`AdminCapability::Repositories`). `admin.refs` is upstream's permit for creating and
+    // deleting refs; it is never substituted for repository authority.
     if created
         && !app
             .policy
             .current()
-            .can_admin(&caller.principal, scion_policy::AdminPerm::Repos)
+            .can_admin(&caller.principal, AdminCapability::Repositories.permit())
     {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "permission_denied",
+        return ApiError::permission_denied(
             "creating a repository requires the DevOps seat (admin.repos)",
-        );
+        )
+        .into_response();
     }
     let engine = if created {
         match state.engines.get_or_boot(&state.config, &repo).await {
             Ok(engine) => engine,
             Err(error) => {
-                return error_response(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "unavailable",
-                    &format!("{error:#}"),
-                );
+                return ApiError::unavailable(format!("{error:#}")).into_response();
             }
         }
     } else {
         match state.engine_for(&repo) {
             Some(engine) => engine,
             None => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    "engine vanished",
-                );
+                return ApiError::internal("engine vanished").into_response();
             }
         }
     };
@@ -345,16 +208,15 @@ pub(crate) async fn init(
             if !app
                 .policy
                 .current()
-                .can_admin(&caller.principal, scion_policy::AdminPerm::Repos)
+                .can_admin(&caller.principal, AdminCapability::Repositories.permit())
             {
-                return error_response(
-                    StatusCode::FORBIDDEN,
-                    "permission_denied",
-                    &format!("repository {repo:?} is owned by {owner}"),
-                );
+                return ApiError::permission_denied(format!(
+                    "repository {repo:?} is owned by {owner}"
+                ))
+                .into_response();
             }
         }
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     }
 
     match list_refs(&engine, &caller).await {
@@ -369,7 +231,7 @@ pub(crate) async fn init(
             })),
         )
             .into_response(),
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -382,23 +244,18 @@ pub(crate) async fn init(
 /// Upstream has no `ListRefs` RPC; `MetaStore::list_refs` is the same strong read `ResolveRef`
 /// uses. The policy check is upstream's repository-read rule (`read` on `/`), spelled once here
 /// because there is no handler to carry it.
-async fn list_refs(engine: &Arc<Engine>, caller: &CallerCtx) -> Result<Vec<Value>, Response> {
+async fn list_refs(engine: &Arc<Engine>, caller: &CallerCtx) -> ApiResult<Vec<Value>> {
     let app = engine.context();
     if !app
         .policy
         .current()
         .can_read(&caller.principal, &RepoPath::root())
     {
-        return Err(status_response(Status::permission_denied(
+        return Err(ApiError::permission_denied(
             "repository read (read on /) denied",
-        )));
+        ));
     }
-    let rows = app
-        .storage
-        .meta
-        .list_refs()
-        .await
-        .map_err(|error| status_response(status_from_error(&error)))?;
+    let rows = app.storage.meta.list_refs().await.map_err(ApiError::from)?;
     Ok(rows
         .iter()
         .map(|row| {
@@ -418,13 +275,13 @@ pub(crate) async fn refs(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -435,7 +292,7 @@ pub(crate) async fn refs(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     match list_refs(&engine, &caller).await {
         Ok(refs) => (
@@ -448,34 +305,13 @@ pub(crate) async fn refs(
             })),
         )
             .into_response(),
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Resolve + Log, shared by GET /commits and POST /pull
 // ---------------------------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CommitsQuery {
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    #[serde(default = "default_limit")]
-    limit: u32,
-    path: Option<String>,
-    #[serde(default)]
-    first_parent_only: bool,
-    /// Opaque continuation from a previous `next_page_token`, hex-encoded.
-    page_token: Option<String>,
-}
-
-fn default_ref() -> String {
-    DEFAULT_REF.to_owned()
-}
-
-fn default_limit() -> u32 {
-    DEFAULT_LIMIT
-}
 
 /// Resolve `ref_name` and return the first page of its log.
 async fn resolve_and_log(
@@ -486,15 +322,11 @@ async fn resolve_and_log(
     path: Option<&str>,
     first_parent_only: bool,
     page_token: Option<&str>,
-) -> Result<(String, u64, Vec<Value>, Option<String>), Response> {
+) -> ApiResult<(String, u64, Vec<Value>, Option<String>)> {
     let app = engine.context();
     let page_token = match page_token {
         Some(raw) if !raw.is_empty() => hex::decode(raw).map_err(|error| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                &format!("page_token is not hex: {error}"),
-            )
+            ApiError::invalid_argument(format!("page_token is not hex: {error}"))
         })?,
         _ => Vec::new(),
     };
@@ -509,10 +341,9 @@ async fn resolve_and_log(
         ),
     )
     .await
-    .map_err(status_response)?
+    .map_err(ApiError::from)?
     .into_inner();
-    let target = ObjectId::from_bytes(&resolved.target)
-        .map_err(|error| status_response(status_from_error(&error)))?;
+    let target = ObjectId::from_bytes(&resolved.target).map_err(ApiError::from)?;
     let log = handlers::history_query::log(
         &app,
         caller_request(
@@ -527,72 +358,11 @@ async fn resolve_and_log(
         ),
     )
     .await
-    .map_err(status_response)?
+    .map_err(ApiError::from)?
     .into_inner();
     let commits = log_entries(&log.entries)?;
     let next = (!log.next_page_token.is_empty()).then(|| hex::encode(&log.next_page_token));
     Ok((target.to_text(), resolved.version, commits, next))
-}
-
-/// One `Log` entry as JSON. The id, parents and change id come from the canonical changeset
-/// when the entry is unfiltered; a filtered view already carries the readable fields.
-fn log_entries(entries: &[v1::LogEntry]) -> Result<Vec<Value>, Response> {
-    let mut out = Vec::with_capacity(entries.len());
-    for entry in entries {
-        let Some(item) = &entry.changeset else {
-            continue;
-        };
-        let (parents, root_tree, change_id, filtered) = match &item.view {
-            Some(v1::changeset_item::View::Encoded(bytes)) => {
-                let changeset = scion_object::Changeset::decode(bytes)
-                    .map_err(|error| status_response(status_from_error(&error)))?;
-                (
-                    changeset
-                        .parents
-                        .iter()
-                        .map(ObjectId::to_text)
-                        .collect::<Vec<_>>(),
-                    Some(changeset.root_tree.to_text()),
-                    Some(hex::encode(changeset.change_id.0)),
-                    false,
-                )
-            }
-            Some(v1::changeset_item::View::FilteredView(view)) => (
-                view.parents.iter().map(|raw| id_text(raw)).collect(),
-                (!view.root_tree.is_empty()).then(|| id_text(&view.root_tree)),
-                (!view.change_id.is_empty()).then(|| hex::encode(&view.change_id)),
-                view.filtered,
-            ),
-            None => (Vec::new(), None, None, false),
-        };
-        let meta = entry.meta.as_ref().map_or(Value::Null, |meta| {
-            let author = (!meta.redacted).then(|| bytes_text(&meta.author));
-            let committer = if meta.redacted {
-                None
-            } else {
-                meta.committer.as_ref().map(|c| bytes_text(c))
-            };
-            let message = (!meta.redacted).then(|| bytes_text(&meta.message));
-            json!({
-                "redacted": meta.redacted,
-                "author": author,
-                "author_time": timestamp_json(meta.author_time.as_ref()),
-                "committer": committer,
-                "committer_time": timestamp_json(meta.committer_time.as_ref()),
-                "message": message,
-                "meta_id": id_text(&meta.meta_id),
-            })
-        });
-        out.push(json!({
-            "id": id_text(&item.id),
-            "parents": parents,
-            "root_tree": root_tree,
-            "change_id": change_id,
-            "filtered": filtered,
-            "meta": meta,
-        }));
-    }
-    Ok(out)
 }
 
 /// `GET /repos/{repo}/commits?ref=main&limit=100[&path=…][&first_parent_only=true]`.
@@ -604,17 +374,17 @@ pub(crate) async fn commits(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -625,7 +395,7 @@ pub(crate) async fn commits(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     match resolve_and_log(
         &engine,
@@ -652,29 +422,13 @@ pub(crate) async fn commits(
             })),
         )
             .into_response(),
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // POST /repos/{repo}/pull
 // ---------------------------------------------------------------------------------------------
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PullBody {
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    #[serde(default = "default_limit")]
-    limit: u32,
-    path: Option<String>,
-    #[serde(default)]
-    first_parent_only: bool,
-    /// Opaque continuation from a previous `next_page_token`, hex-encoded.
-    page_token: Option<String>,
-    /// Object ids whose bytes should accompany the history. Empty means metadata only.
-    #[serde(default)]
-    objects: Vec<String>,
-}
 
 struct ObjectAccum {
     status: i32,
@@ -701,15 +455,13 @@ async fn fetch_objects(
     engine: &Arc<Engine>,
     caller: &CallerCtx,
     ids: &[String],
-) -> Result<Vec<Value>, Response> {
+) -> ApiResult<Vec<Value>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let mut parsed = Vec::with_capacity(ids.len());
     for raw in ids {
-        parsed.push(parse_id(raw, "objects[]").map_err(|message| {
-            error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message)
-        })?);
+        parsed.push(parse_id(raw, "objects[]").map_err(ApiError::invalid_argument)?);
     }
     let app = engine.context();
     let mut stream = handlers::object::get_objects(
@@ -728,12 +480,12 @@ async fn fetch_objects(
         ),
     )
     .await
-    .map_err(status_response)?
+    .map_err(ApiError::from)?
     .into_inner();
 
     let mut chunks: BTreeMap<Vec<u8>, ObjectAccum> = BTreeMap::new();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(status_response)?;
+        let chunk = chunk.map_err(ApiError::from)?;
         let accum = chunks.entry(chunk.id.clone()).or_default();
         accum.status = chunk.status;
         accum.encoding = chunk.encoding;
@@ -774,17 +526,17 @@ pub(crate) async fn pull(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -795,7 +547,7 @@ pub(crate) async fn pull(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let history = resolve_and_log(
         &engine,
@@ -809,11 +561,11 @@ pub(crate) async fn pull(
     .await;
     let (target, version, commits, next_page_token) = match history {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let objects = match fetch_objects(&engine, &caller, &body.objects).await {
         Ok(objects) => objects,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     (
         StatusCode::OK,
@@ -841,80 +593,6 @@ pub(crate) async fn pull(
 // policy, redaction filtering and path validation remain upstream's.
 // ---------------------------------------------------------------------------------------------
 
-fn delta_json(delta: &[v1::DeltaEntryMsg]) -> Vec<Value> {
-    delta
-        .iter()
-        .map(|entry| {
-            json!({
-                "path": bytes_text(&entry.path),
-                "op": entry.op,
-                "mode": entry.mode,
-                "id": (!entry.id.is_empty()).then(|| id_text(&entry.id)),
-                "size": entry.size,
-            })
-        })
-        .collect()
-}
-
-fn entry_json(entry: Option<&v1::EntryInfo>) -> Value {
-    entry.map_or(Value::Null, |entry| {
-        json!({
-            "mode": entry.mode,
-            "id": id_text(&entry.id),
-            "size": entry.size,
-        })
-    })
-}
-
-/// One `ChangesetItem` as JSON. Encoded items are decoded to their canonical fields; a filtered
-/// view already carries only the caller-readable delta entries.
-fn changeset_json(item: &v1::ChangesetItem) -> Result<Value, Response> {
-    let id = id_text(&item.id);
-    match &item.view {
-        Some(v1::changeset_item::View::Encoded(bytes)) => {
-            let changeset = scion_object::Changeset::decode(bytes)
-                .map_err(|error| status_response(status_from_error(&error)))?;
-            Ok(json!({
-                "id": id,
-                "parents": changeset.parents.iter().map(ObjectId::to_text).collect::<Vec<_>>(),
-                "root_tree": changeset.root_tree.to_text(),
-                "change_id": hex::encode(changeset.change_id.0),
-                "filtered": false,
-                "delta": delta_json(&convert::delta_to_proto(&changeset.delta)),
-            }))
-        }
-        Some(v1::changeset_item::View::FilteredView(view)) => Ok(json!({
-            "id": id,
-            "parents": view.parents.iter().map(|raw| id_text(raw)).collect::<Vec<_>>(),
-            "root_tree": id_text(&view.root_tree),
-            "change_id": hex::encode(&view.change_id),
-            "filtered": view.filtered,
-            "delta": delta_json(&view.delta),
-        })),
-        None => Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "changeset item has no view",
-        )),
-    }
-}
-
-fn diff_item_json(item: &v1::DiffItem) -> Value {
-    json!({
-        "path": bytes_text(&item.path),
-        "old": entry_json(item.old_entry.as_ref()),
-        "new": entry_json(item.new_entry.as_ref()),
-        "binary": item.binary,
-        "hunks": item.hunks.iter().map(|hunk| json!({
-            "old_start": hunk.old_start,
-            "old_lines": hunk.old_lines,
-            "new_start": hunk.new_start,
-            "new_lines": hunk.new_lines,
-            "lines": hunk.lines.iter().map(|line| bytes_text(line)).collect::<Vec<_>>(),
-        })).collect::<Vec<_>>(),
-    })
-}
-
 /// `GET /repos/{repo}/changesets/{id}` — one changeset, decoded.
 pub(crate) async fn changeset(
     State(state): State<Arc<AppState>>,
@@ -923,19 +601,19 @@ pub(crate) async fn changeset(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let id = match parse_id(&id, "changeset") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -946,7 +624,7 @@ pub(crate) async fn changeset(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let response = match handlers::query::get_changesets(
@@ -961,21 +639,13 @@ pub(crate) async fn changeset(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let Some(item) = response.items.first() else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("changeset {id} not found"),
-        );
+        return ApiError::not_found(format!("changeset {id} not found")).into_response();
     };
     if item.status != v1::ItemStatus::Ok as i32 {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("changeset {id} not found"),
-        );
+        return ApiError::not_found(format!("changeset {id} not found")).into_response();
     }
     match changeset_json(item) {
         Ok(changeset) => (
@@ -988,15 +658,8 @@ pub(crate) async fn changeset(
             })),
         )
             .into_response(),
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct FileQuery {
-    changeset: String,
-    #[serde(default)]
-    path: String,
 }
 
 /// `GET /repos/{repo}/file?changeset=<id>&path=<path>` — file bytes at a changeset.
@@ -1008,24 +671,24 @@ pub(crate) async fn file(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let changeset = match parse_id(&query.changeset, "changeset") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let path = query.path;
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -1036,7 +699,7 @@ pub(crate) async fn file(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let mut stream = match handlers::query::read_path(
@@ -1052,7 +715,7 @@ pub(crate) async fn file(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let mut entry = None;
     let mut data = Vec::new();
@@ -1064,7 +727,7 @@ pub(crate) async fn file(
                 }
                 data.extend_from_slice(&chunk.data);
             }
-            Err(status) => return status_response(status),
+            Err(status) => return ApiError::from(status).into_response(),
         }
     }
     (
@@ -1083,13 +746,6 @@ pub(crate) async fn file(
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct TreeQuery {
-    changeset: String,
-    #[serde(default)]
-    path: String,
-}
-
 /// `GET /repos/{repo}/tree?changeset=<id>&path=<dir>` — one directory's entries.
 pub(crate) async fn tree(
     State(state): State<Arc<AppState>>,
@@ -1099,17 +755,17 @@ pub(crate) async fn tree(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -1124,12 +780,12 @@ pub(crate) async fn tree(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let changeset = match parse_id(&query.changeset, "changeset") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let app = engine.context();
@@ -1146,7 +802,7 @@ pub(crate) async fn tree(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let entries: Vec<Value> = tree
         .entries
@@ -1176,20 +832,6 @@ pub(crate) async fn tree(
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct DiffQuery {
-    a: Option<String>,
-    b: String,
-    /// Comma-separated paths; empty/absent means the whole tree.
-    paths: Option<String>,
-    #[serde(default = "default_true")]
-    include_hunks: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-
 /// `GET /repos/{repo}/diff?a=<changeset>&b=<changeset>[&paths=a,b][&include_hunks=true]`.
 pub(crate) async fn diff(
     State(state): State<Arc<AppState>>,
@@ -1199,21 +841,21 @@ pub(crate) async fn diff(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let a = match query.a.as_deref() {
         Some(raw) if !raw.is_empty() => match parse_id(raw, "a") {
             Ok(id) => Some(id),
             Err(message) => {
-                return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                return ApiError::invalid_argument(message).into_response();
             }
         },
         _ => None,
@@ -1221,7 +863,7 @@ pub(crate) async fn diff(
     let b = match parse_id(&query.b, "b") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let paths: Vec<Vec<u8>> = query
@@ -1232,7 +874,7 @@ pub(crate) async fn diff(
         .filter(|path| !path.is_empty())
         .map(|path| path.as_bytes().to_vec())
         .collect();
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -1243,7 +885,7 @@ pub(crate) async fn diff(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let mut stream = match handlers::query::diff(
@@ -1261,13 +903,13 @@ pub(crate) async fn diff(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let mut items = Vec::new();
     while let Some(item) = stream.next().await {
         match item {
             Ok(item) => items.push(diff_item_json(&item)),
-            Err(status) => return status_response(status),
+            Err(status) => return ApiError::from(status).into_response(),
         }
     }
     (
@@ -1284,12 +926,6 @@ pub(crate) async fn diff(
         .into_response()
 }
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct MergeBaseQuery {
-    a: String,
-    b: String,
-}
-
 /// `GET /repos/{repo}/merge-base?a=<changeset>&b=<changeset>`.
 pub(crate) async fn merge_base(
     State(state): State<Arc<AppState>>,
@@ -1299,29 +935,29 @@ pub(crate) async fn merge_base(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let a = match parse_id(&query.a, "a") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let b = match parse_id(&query.b, "b") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -1332,7 +968,7 @@ pub(crate) async fn merge_base(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let response = match handlers::query::merge_base(
@@ -1348,7 +984,7 @@ pub(crate) async fn merge_base(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let bases: Vec<String> = response.bases.iter().map(|raw| id_text(raw)).collect();
     (
@@ -1369,455 +1005,37 @@ pub(crate) async fn merge_base(
 // POST /repos/{repo}/push
 // ---------------------------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-pub(crate) struct ObjectUpload {
-    id: String,
-    /// `0x01` blob or `0x02` tree. Defaults to the kind encoded in the id.
-    kind: Option<u32>,
-    /// Base64 of the raw bytes (a blob's content or a tree's canonical encoding).
-    data: String,
-}
-
-impl ObjectUpload {
-    fn into_proto(self) -> Result<v1::UploadItem, String> {
-        let id = parse_id(&self.id, "objects[].id")?;
-        let kind = self.kind.unwrap_or(u32::from(id.kind().byte()));
-        let data = BASE64
-            .decode(self.data.as_bytes())
-            .map_err(|error| format!("objects[{}]: data is not base64: {error}", self.id))?;
-        Ok(v1::UploadItem {
-            id: id.as_bytes().to_vec(),
-            kind,
-            data,
-        })
-    }
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct TimeBody {
-    #[serde(default)]
-    seconds: i64,
-    #[serde(default)]
-    tz_offset_minutes: i64,
-}
-
-impl TimeBody {
-    fn into_proto(self) -> v1::Timestamp {
-        v1::Timestamp {
-            seconds: self.seconds,
-            tz_offset_minutes: self.tz_offset_minutes,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ExtensionBody {
-    tag: u64,
-    /// The extension value as UTF-8 bytes. Binary extensions are not part of the v1 façade.
-    value: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct MetaBody {
-    /// `author <email>` in UTF-8, matching upstream's bytes field.
-    author: String,
-    author_time: Option<TimeBody>,
-    committer: Option<String>,
-    committer_time: Option<TimeBody>,
-    message: String,
-    #[serde(default)]
-    extensions: Vec<ExtensionBody>,
-}
-
-impl MetaBody {
-    fn into_proto(self) -> v1::MetaFields {
-        v1::MetaFields {
-            author: self.author.into_bytes(),
-            author_time: Some(self.author_time.unwrap_or_default().into_proto()),
-            committer: self.committer.map(String::into_bytes),
-            committer_time: self.committer_time.map(TimeBody::into_proto),
-            message: self.message.into_bytes(),
-            extensions: self
-                .extensions
-                .into_iter()
-                .map(|extension| v1::Extension {
-                    tag: extension.tag,
-                    value: extension.value.into_bytes(),
-                })
-                .collect(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct DeltaBody {
-    /// Repository path, UTF-8 (SPEC 4.3.4; paths are sorted ascending by the caller).
-    path: String,
-    /// `1` Put, `2` Delete.
-    #[serde(default = "put_op")]
-    op: u32,
-    /// `1` File, `2` Executable, `3` Symlink for a Put.
-    #[serde(default = "file_mode")]
-    mode: u32,
-    /// Blob id for a Put; empty for a Delete.
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    size: u64,
-}
-
-fn put_op() -> u32 {
-    DELTA_PUT
-}
-
-fn file_mode() -> u32 {
-    1
-}
-
-impl DeltaBody {
-    fn into_proto(self) -> Result<v1::DeltaEntryMsg, String> {
-        let id = if self.id.is_empty() {
-            Vec::new()
-        } else {
-            parse_id(&self.id, "changeset.delta[].id")?
-                .as_bytes()
-                .to_vec()
-        };
-        if self.op == DELTA_PUT && id.is_empty() {
-            return Err("changeset.delta[].id is required for a put".to_owned());
-        }
-        Ok(v1::DeltaEntryMsg {
-            path: self.path.into_bytes(),
-            op: self.op,
-            mode: self.mode,
-            id,
-            size: self.size,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ChangesetBody {
-    #[serde(default)]
-    parents: Vec<String>,
-    #[serde(default)]
-    delta: Vec<DeltaBody>,
-    meta: MetaBody,
-    /// 16 bytes as 32 hex digits.
-    change_id: String,
-    expected_root_tree: Option<String>,
-    #[serde(default)]
-    import_mode: bool,
-}
-
-impl ChangesetBody {
-    fn into_proto(self) -> Result<v1::CreateChangesetRequest, String> {
-        let parents = self
-            .parents
-            .iter()
-            .map(|raw| parse_id(raw, "changeset.parents[]"))
-            .collect::<Result<Vec<_>, _>>()?;
-        let delta = self
-            .delta
-            .into_iter()
-            .map(DeltaBody::into_proto)
-            .collect::<Result<Vec<_>, _>>()?;
-        let expected_root_tree = self
-            .expected_root_tree
-            .as_deref()
-            .map(|raw| parse_id(raw, "changeset.expected_root_tree"))
-            .transpose()?
-            .map(|id| id.as_bytes().to_vec());
-        Ok(v1::CreateChangesetRequest {
-            parents: parents.iter().map(convert::id_bytes).collect(),
-            delta,
-            meta_fields: Some(self.meta.into_proto()),
-            change_id: parse_change_id(&self.change_id)?,
-            expected_root_tree,
-            import_mode: self.import_mode,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PushBody {
-    #[serde(default)]
-    objects: Vec<ObjectUpload>,
-    changeset: ChangesetBody,
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    /// `land` (default), `update` or `none`.
-    #[serde(default = "default_push_mode")]
-    mode: String,
-    /// For `update`: the ref version the caller observed.
-    #[serde(default)]
-    expected_version: u64,
-    #[serde(default)]
-    allow_non_fast_forward: bool,
-    /// For `land`: tolerate an EMPTY_CHANGE rebase result.
-    #[serde(default)]
-    allow_empty: bool,
-}
-
-fn default_push_mode() -> String {
-    "land".to_owned()
-}
-
-/// `POST /repos/{repo}/refs` — create a ref at an existing changeset.
-#[derive(Debug, Deserialize)]
-pub(crate) struct RefCreateBody {
-    name: String,
-    target: String,
-    #[serde(default)]
-    reason: String,
-}
-
-/// `POST /repos/{repo}/rebase` — rebase one changeset onto another.
-#[derive(Debug, Deserialize)]
-pub(crate) struct RebaseBody {
-    changeset: String,
-    onto: String,
-}
-
-/// `POST /repos/{repo}/merge` — produce a merge changeset from two changesets.
-#[derive(Debug, Deserialize)]
-pub(crate) struct MergeBody {
-    a: String,
-    b: String,
-    meta: MetaBody,
-    change_id: String,
-}
-
-/// `POST /repos/{repo}/land` — publish an existing changeset on a ref.
-#[derive(Debug, Deserialize)]
-pub(crate) struct LandBody {
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    head: String,
-    #[serde(default)]
-    allow_empty: bool,
-}
-
-/// `POST /repos/{repo}/merge-land` — merge a head into the ref tip and land the result.
-#[derive(Debug, Deserialize)]
-pub(crate) struct MergeLandBody {
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    head: String,
-    #[serde(default)]
-    author: Option<String>,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(default)]
-    change_id: Option<String>,
-}
-
-/// `POST /repos/{repo}/conflict-context` — the three readable sides of a refused merge/rebase.
-#[derive(Debug, Deserialize)]
-pub(crate) struct ConflictContextBody {
-    #[serde(default)]
-    a: Option<String>,
-    #[serde(default)]
-    b: Option<String>,
-    #[serde(default)]
-    changeset: Option<String>,
-    #[serde(default)]
-    onto: Option<String>,
-}
-
-/// `POST /repos/{repo}/conflicts/escalate` — file a stuck merge/rebase for the DevOps seat.
-#[derive(Debug, Deserialize)]
-pub(crate) struct EscalateBody {
-    #[serde(rename = "ref", default = "default_ref")]
-    ref_name: String,
-    head: String,
-    #[serde(default)]
-    onto: Option<String>,
-    #[serde(default)]
-    base: Option<String>,
-    #[serde(default)]
-    note: Option<String>,
-    #[serde(default)]
-    report: Option<Value>,
-}
-
-/// `GET /repos/{repo}/conflicts?status=…`
-#[derive(Debug, Deserialize)]
-pub(crate) struct ConflictQueueQuery {
-    #[serde(default)]
-    status: Option<String>,
-}
-
-/// `POST /repos/{repo}/conflicts/{id}/resolve`
-#[derive(Debug, Deserialize)]
-pub(crate) struct ResolveEscalationBody {
-    #[serde(default)]
-    resolution: Option<String>,
-}
-
-/// `DELETE /repos/{repo}` — the body must repeat the repository name.
-#[derive(Debug, Deserialize)]
-pub(crate) struct DeleteRepoBody {
-    confirm: String,
-}
-
-/// `DELETE /repos/{repo}/conflicts?status=…`
-#[derive(Debug, Deserialize)]
-pub(crate) struct ClearConflictsQuery {
-    #[serde(default)]
-    status: Option<String>,
-}
-
-/// `POST /admin/gc/objects` — dry-run unless `apply` is true.
-#[derive(Debug, Deserialize)]
-pub(crate) struct GcBody {
-    #[serde(default)]
-    apply: bool,
-    /// Explicit legacy prefix to purge instead of the orphan sweep (e.g. `forgevcs-ci/`).
-    #[serde(default)]
-    prefix: Option<String>,
-}
-
-/// One exported object key and its bytes (base64). Keys are store-relative
-/// (`r|q/<repo_id>/<kind>/<fan>/<hex>`).
-#[derive(Debug, Deserialize, serde::Serialize)]
-pub(crate) struct BlobEntry {
-    key: String,
-    data: String,
-}
-
-/// `POST /repos/{repo}/blobs/import`
-#[derive(Debug, Deserialize)]
-pub(crate) struct BlobImportBody {
-    entries: Vec<BlobEntry>,
-}
-
-fn grpc_frames(items: &[v1::UploadItem]) -> Vec<u8> {
-    let mut framed = Vec::new();
-    for item in items {
-        let message = item.encode_to_vec();
-        let length = u32::try_from(message.len()).unwrap_or(u32::MAX);
-        framed.push(0);
-        framed.extend_from_slice(&length.to_be_bytes());
-        framed.extend_from_slice(&message);
-    }
-    framed
-}
-
-/// `Streaming<UploadItem>` over the bytes the handler would have received from tonic.
-///
-/// `UploadObjects` is the one write handler with a streaming request. The façade already holds
-/// every item in memory (the REST body is not streamed), so it builds the five-byte gRPC frame
-/// header and the prost payloads itself and lets tonic decode them. No upload rule is copied.
-fn upload_stream(items: Vec<v1::UploadItem>) -> tonic::Streaming<v1::UploadItem> {
-    let body = axum::body::Body::from(grpc_frames(&items));
-    tonic::codec::Streaming::new_request(
-        tonic_prost::ProstCodec::<v1::UploadItem, v1::UploadItem>::raw_decoder(Default::default()),
-        body,
-        None,
-        None,
-    )
-}
-
-fn uploads_json(results: &[v1::UploadResult]) -> Vec<Value> {
-    results
-        .iter()
-        .map(|result| {
-            json!({
-                "id": id_text(&result.id),
-                "status": item_status(result.status),
-                "error_code": result.error_code,
-                "message": result.message,
-            })
-        })
-        .collect()
-}
-
-fn upload_failed_response(results: &[v1::UploadResult]) -> Response {
-    let failed: Vec<&v1::UploadResult> = results
-        .iter()
-        .filter(|result| result.status != v1::ItemStatus::Ok as i32)
-        .collect();
-    let ids: Vec<&str> = failed
-        .iter()
-        .map(|result| result.error_code.as_str())
-        .collect();
-    (
-        StatusCode::BAD_REQUEST,
-        Json(json!({
-            "service": SERVICE,
-            "status": "error",
-            "code": "upload_failed",
-            "message": format!(
-                "{} of {} object(s) failed validation: {}",
-                failed.len(),
-                results.len(),
-                ids.join(", ")
-            ),
-            "uploads": uploads_json(results),
-        })),
-    )
-        .into_response()
-}
-
-fn landed_json(landed: &[v1::LandedEntry]) -> Vec<Value> {
-    landed
-        .iter()
-        .map(|entry| {
-            json!({
-                "change_id": hex::encode(&entry.change_id),
-                "source": id_text(&entry.source),
-                "result": id_text(&entry.result),
-            })
-        })
-        .collect()
-}
-
 /// Advancing the trunk ref is the DevOps seat's entitlement, independent of path writes and of
 /// the ref rule: both must allow it. Workers check in on their own refs; they do not land to the
 /// trunk.
 fn require_devops(
     engine: &Arc<Engine>,
     caller: &CallerCtx,
-    permission: scion_policy::AdminPerm,
+    capability: AdminCapability,
     message: &str,
-) -> Result<(), Response> {
+) -> ApiResult<()> {
     let app = engine.context();
     if app
         .policy
         .current()
-        .can_admin(&caller.principal, permission)
+        .can_admin(&caller.principal, capability.permit())
     {
         Ok(())
     } else {
-        Err(error_response(
-            StatusCode::FORBIDDEN,
-            "permission_denied",
-            message,
-        ))
+        Err(ApiError::permission_denied(message))
     }
 }
 
-fn require_trunk(engine: &Arc<Engine>, caller: &CallerCtx, ref_name: &str) -> Result<(), Response> {
+fn require_trunk(engine: &Arc<Engine>, caller: &CallerCtx, ref_name: &str) -> ApiResult<()> {
     if ref_name != DEFAULT_REF {
         return Ok(());
     }
     require_devops(
         engine,
         caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "advancing the trunk ref requires the DevOps seat (admin.trunk)",
     )
-}
-
-/// The repository paths one push writes: every changeset delta path. The façade authorizes each
-/// one (FVCS-02), and upstream's `create_changeset` checks the same paths again (defense in depth).
-fn push_delta_paths(changeset: &ChangesetBody) -> Vec<String> {
-    changeset
-        .delta
-        .iter()
-        .map(|delta| delta.path.clone())
-        .collect()
 }
 
 /// `POST /repos/{repo}/push` — upload objects, create a changeset, then land or update a ref.
@@ -1834,22 +1052,19 @@ pub(crate) async fn push(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     if !matches!(body.mode.as_str(), "land" | "update" | "none") {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "mode must be one of land, update, none",
-        );
+        return ApiError::invalid_argument("mode must be one of land, update, none")
+            .into_response();
     }
     let PushBody {
         objects,
@@ -1866,9 +1081,9 @@ pub(crate) async fn push(
     let delta_paths = push_delta_paths(&changeset);
 
     if matches!(mode.as_str(), "land" | "update")
-        && let Err(response) = require_trunk(&engine, &caller, &ref_name)
+        && let Err(error) = require_trunk(&engine, &caller, &ref_name)
     {
-        return response;
+        return error.into_response();
     }
 
     let policy = engine.context().policy.current();
@@ -1878,8 +1093,8 @@ pub(crate) async fn push(
         .await
     {
         Ok(decision) if decision.allow => {}
-        Ok(decision) => return status_response(Status::permission_denied(decision.reason)),
-        Err(status) => return status_response(status),
+        Ok(decision) => return ApiError::permission_denied(decision.reason).into_response(),
+        Err(status) => return ApiError::from(status).into_response(),
     }
 
     let mut uploads = Vec::with_capacity(objects.len());
@@ -1887,14 +1102,14 @@ pub(crate) async fn push(
         match object.into_proto() {
             Ok(item) => uploads.push(item),
             Err(message) => {
-                return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                return ApiError::invalid_argument(message).into_response();
             }
         }
     }
     let changeset = match changeset.into_proto() {
         Ok(changeset) => changeset,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
 
@@ -1904,7 +1119,7 @@ pub(crate) async fn push(
         let request = caller_request(upload_stream(uploads), &caller);
         match handlers::upload::upload_objects(&app, request).await {
             Ok(response) => upload_results = response.into_inner().results,
-            Err(status) => return status_response(status),
+            Err(status) => return ApiError::from(status).into_response(),
         }
         if upload_results
             .iter()
@@ -1917,11 +1132,11 @@ pub(crate) async fn push(
     let created =
         match handlers::write::create_changeset(&app, caller_request(changeset, &caller)).await {
             Ok(response) => response.into_inner(),
-            Err(status) => return status_response(status),
+            Err(status) => return ApiError::from(status).into_response(),
         };
     let changeset_id = match ObjectId::from_bytes(&created.changeset_id) {
         Ok(id) => id,
-        Err(error) => return status_response(status_from_error(&error)),
+        Err(error) => return ApiError::from(&error).into_response(),
     };
     let root_tree = ObjectId::from_bytes(&created.root_tree)
         .map(|id| id.to_text())
@@ -1949,7 +1164,7 @@ pub(crate) async fn push(
                         "version": response.into_inner().version,
                     });
                 }
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             }
         }
         "land" => {
@@ -1968,15 +1183,12 @@ pub(crate) async fn push(
                     });
                     landed = json!(landed_json(&response.landed));
                 }
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             }
         }
         _ => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                "mode must be one of land, update, none",
-            );
+            return ApiError::invalid_argument("mode must be one of land, update, none")
+                .into_response();
         }
     }
 
@@ -2021,20 +1233,20 @@ pub(crate) async fn ref_create(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let target = match parse_id(&body.target, "target") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let request = v1::CreateRefRequest {
@@ -2056,7 +1268,7 @@ pub(crate) async fn ref_create(
             )
                 .into_response()
         }
-        Err(status) => status_response(status),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -2072,26 +1284,26 @@ pub(crate) async fn rebase(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let changeset = match parse_id(&body.changeset, "changeset") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let onto = match parse_id(&body.onto, "onto") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let request = v1::RebaseRequest {
@@ -2112,7 +1324,7 @@ pub(crate) async fn rebase(
             )
                 .into_response()
         }
-        Err(status) => status_response(status),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -2128,32 +1340,32 @@ pub(crate) async fn merge(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let a = match parse_id(&body.a, "a") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let b = match parse_id(&body.b, "b") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let change_id = match parse_change_id(&body.change_id) {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let request = v1::MergeRequest {
@@ -2176,7 +1388,7 @@ pub(crate) async fn merge(
             )
                 .into_response()
         }
-        Err(status) => status_response(status),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -2195,23 +1407,23 @@ pub(crate) async fn land(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_trunk(&engine, &caller, &body.ref_name) {
-        return response;
+    if let Err(error) = require_trunk(&engine, &caller, &body.ref_name) {
+        return error.into_response();
     }
     let head = match parse_id(&body.head, "head") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let request = v1::LandRequest {
@@ -2238,18 +1450,7 @@ pub(crate) async fn land(
             )
                 .into_response()
         }
-        Err(status) => status_response(status),
-    }
-}
-
-fn merge_land_meta(author: &str, message: &str) -> v1::MetaFields {
-    v1::MetaFields {
-        author: author.as_bytes().to_vec(),
-        author_time: Some(v1::Timestamp::default()),
-        committer: None,
-        committer_time: None,
-        message: message.as_bytes().to_vec(),
-        extensions: Vec::new(),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -2278,23 +1479,23 @@ pub(crate) async fn merge_land(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_trunk(&engine, &caller, &body.ref_name) {
-        return response;
+    if let Err(error) = require_trunk(&engine, &caller, &body.ref_name) {
+        return error.into_response();
     }
     let head = match parse_id(&body.head, "head") {
         Ok(value) => value,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let app = engine.context();
@@ -2312,11 +1513,11 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let tip = match ObjectId::from_bytes(&resolved.target) {
         Ok(id) => id,
-        Err(error) => return status_response(status_from_error(&error)),
+        Err(error) => return ApiError::from(&error).into_response(),
     };
 
     let author = body
@@ -2331,7 +1532,7 @@ pub(crate) async fn merge_land(
         Some(raw) => match parse_change_id(raw) {
             Ok(id) => id,
             Err(message) => {
-                return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                return ApiError::invalid_argument(message).into_response();
             }
         },
         None => uuid::Uuid::new_v4().into_bytes().to_vec(),
@@ -2343,7 +1544,7 @@ pub(crate) async fn merge_land(
             v1::MergeRequest {
                 a: convert::id_bytes(&tip),
                 b: convert::id_bytes(&head),
-                meta_fields: Some(merge_land_meta(&author, &message)),
+                meta_fields: Some(derived_meta(&author, &message)),
                 change_id: merge_change_id,
             },
             &caller,
@@ -2352,11 +1553,11 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let merged_id = match ObjectId::from_bytes(&merged.changeset_id) {
         Ok(id) => id,
-        Err(error) => return status_response(status_from_error(&error)),
+        Err(error) => return ApiError::from(&error).into_response(),
     };
 
     let changesets = match handlers::query::get_changesets(
@@ -2371,38 +1572,31 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let Some(item) = changesets.items.first() else {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("merge changeset {merged_id} not found"),
-        );
+        return ApiError::not_found(format!("merge changeset {merged_id} not found"))
+            .into_response();
     };
     if item.status != v1::ItemStatus::Ok as i32 {
-        return error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("merge changeset {merged_id} not found"),
-        );
+        return ApiError::not_found(format!("merge changeset {merged_id} not found"))
+            .into_response();
     }
     let delta = match &item.view {
         Some(v1::changeset_item::View::FilteredView(view)) => {
             if view.filtered {
-                return error_response(
-                    StatusCode::CONFLICT,
-                    "conflict",
+                return ApiError::conflict(
                     "the merge delta includes a path this principal cannot read; refusing to \
                      publish a partial tree",
-                );
+                )
+                .into_response();
             }
             view.delta.clone()
         }
         Some(v1::changeset_item::View::Encoded(bytes)) => {
             let changeset = match scion_object::Changeset::decode(bytes) {
                 Ok(changeset) => changeset,
-                Err(error) => return status_response(status_from_error(&error)),
+                Err(error) => return ApiError::from(&error).into_response(),
             };
             changeset
                 .delta
@@ -2411,11 +1605,8 @@ pub(crate) async fn merge_land(
                 .collect()
         }
         None => {
-            return error_response(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                &format!("merge changeset {merged_id} has no view"),
-            );
+            return ApiError::not_found(format!("merge changeset {merged_id} has no view"))
+                .into_response();
         }
     };
 
@@ -2425,7 +1616,7 @@ pub(crate) async fn merge_land(
             v1::CreateChangesetRequest {
                 parents: vec![convert::id_bytes(&tip)],
                 delta,
-                meta_fields: Some(merge_land_meta(&author, &message)),
+                meta_fields: Some(derived_meta(&author, &message)),
                 change_id: uuid::Uuid::new_v4().into_bytes().to_vec(),
                 expected_root_tree: None,
                 import_mode: false,
@@ -2436,11 +1627,11 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
     let linear_id = match ObjectId::from_bytes(&linear.changeset_id) {
         Ok(id) => id,
-        Err(error) => return status_response(status_from_error(&error)),
+        Err(error) => return ApiError::from(&error).into_response(),
     };
 
     let landed = match handlers::write::land(
@@ -2457,7 +1648,7 @@ pub(crate) async fn merge_land(
     .await
     {
         Ok(response) => response.into_inner(),
-        Err(status) => return status_response(status),
+        Err(status) => return ApiError::from(status).into_response(),
     };
 
     (
@@ -2477,37 +1668,6 @@ pub(crate) async fn merge_land(
         })),
     )
         .into_response()
-}
-
-/// Largest version body embedded in a conflict-context response; larger side is described by
-/// `size` and left for a `/file` read.
-const MAX_CONTEXT_BYTES: usize = 1 << 20;
-
-fn entry_info_json(entry: Option<&EntryInfo>) -> Value {
-    match entry {
-        None => Value::Null,
-        Some(entry) => json!({
-            "mode": entry.mode as u8,
-            "id": entry.id.to_text(),
-            "size": entry.size,
-        }),
-    }
-}
-
-fn version_json(data: Option<Vec<u8>>) -> Value {
-    match data {
-        None => json!({ "present": false }),
-        Some(bytes) if bytes.len() > MAX_CONTEXT_BYTES => json!({
-            "present": true,
-            "size": bytes.len(),
-            "truncated": true,
-        }),
-        Some(bytes) => json!({
-            "present": true,
-            "size": bytes.len(),
-            "data": BASE64.encode(&bytes),
-        }),
-    }
 }
 
 /// Read one path at one changeset; `None` when the path is not in that tree.
@@ -2582,30 +1742,6 @@ async fn changeset_parents(
     }
 }
 
-fn conflict_report_of(status: &Status) -> Option<ConflictReport> {
-    if status.code() != tonic::Code::FailedPrecondition && status.code() != tonic::Code::Aborted {
-        return None;
-    }
-    match error_from_status(status).payload {
-        ErrorPayload::MergeConflict(report) => Some(*report),
-        _ => None,
-    }
-}
-
-fn conflict_hunks_json(conflict: &scion_core::Conflict) -> Value {
-    json!(
-        conflict
-            .hunks
-            .iter()
-            .map(|hunk| json!({
-                "base":   { "start": hunk.base.start,   "end": hunk.base.end },
-                "ours":   { "start": hunk.ours.start,   "end": hunk.ours.end },
-                "theirs": { "start": hunk.theirs.start, "end": hunk.theirs.end },
-            }))
-            .collect::<Vec<_>>()
-    )
-}
-
 /// `POST /repos/{repo}/conflict-context` — the three sides of a refused merge or rebase.
 ///
 /// A `409 conflict` from `merge`, `merge-land`, `rebase` or a contended `land` carries the
@@ -2632,15 +1768,15 @@ pub(crate) async fn conflict_context(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let app = engine.context();
 
@@ -2649,13 +1785,13 @@ pub(crate) async fn conflict_context(
             let a = match parse_id(raw_a, "a") {
                 Ok(id) => id,
                 Err(message) => {
-                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                    return ApiError::invalid_argument(message).into_response();
                 }
             };
             let b = match parse_id(raw_b, "b") {
                 Ok(id) => id,
                 Err(message) => {
-                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                    return ApiError::invalid_argument(message).into_response();
                 }
             };
             let bases = match handlers::query::merge_base(
@@ -2671,20 +1807,19 @@ pub(crate) async fn conflict_context(
             .await
             {
                 Ok(response) => response.into_inner().bases,
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             };
             let base = match bases.as_slice() {
                 [] => None,
                 [one] => match ObjectId::from_bytes(one) {
                     Ok(id) => Some(id),
-                    Err(error) => return status_response(status_from_error(&error)),
+                    Err(error) => return ApiError::from(&error).into_response(),
                 },
                 _ => {
-                    return error_response(
-                        StatusCode::CONFLICT,
-                        "conflict",
+                    return ApiError::conflict(
                         "the two changesets have more than one best common ancestor",
-                    );
+                    )
+                    .into_response();
                 }
             };
             let merged = handlers::write::merge(
@@ -2693,7 +1828,7 @@ pub(crate) async fn conflict_context(
                     v1::MergeRequest {
                         a: convert::id_bytes(&a),
                         b: convert::id_bytes(&b),
-                        meta_fields: Some(merge_land_meta(
+                        meta_fields: Some(derived_meta(
                             "ForgeVCS conflict context <conflict@example.test>",
                             "conflict context",
                         )),
@@ -2714,7 +1849,7 @@ pub(crate) async fn conflict_context(
                 ),
                 Err(status) => match conflict_report_of(&status) {
                     Some(report) => ("merge", base, a, b, Some(report), None),
-                    None => return status_response(status),
+                    None => return ApiError::from(status).into_response(),
                 },
             }
         } else if let (Some(raw_changeset), Some(raw_onto)) =
@@ -2723,25 +1858,24 @@ pub(crate) async fn conflict_context(
             let changeset = match parse_id(raw_changeset, "changeset") {
                 Ok(id) => id,
                 Err(message) => {
-                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                    return ApiError::invalid_argument(message).into_response();
                 }
             };
             let onto = match parse_id(raw_onto, "onto") {
                 Ok(id) => id,
                 Err(message) => {
-                    return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+                    return ApiError::invalid_argument(message).into_response();
                 }
             };
             let parents = match changeset_parents(&app, &caller, &changeset).await {
                 Ok(parents) => parents,
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             };
             let [parent] = parents.as_slice() else {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_argument",
+                return ApiError::invalid_argument(
                     "rebase context requires a single-parent changeset",
-                );
+                )
+                .into_response();
             };
             let rebased = handlers::write::rebase(
                 &app,
@@ -2765,15 +1899,12 @@ pub(crate) async fn conflict_context(
                 ),
                 Err(status) => match conflict_report_of(&status) {
                     Some(report) => ("rebase", Some(*parent), onto, changeset, Some(report), None),
-                    None => return status_response(status),
+                    None => return ApiError::from(status).into_response(),
                 },
             }
         } else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                "provide a+b (merge) or changeset+onto (rebase)",
-            );
+            return ApiError::invalid_argument("provide a+b (merge) or changeset+onto (rebase)")
+                .into_response();
         };
 
     let mut conflicts = Vec::new();
@@ -2782,16 +1913,16 @@ pub(crate) async fn conflict_context(
         for conflict in &report.conflicts {
             let base_data = match read_version(&app, &caller, base.as_ref(), &conflict.path).await {
                 Ok(data) => data,
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             };
             let ours_data = match read_version(&app, &caller, Some(&ours), &conflict.path).await {
                 Ok(data) => data,
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             };
             let theirs_data = match read_version(&app, &caller, Some(&theirs), &conflict.path).await
             {
                 Ok(data) => data,
-                Err(status) => return status_response(status),
+                Err(status) => return ApiError::from(status).into_response(),
             };
             conflicts.push(json!({
                 "path": String::from_utf8_lossy(&conflict.path).into_owned(),
@@ -2845,12 +1976,8 @@ pub(crate) async fn conflict_context(
 // agent re-reads the three sides with `/conflict-context`.
 // ---------------------------------------------------------------------------------------------
 
-fn queue_unavailable() -> Response {
-    error_response(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "unavailable",
-        "the conflict queue needs FORGEVCS_DATABASE_URL",
-    )
+fn queue_unavailable() -> ApiError {
+    ApiError::unavailable("the conflict queue needs FORGEVCS_DATABASE_URL")
 }
 
 /// `POST /repos/{repo}/conflicts/escalate` — file a stuck merge/rebase. Workers may escalate.
@@ -2862,20 +1989,20 @@ pub(crate) async fn escalate_conflict(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let head = match parse_id(&body.head, "head") {
         Ok(id) => id.to_text(),
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let optional_id = |raw: Option<&str>, field: &str| -> Result<Option<String>, String> {
@@ -2885,16 +2012,16 @@ pub(crate) async fn escalate_conflict(
     let onto = match optional_id(body.onto.as_deref(), "onto") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
     let base = match optional_id(body.base.as_deref(), "base") {
         Ok(id) => id,
         Err(message) => {
-            return error_response(StatusCode::BAD_REQUEST, "invalid_argument", &message);
+            return ApiError::invalid_argument(message).into_response();
         }
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -2905,10 +2032,10 @@ pub(crate) async fn escalate_conflict(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::insert(
         pool,
@@ -2933,7 +2060,7 @@ pub(crate) async fn escalate_conflict(
             })),
         )
             .into_response(),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -2946,34 +2073,31 @@ pub(crate) async fn list_conflicts(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &engine,
         &caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "reading the conflict queue requires the DevOps seat (admin.trunk)",
     ) {
-        return response;
+        return error.into_response();
     }
     let status = query.status.unwrap_or_else(|| "open".to_owned());
     if !crate::escalations::valid_status(&status) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "status must be one of open, claimed, resolved, all",
-        );
+        return ApiError::invalid_argument("status must be one of open, claimed, resolved, all")
+            .into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::list(pool, &repo, &status).await {
         Ok(rows) => (
@@ -2987,7 +2111,7 @@ pub(crate) async fn list_conflicts(
             })),
         )
             .into_response(),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -2999,29 +2123,25 @@ pub(crate) async fn claim_conflict(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &engine,
         &caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "claiming a conflict requires the DevOps seat (admin.trunk)",
     ) {
-        return response;
+        return error.into_response();
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "id is not a UUID",
-        );
+        return ApiError::invalid_argument("id is not a UUID").into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::claim(pool, &repo, &id, &caller.principal.to_string()).await {
         Ok(Some(row)) => (
@@ -3034,12 +2154,9 @@ pub(crate) async fn claim_conflict(
             })),
         )
             .into_response(),
-        Ok(None) => error_response(
-            StatusCode::CONFLICT,
-            "conflict",
-            "escalation is not open (already claimed or resolved)",
-        ),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Ok(None) => ApiError::conflict("escalation is not open (already claimed or resolved)")
+            .into_response(),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -3052,33 +2169,29 @@ pub(crate) async fn resolve_conflict(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &engine,
         &caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "resolving a conflict requires the DevOps seat (admin.trunk)",
     ) {
-        return response;
+        return error.into_response();
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "id is not a UUID",
-        );
+        return ApiError::invalid_argument("id is not a UUID").into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::resolve(
         pool,
@@ -3099,12 +2212,8 @@ pub(crate) async fn resolve_conflict(
             })),
         )
             .into_response(),
-        Ok(None) => error_response(
-            StatusCode::CONFLICT,
-            "conflict",
-            "escalation is already resolved or absent",
-        ),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Ok(None) => ApiError::conflict("escalation is already resolved or absent").into_response(),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -3135,60 +2244,38 @@ const SCION_REPO_TABLES: [&str; 13] = [
     "audit_log",
 ];
 
-async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Response> {
-    let mut client = pool.get().await.map_err(|error| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            &format!("deleting repository: {error}"),
-        )
-    })?;
-    let tx = client.transaction().await.map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            &format!("deleting repository: {error}"),
-        )
-    })?;
+async fn delete_repository_rows(pool: &Pool, repo: &str) -> ApiResult<Value> {
+    let mut client = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::unavailable(format!("deleting repository: {error}")))?;
+    let tx = client
+        .transaction()
+        .await
+        .map_err(|error| ApiError::internal(format!("deleting repository: {error}")))?;
     let row = tx
         .query_opt("SELECT repo_id FROM repos WHERE name = $1", &[&repo])
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("reading repository: {error}"),
-            )
-        })?;
+        .map_err(|error| ApiError::internal(format!("reading repository: {error}")))?;
     let Some(row) = row else {
-        return Err(error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("repository {repo} not found"),
-        ));
+        return Err(ApiError::not_found(format!("repository {repo} not found")));
     };
     let repo_id: i64 = row.get(0);
     let mut rows = serde_json::Map::new();
     for table in SCION_REPO_TABLES {
         let sql = format!("DELETE FROM {table} WHERE repo_id = $1");
-        let removed = tx.execute(&sql, &[&repo_id]).await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("deleting {table}: {error}"),
-            )
-        })?;
+        let removed = tx
+            .execute(&sql, &[&repo_id])
+            .await
+            .map_err(|error| ApiError::internal(format!("deleting {table}: {error}")))?;
         rows.insert(table.to_owned(), json!(removed));
     }
     for table in ["forgevcs_workspaces", "forgevcs_conflict_escalations"] {
         let sql = format!("DELETE FROM {table} WHERE repo = $1");
-        let removed = tx.execute(&sql, &[&repo]).await.map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("deleting {table}: {error}"),
-            )
-        })?;
+        let removed = tx
+            .execute(&sql, &[&repo])
+            .await
+            .map_err(|error| ApiError::internal(format!("deleting {table}: {error}")))?;
         rows.insert(table.to_owned(), json!(removed));
     }
     // FVCS-01: repository deletion releases the owner row in the same transaction, so a later
@@ -3199,38 +2286,20 @@ async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Respon
             &[&repo],
         )
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("deleting forgevcs_repo_acl: {error}"),
-            )
-        })?;
+        .map_err(|error| ApiError::internal(format!("deleting forgevcs_repo_acl: {error}")))?;
     rows.insert("forgevcs_repo_acl".to_owned(), json!(removed_owner));
     let removed = tx
         .execute("DELETE FROM repos WHERE repo_id = $1", &[&repo_id])
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("deleting the repository row: {error}"),
-            )
-        })?;
+        .map_err(|error| ApiError::internal(format!("deleting the repository row: {error}")))?;
     if removed != 1 {
-        return Err(error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
+        return Err(ApiError::internal(
             "the repository row changed during deletion",
         ));
     }
-    tx.commit().await.map_err(|error| {
-        error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            &format!("committing repository deletion: {error}"),
-        )
-    })?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::internal(format!("committing repository deletion: {error}")))?;
     Ok(json!({
         "deleted": true,
         "repo": repo,
@@ -3243,21 +2312,21 @@ async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Respon
 pub(crate) async fn list_repos(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Repos,
+        AdminCapability::Repositories,
         "listing repositories requires the DevOps seat (admin.repos)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     let Ok(client) = pool.get().await else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     let rows = match client
         .query(
@@ -3268,11 +2337,7 @@ pub(crate) async fn list_repos(State(state): State<Arc<AppState>>, headers: Head
     {
         Ok(rows) => rows,
         Err(error) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("listing repositories: {error}"),
-            );
+            return ApiError::internal(format!("listing repositories: {error}")).into_response();
         }
     };
     let repos: Vec<Value> = rows
@@ -3301,29 +2366,26 @@ pub(crate) async fn delete_repo(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Repos,
+        AdminCapability::Repositories,
         "deleting a repository requires the DevOps seat (admin.repos)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     if body.confirm != repo {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "confirm must equal the repository name",
-        );
+        return ApiError::invalid_argument("confirm must equal the repository name")
+            .into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match delete_repository_rows(pool, &repo).await {
         Ok(deleted) => {
@@ -3334,7 +2396,7 @@ pub(crate) async fn delete_repo(
             )
                 .into_response()
         }
-        Err(response) => response,
+        Err(error) => error.into_response(),
     }
 }
 
@@ -3348,30 +2410,27 @@ pub(crate) async fn clear_conflicts(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "clearing the conflict queue requires the DevOps seat (admin.trunk)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let status = query.status.unwrap_or_else(|| "resolved".to_owned());
     if !crate::escalations::valid_status(&status) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "status must be one of open, claimed, resolved, all",
-        );
+        return ApiError::invalid_argument("status must be one of open, claimed, resolved, all")
+            .into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::clear(pool, &repo, &status).await {
         Ok(removed) => (
@@ -3385,7 +2444,7 @@ pub(crate) async fn clear_conflicts(
             })),
         )
             .into_response(),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -3397,25 +2456,21 @@ pub(crate) async fn delete_conflict(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Trunk,
+        AdminCapability::Trunk,
         "clearing a conflict requires the DevOps seat (admin.trunk)",
     ) {
-        return response;
+        return error.into_response();
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "id is not a UUID",
-        );
+        return ApiError::invalid_argument("id is not a UUID").into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     match crate::escalations::delete(pool, &repo, &id).await {
         Ok(true) => (
@@ -3423,8 +2478,8 @@ pub(crate) async fn delete_conflict(
             Json(json!({ "service": SERVICE, "status": "ok", "repo": repo, "cleared": id })),
         )
             .into_response(),
-        Ok(false) => error_response(StatusCode::NOT_FOUND, "not_found", "escalation not found"),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Ok(false) => ApiError::not_found("escalation not found").into_response(),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -3441,33 +2496,29 @@ pub(crate) async fn gc_objects(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Repos,
+        AdminCapability::Repositories,
         "object garbage collection requires the DevOps seat (admin.repos)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let Some(s3) = state.config.s3_config() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "object storage is not configured",
-        );
+        return ApiError::unavailable("object storage is not configured").into_response();
     };
     let blobs = match scion_store_s3::S3BlobStore::new(s3) {
         Ok(blobs) => blobs,
-        Err(error) => return status_response(status_from_error(&error)),
+        Err(error) => return ApiError::from(&error).into_response(),
     };
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     let report = match body.prefix.as_deref() {
         Some(prefix) => crate::gc::purge_prefix(&blobs, prefix, body.apply).await,
@@ -3493,7 +2544,7 @@ pub(crate) async fn gc_objects(
             })),
         )
             .into_response(),
-        Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal", &error),
+        Err(error) => ApiError::internal(error).into_response(),
     }
 }
 
@@ -3505,44 +2556,24 @@ pub(crate) async fn gc_objects(
 // are confined to the repository's own two areas (`r/<repo_id>/`, `q/<repo_id>/`).
 // ---------------------------------------------------------------------------------------------
 
-async fn repo_id_for(pool: &Pool, repo: &str) -> Result<i64, Response> {
-    let client = pool.get().await.map_err(|error| {
-        error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            &format!("backup: database: {error}"),
-        )
-    })?;
+async fn repo_id_for(pool: &Pool, repo: &str) -> ApiResult<i64> {
+    let client = pool
+        .get()
+        .await
+        .map_err(|error| ApiError::unavailable(format!("backup: database: {error}")))?;
     let row = client
         .query_opt("SELECT repo_id FROM repos WHERE name = $1", &[&repo])
         .await
-        .map_err(|error| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("backup: reading repository: {error}"),
-            )
-        })?;
-    row.map(|row| row.get::<_, i64>(0)).ok_or_else(|| {
-        error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            &format!("repository {repo} not found"),
-        )
-    })
+        .map_err(|error| ApiError::internal(format!("backup: reading repository: {error}")))?;
+    row.map(|row| row.get::<_, i64>(0))
+        .ok_or_else(|| ApiError::not_found(format!("repository {repo} not found")))
 }
 
-fn store_for_backup(
-    config: &crate::config::Config,
-) -> Result<scion_store_s3::S3BlobStore, Response> {
+fn store_for_backup(config: &crate::config::Config) -> ApiResult<scion_store_s3::S3BlobStore> {
     let Some(s3) = config.s3_config() else {
-        return Err(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "unavailable",
-            "object storage is not configured",
-        ));
+        return Err(ApiError::unavailable("object storage is not configured"));
     };
-    scion_store_s3::S3BlobStore::new(s3).map_err(|error| status_response(status_from_error(&error)))
+    scion_store_s3::S3BlobStore::new(s3).map_err(|error| ApiError::from(&error))
 }
 
 /// `GET /repos/{repo}/blobs/export` — every external object of the repository, base64.
@@ -3553,26 +2584,26 @@ pub(crate) async fn export_blobs(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Repos,
+        AdminCapability::Repositories,
         "exporting object bytes requires the DevOps seat (admin.repos)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     let repo_id = match repo_id_for(pool, &repo).await {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let blobs = match store_for_backup(&state.config) {
         Ok(blobs) => blobs,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let mut entries = Vec::new();
     for area in ["r", "q"] {
@@ -3580,11 +2611,7 @@ pub(crate) async fn export_blobs(
         let keys = match blobs.list(&prefix).await {
             Ok(keys) => keys,
             Err(error) => {
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal",
-                    &format!("listing object keys: {error}"),
-                );
+                return ApiError::internal(format!("listing object keys: {error}")).into_response();
             }
         };
         for key in keys {
@@ -3592,11 +2619,7 @@ pub(crate) async fn export_blobs(
                 Ok(Some(bytes)) => bytes,
                 Ok(None) => continue,
                 Err(error) => {
-                    return error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "internal",
-                        &format!("reading {key}: {error}"),
-                    );
+                    return ApiError::internal(format!("reading {key}: {error}")).into_response();
                 }
             };
             entries.push(BlobEntry {
@@ -3627,56 +2650,49 @@ pub(crate) async fn import_blobs(
 ) -> Response {
     let (auth_engine, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_devops(
+    if let Err(error) = require_devops(
         &auth_engine,
         &caller,
-        scion_policy::AdminPerm::Repos,
+        AdminCapability::Repositories,
         "importing object bytes requires the DevOps seat (admin.repos)",
     ) {
-        return response;
+        return error.into_response();
     }
     let Some(pool) = state.db.as_ref() else {
-        return queue_unavailable();
+        return queue_unavailable().into_response();
     };
     let repo_id = match repo_id_for(pool, &repo).await {
         Ok(id) => id,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let live = format!("r/{repo_id}/");
     let quarantine = format!("q/{repo_id}/");
     for entry in &body.entries {
         if !entry.key.starts_with(&live) && !entry.key.starts_with(&quarantine) {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                &format!("key {} does not belong to repository {repo}", entry.key),
-            );
+            return ApiError::invalid_argument(format!(
+                "key {} does not belong to repository {repo}",
+                entry.key
+            ))
+            .into_response();
         }
     }
     let blobs = match store_for_backup(&state.config) {
         Ok(blobs) => blobs,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     for entry in &body.entries {
         let Ok(bytes) = BASE64.decode(entry.data.as_bytes()) else {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                &format!("entry {} is not base64", entry.key),
-            );
+            return ApiError::invalid_argument(format!("entry {} is not base64", entry.key))
+                .into_response();
         };
         if let Err(error) = blobs.put(&entry.key, bytes.into()).await {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                &format!("writing {}: {error}", entry.key),
-            );
+            return ApiError::internal(format!("writing {}: {error}", entry.key)).into_response();
         }
     }
     (
@@ -3699,103 +2715,54 @@ pub(crate) async fn import_blobs(
 // here because the internal principal is privileged.
 // ---------------------------------------------------------------------------------------------
 
-fn require_root_read(engine: &Arc<Engine>, caller: &CallerCtx) -> Result<(), Response> {
+fn require_root_read(engine: &Arc<Engine>, caller: &CallerCtx) -> ApiResult<()> {
     let app = engine.context();
     let policy = app.policy.current();
     if policy.can_read(&caller.principal, &RepoPath::root()) {
         Ok(())
     } else {
-        Err(status_response(Status::permission_denied(
+        Err(ApiError::permission_denied(
             "repository read (read on /) denied",
-        )))
+        ))
     }
 }
 
-fn require_root_write(engine: &Arc<Engine>, caller: &CallerCtx) -> Result<(), Response> {
+fn require_root_write(engine: &Arc<Engine>, caller: &CallerCtx) -> ApiResult<()> {
     let app = engine.context();
     let policy = app.policy.current();
     if policy.can_write(&caller.principal, &RepoPath::root()) {
         Ok(())
     } else {
-        Err(status_response(Status::permission_denied(
+        Err(ApiError::permission_denied(
             "repository write (write on /) denied",
-        )))
+        ))
     }
 }
 
-fn workspace_rev(changeset: Option<&str>, ref_name: Option<&str>) -> Result<String, Response> {
+fn workspace_rev(changeset: Option<&str>, ref_name: Option<&str>) -> ApiResult<String> {
     match changeset {
         Some(raw) => match parse_id(raw, "changeset") {
             Ok(id) => Ok(id.to_text()),
-            Err(message) => Err(error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                &message,
-            )),
+            Err(message) => Err(ApiError::invalid_argument(message)),
         },
         None => Ok(ref_name.unwrap_or(DEFAULT_REF).to_owned()),
     }
 }
 
-fn parse_sparse(sparse: &[String]) -> Result<Vec<RepoPath>, Response> {
+fn parse_sparse(sparse: &[String]) -> ApiResult<Vec<RepoPath>> {
     let mut paths = Vec::with_capacity(sparse.len());
     for raw in sparse {
         match RepoPath::parse(raw.as_bytes()) {
             Ok(path) => paths.push(path),
             Err(error) => {
-                return Err(error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_argument",
-                    &format!("sparse path {raw:?}: {}", error.message),
-                ));
+                return Err(ApiError::invalid_argument(format!(
+                    "sparse path {raw:?}: {}",
+                    error.message
+                )));
             }
         }
     }
     Ok(paths)
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceCreateBody {
-    #[serde(rename = "ref")]
-    ref_name: Option<String>,
-    changeset: Option<String>,
-    #[serde(default)]
-    sparse: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceMaterializeBody {
-    #[serde(rename = "ref")]
-    ref_name: Option<String>,
-    changeset: Option<String>,
-    #[serde(default)]
-    force: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceFileQuery {
-    path: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceWriteBody {
-    data: String,
-    #[serde(default = "default_write_mode")]
-    mode: u8,
-}
-
-fn default_write_mode() -> u8 {
-    1
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceSubmitBody {
-    message: String,
-    author: Option<String>,
-    #[serde(rename = "ref")]
-    ref_name: Option<String>,
-    #[serde(default = "default_push_mode")]
-    mode: String,
 }
 
 /// `POST /repos/{repo}/workspaces` — materialize a ref/changeset into a disposable workspace.
@@ -3807,16 +2774,16 @@ pub(crate) async fn workspace_create(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_root_read(&engine, &caller) {
-        return response;
+    if let Err(error) = require_root_read(&engine, &caller) {
+        return error.into_response();
     }
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -3827,19 +2794,19 @@ pub(crate) async fn workspace_create(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let rev = match workspace_rev(body.changeset.as_deref(), body.ref_name.as_deref()) {
         Ok(rev) => rev,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let sparse = match parse_sparse(&body.sparse) {
         Ok(sparse) => sparse,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     match engine.workspaces().create(&rev, sparse).await {
         Ok((workspace_id, workspace_state)) => (
@@ -3853,7 +2820,7 @@ pub(crate) async fn workspace_create(
             })),
         )
             .into_response(),
-        Err(status) => status_response(status),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -3865,16 +2832,16 @@ pub(crate) async fn workspace_status(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_root_read(&engine, &caller) {
-        return response;
+    if let Err(error) = require_root_read(&engine, &caller) {
+        return error.into_response();
     }
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -3885,7 +2852,7 @@ pub(crate) async fn workspace_status(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -3905,16 +2872,16 @@ pub(crate) async fn workspace_materialize(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_root_read(&engine, &caller) {
-        return response;
+    if let Err(error) = require_root_read(&engine, &caller) {
+        return error.into_response();
     }
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -3925,15 +2892,15 @@ pub(crate) async fn workspace_materialize(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let rev = match workspace_rev(body.changeset.as_deref(), body.ref_name.as_deref()) {
         Ok(rev) => rev,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let result = engine.workspaces().materialize(&id, &rev, body.force).await;
     workspace_result(repo, result)
@@ -3948,17 +2915,17 @@ pub(crate) async fn workspace_read_file(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -3969,7 +2936,7 @@ pub(crate) async fn workspace_read_file(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -3990,31 +2957,28 @@ pub(crate) async fn workspace_write_file(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     let data = match BASE64.decode(body.data.as_bytes()) {
         Ok(data) => data,
         Err(error) => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid_argument",
-                &format!("data is not base64: {error}"),
-            );
+            return ApiError::invalid_argument(format!("data is not base64: {error}"))
+                .into_response();
         }
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -4025,7 +2989,7 @@ pub(crate) async fn workspace_write_file(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -4052,17 +3016,17 @@ pub(crate) async fn workspace_delete_file(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -4073,7 +3037,7 @@ pub(crate) async fn workspace_delete_file(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -4093,20 +3057,20 @@ pub(crate) async fn workspace_diff(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Query(query) = match query {
         Ok(query) => query,
-        Err(rejection) => return bad_query(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if let Err(response) = require_root_read(&engine, &caller) {
-        return response;
+    if let Err(error) = require_root_read(&engine, &caller) {
+        return error.into_response();
     }
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -4117,7 +3081,7 @@ pub(crate) async fn workspace_diff(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -4126,16 +3090,6 @@ pub(crate) async fn workspace_diff(
         .diff(&id, query.context.min(100), &policy, &caller.principal)
         .await;
     workspace_result(repo, result)
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct WorkspaceDiffQuery {
-    #[serde(default = "default_context")]
-    context: usize,
-}
-
-fn default_context() -> usize {
-    3
 }
 
 /// `POST /repos/{repo}/workspaces/{id}/submit` — commit and optionally land.
@@ -4147,38 +3101,34 @@ pub(crate) async fn workspace_submit(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let Json(body) = match body {
         Ok(body) => body,
-        Err(rejection) => return bad_json(rejection),
+        Err(rejection) => return ApiError::from(rejection).into_response(),
     };
     if body.message.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_argument",
-            "message must not be empty",
-        );
+        return ApiError::invalid_argument("message must not be empty").into_response();
     }
     if matches!(body.mode.as_str(), "land" | "update")
-        && let Err(response) = require_trunk(
+        && let Err(error) = require_trunk(
             &engine,
             &caller,
             body.ref_name.as_deref().unwrap_or(DEFAULT_REF),
         )
     {
-        return response;
+        return error.into_response();
     }
     let ref_name = body.ref_name.as_deref().unwrap_or(DEFAULT_REF);
     let author = body
         .author
         .as_deref()
         .unwrap_or("ForgeVCS workspace <workspace@example.test>");
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -4189,7 +3139,7 @@ pub(crate) async fn workspace_submit(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     let app = engine.context();
     let policy = app.policy.current();
@@ -4218,16 +3168,16 @@ pub(crate) async fn workspace_destroy(
 ) -> Response {
     let (_, caller) = match authenticate(&state, &headers) {
         Ok(value) => value,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
-        Err(response) => return response,
+        Err(error) => return error.into_response(),
     };
-    if let Err(response) = require_root_write(&engine, &caller) {
-        return response;
+    if let Err(error) = require_root_write(&engine, &caller) {
+        return error.into_response();
     }
-    if let Err(response) = authorize(
+    if let Err(error) = authorize(
         &state,
         &engine,
         &caller,
@@ -4238,7 +3188,7 @@ pub(crate) async fn workspace_destroy(
     )
     .await
     {
-        return response;
+        return error.into_response();
     }
     match engine.workspaces().destroy(&id).await {
         Ok(()) => (
@@ -4252,23 +3202,7 @@ pub(crate) async fn workspace_destroy(
             })),
         )
             .into_response(),
-        Err(status) => status_response(status),
-    }
-}
-
-fn workspace_result(repo: String, result: Result<Value, Status>) -> Response {
-    match result {
-        Ok(value) => (
-            StatusCode::OK,
-            Json(json!({
-                "service": SERVICE,
-                "status": "ok",
-                "repo": repo,
-                "workspace": value,
-            })),
-        )
-            .into_response(),
-        Err(status) => status_response(status),
+        Err(status) => ApiError::from(status).into_response(),
     }
 }
 
@@ -4277,6 +3211,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+    use prost::Message as _;
 
     #[test]
     fn repo_names_reject_path_shaped_input() {

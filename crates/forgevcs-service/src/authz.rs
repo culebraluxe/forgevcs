@@ -86,6 +86,31 @@ impl Action {
     }
 }
 
+/// The DevOps capabilities the façade gates, and the single mapping from a capability to the
+/// engine `[admin]` permit it requires (SPEC 6.2).
+///
+/// Repository lifecycle is `admin.repos`, never `admin.refs`: `admin.refs` is upstream's permit
+/// for creating/deleting refs and is checked inside `RefService.CreateRef`; the façade does not
+/// substitute it for repository or trunk authority. Every ForgeVCS check reads `permit()`, so a
+/// code path cannot quietly drift to a different grant. `docs/M1-roles.md` mirrors this table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdminCapability {
+    /// Repository lifecycle and object administration — `admin.repos`.
+    Repositories,
+    /// Trunk advance and conflict-queue administration — `admin.trunk`.
+    Trunk,
+}
+
+impl AdminCapability {
+    /// The engine permit this capability requires.
+    pub fn permit(self) -> scion_policy::AdminPerm {
+        match self {
+            Self::Repositories => scion_policy::AdminPerm::Repos,
+            Self::Trunk => scion_policy::AdminPerm::Trunk,
+        }
+    }
+}
+
 /// One authorization outcome.
 #[derive(Clone, Debug)]
 pub struct Decision {
@@ -294,7 +319,7 @@ impl AuthorizationService {
         repository: &str,
         action: Action,
     ) -> Result<RepoDecision, Status> {
-        if policy.can_admin(principal, scion_policy::AdminPerm::Repos) {
+        if policy.can_admin(principal, AdminCapability::Repositories.permit()) {
             return Ok(RepoDecision::allow(
                 "repository administrator (admin.repos)",
             ));
@@ -543,6 +568,18 @@ mod tests {
         assert_eq!(AuthMode::parse(Some("CULEBRA_ONLY")), AuthMode::CulebraOnly);
         assert_eq!(AuthMode::parse(Some("nonsense")), AuthMode::ScionOnly);
         assert_eq!(AuthMode::DualEnforce.as_str(), "DUAL_ENFORCE");
+    }
+
+    #[test]
+    fn devops_capabilities_map_to_the_engine_permits() {
+        use scion_policy::AdminPerm;
+        // One mapping: repository lifecycle is `admin.repos`, trunk is `admin.trunk`.
+        assert_eq!(
+            AdminCapability::Repositories.permit(),
+            AdminPerm::Repos,
+            "repository lifecycle must use admin.repos, not admin.refs"
+        );
+        assert_eq!(AdminCapability::Trunk.permit(), AdminPerm::Trunk);
     }
 
     #[test]

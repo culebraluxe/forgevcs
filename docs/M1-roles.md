@@ -33,6 +33,12 @@ are `[admin]` grants, so a policy that does not name the DevOps principal denies
 façade checks `admin.repos` and `admin.trunk` at the request that would act; the gRPC surface
 cannot be used to bypass trunk advance because the `main` ref rule also names the DevOps group.
 
+**Single source of truth (code):** `crate::authz::AdminCapability` is the one mapping from a
+ForgeVCS-gated capability to its engine permit — `Repositories` → `admin.repos`, `Trunk` →
+`admin.trunk`. The façade gate and the repository-ACL admin bypass both read it, so repository
+lifecycle cannot silently drift to `admin.refs`; `admin.refs` stays upstream's permit for
+creating/deleting refs (checked inside `RefService.CreateRef`), not a repository grant.
+
 ## What is enforced in code vs policy
 
 - **Code:** `POST /repos/{repo}/init` refuses a principal without `admin.repos` when it would

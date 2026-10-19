@@ -211,7 +211,7 @@ no-token   HTTP 401  {"code":"unauthenticated","message":"missing bearer token",
 
 | Path | Change |
 | --- | --- |
-| `crates/forgevcs-service/src/facade.rs` | **new.** The five endpoints, their JSON shapes, the `UploadObjects` gRPC framing, and the `Log`/`GetObjects` collection helpers |
+| `crates/forgevcs-service/src/facade/` | **new.** The five endpoints, their JSON shapes, the `UploadObjects` gRPC framing, and the `Log`/`GetObjects` collection helpers |
 | `crates/forgevcs-service/src/http.rs` | `AppState.config`; `engine_for`/`auth_engine`; `authenticate` and `caller_request` shared by every endpoint; the five routes |
 | `crates/forgevcs-service/src/engine.rs` | `Engines::get_or_boot` — create-or-get for `POST /init`, with a second lock check so concurrent initializations converge |
 | `crates/forgevcs-service/src/main.rs` | keeps `Config` for `AppState` instead of moving it into `EngineHealth` |
