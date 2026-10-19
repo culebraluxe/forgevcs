@@ -154,7 +154,10 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/repos/{repo}/init", post(facade::init))
         .route("/repos/{repo}/push", post(facade::push))
         .route("/repos/{repo}/pull", post(facade::pull))
-        .route("/repos/{repo}/refs", get(facade::refs).post(facade::ref_create))
+        .route(
+            "/repos/{repo}/refs",
+            get(facade::refs).post(facade::ref_create),
+        )
         .route("/repos/{repo}/commits", get(facade::commits))
         .route("/repos/{repo}/changesets/{id}", get(facade::changeset))
         .route("/repos/{repo}/file", get(facade::file))
@@ -387,7 +390,11 @@ fn error_payload_json(payload: &ErrorPayload) -> Option<Value> {
     match payload {
         ErrorPayload::None => None,
         ErrorPayload::Subcode(subcode) => Some(json!({ "kind": "subcode", "subcode": subcode })),
-        ErrorPayload::Limit { name, limit, actual } => Some(json!({
+        ErrorPayload::Limit {
+            name,
+            limit,
+            actual,
+        } => Some(json!({
             "kind": "limit", "name": name, "limit": limit, "actual": actual
         })),
         ErrorPayload::MergeConflict(report) => Some(json!({

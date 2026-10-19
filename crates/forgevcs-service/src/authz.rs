@@ -5,6 +5,11 @@
 //! allow. `CULEBRA_ONLY` is accepted by configuration but not served by this façade: the
 //! vendored handlers still enforce Scion policy, so claiming Culebra-only would be false.
 //!
+//! Repository identity is a **separate mandatory layer** (FVCS-01): the vendored Scion policy is
+//! path/ref-scoped and cannot see a repository name, so [`AuthorizationService`] additionally
+//! evaluates [`RepoAcl`] and combines the two decisions with AND. `admin.repos` (the DevOps seat)
+//! bypasses the repository layer for administration, not the path/ref policy.
+//!
 //! Culebra decisions come from the existing CulebraLuxe tables on the same Neon database:
 //! `auth_identity → app_user → app_user_role → security_role → role_authority → authority`.
 //! Service principals have no Culebra identity yet, so Culebra denies them — which is exactly the
@@ -22,6 +27,7 @@ use scion_proto::status_from_error;
 use tonic::Status;
 
 use crate::config::Config;
+use crate::repo_acl::{ClaimOutcome, RepoAcl, RepoAction, RepoDecision};
 
 /// The `FORGEVCS_AUTH_MODE` values (work order §10).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,10 +113,25 @@ fn internal(error: impl std::fmt::Display) -> Status {
     Status::internal(error.to_string())
 }
 
+fn repo_acl_unavailable(error: String) -> Status {
+    // Fail closed: an ACL store that cannot answer is never an allow.
+    Status::unavailable(format!("repository ACL store unavailable: {error}"))
+}
+
+fn repo_action(action: Action) -> RepoAction {
+    match action {
+        Action::Read => RepoAction::Read,
+        Action::Write => RepoAction::Write,
+        Action::UpdateRef => RepoAction::UpdateRef,
+    }
+}
+
 /// The A/B authorization service shared by the façade.
 pub struct AuthorizationService {
     mode: AuthMode,
     pool: Option<Pool>,
+    /// Repository identity layer (FVCS-01), evaluated after the path/ref policy.
+    repo_acl: RepoAcl,
 }
 
 const CREATE_DECISIONS: &str = r#"
@@ -155,21 +176,36 @@ impl AuthorizationService {
     pub async fn from_config(config: &Config) -> Self {
         let mode = AuthMode::parse(config.auth_mode.as_deref());
         tracing::info!(mode = mode.as_str(), "authorization A/B mode parsed");
+        // Repository identity is independent of the A/B mode: it is mandatory in `SCION_ONLY`
+        // too (the hosted default), so it is built before the mode-specific early returns.
+        let repo_acl = RepoAcl::from_config(config).await;
         if mode == AuthMode::ScionOnly {
-            return Self { mode, pool: None };
+            return Self {
+                mode,
+                pool: None,
+                repo_acl,
+            };
         }
         let Some(url) = config.database_url.as_deref() else {
             tracing::error!(
                 mode = mode.as_str(),
                 "FORGEVCS_AUTH_MODE needs FORGEVCS_DATABASE_URL for Culebra decisions"
             );
-            return Self { mode, pool: None };
+            return Self {
+                mode,
+                pool: None,
+                repo_acl,
+            };
         };
         let pool = match crate::db::build_pool(url) {
             Ok(pool) => pool,
             Err(error) => {
                 tracing::error!(%error, "Culebra authorization pool did not start");
-                return Self { mode, pool: None };
+                return Self {
+                    mode,
+                    pool: None,
+                    repo_acl,
+                };
             }
         };
         if let Err(error) = ensure_schema(&pool).await {
@@ -179,6 +215,7 @@ impl AuthorizationService {
         Self {
             mode,
             pool: Some(pool),
+            repo_acl,
         }
     }
 
@@ -187,8 +224,89 @@ impl AuthorizationService {
         self.mode
     }
 
-    /// Evaluate one request. Scion is always evaluated; Culebra is added for every mode except
-    /// `SCION_ONLY`. See the module docs for the combination rule.
+    /// Claim a repository for `principal` (called by `POST /repos/{repo}/init`). First writer
+    /// wins; an existing owner is returned rather than overwritten.
+    pub async fn claim_repo_owner(
+        &self,
+        repository: &str,
+        principal: &Principal,
+    ) -> Result<ClaimOutcome, Status> {
+        self.repo_acl
+            .claim(repository, principal)
+            .await
+            .map_err(repo_acl_unavailable)
+    }
+
+    /// The recorded owner, if any. Used by the façade to describe an idempotent `init`.
+    pub async fn repository_owner(&self, repository: &str) -> Result<Option<String>, Status> {
+        self.repo_acl
+            .owner(repository)
+            .await
+            .map_err(repo_acl_unavailable)
+    }
+
+    /// Authorize a push by authorizing **each changeset delta path** (FVCS-02) instead of the
+    /// coarse write on `/`. An empty delta has no path to scope, so it keeps the coarse root gate.
+    /// The engine still re-checks every path inside `create_changeset` (defense in depth).
+    pub async fn authorize_push(
+        &self,
+        policy: &Policy,
+        principal: &Principal,
+        repository: &str,
+        ref_name: &str,
+        delta_paths: &[String],
+    ) -> Result<Decision, Status> {
+        if delta_paths.is_empty() {
+            return self
+                .authorize(
+                    policy,
+                    principal,
+                    repository,
+                    Action::Write,
+                    Some("/"),
+                    Some(ref_name),
+                )
+                .await;
+        }
+        for path in delta_paths {
+            let decision = self
+                .authorize(
+                    policy,
+                    principal,
+                    repository,
+                    Action::Write,
+                    Some(path),
+                    Some(ref_name),
+                )
+                .await?;
+            if !decision.allow {
+                return Ok(decision);
+            }
+        }
+        Ok(allow())
+    }
+
+    /// The repository layer, with the DevOps `admin.repos` bypass for administration.
+    async fn repository_scope(
+        &self,
+        policy: &Policy,
+        principal: &Principal,
+        repository: &str,
+        action: Action,
+    ) -> Result<RepoDecision, Status> {
+        if policy.can_admin(principal, scion_policy::AdminPerm::Repos) {
+            return Ok(RepoDecision::allow(
+                "repository administrator (admin.repos)",
+            ));
+        }
+        self.repo_acl
+            .decide(principal, repository, repo_action(action))
+            .await
+            .map_err(repo_acl_unavailable)
+    }
+
+    /// Evaluate one business request: path/ref policy AND repository identity. Culebra is added
+    /// for every mode except `SCION_ONLY`. See the module docs for the combination rule.
     pub async fn authorize(
         &self,
         policy: &Policy,
@@ -198,23 +316,65 @@ impl AuthorizationService {
         path: Option<&str>,
         ref_name: Option<&str>,
     ) -> Result<Decision, Status> {
+        self.evaluate(policy, principal, repository, action, path, ref_name, true)
+            .await
+    }
+
+    /// Evaluate repository **provisioning** (`POST /repos/{repo}/init`). The repository's identity
+    /// does not exist yet — the owner is claimed immediately after the engine boots — so this
+    /// evaluates the path/ref policy only; it is not usable for business requests.
+    pub async fn authorize_provisioning(
+        &self,
+        policy: &Policy,
+        principal: &Principal,
+        repository: &str,
+        action: Action,
+        path: Option<&str>,
+        ref_name: Option<&str>,
+    ) -> Result<Decision, Status> {
+        self.evaluate(policy, principal, repository, action, path, ref_name, false)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn evaluate(
+        &self,
+        policy: &Policy,
+        principal: &Principal,
+        repository: &str,
+        action: Action,
+        path: Option<&str>,
+        ref_name: Option<&str>,
+        include_repository: bool,
+    ) -> Result<Decision, Status> {
         let repo_path = match path {
             Some(raw) if !raw.is_empty() && raw != "/" => {
                 RepoPath::parse(raw.as_bytes()).map_err(|error| status_from_error(&error))?
             }
             _ => RepoPath::root(),
         };
-        let scion_allow = match action {
+        let path_allow = match action {
             Action::Read => policy.can_read(principal, &repo_path),
             Action::Write => policy.can_write(principal, &repo_path),
             Action::UpdateRef => policy.can_update_ref_name(principal, ref_name.unwrap_or("")),
         };
+        // Both layers are mandatory for business requests: the vendored path/ref policy AND
+        // repository identity. Provisioning runs before an owner exists, so it skips the latter.
+        let repo_decision = if include_repository {
+            self.repository_scope(policy, principal, repository, action)
+                .await?
+        } else {
+            RepoDecision::allow("repository provisioning")
+        };
+        let scion_allow = path_allow && repo_decision.allow;
 
         if self.mode == AuthMode::ScionOnly {
             return Ok(if scion_allow {
                 allow()
-            } else {
+            } else if !path_allow {
                 deny("Scion policy denied")
+            } else {
+                deny(repo_decision.reason)
             });
         }
         if self.mode == AuthMode::CulebraOnly {
@@ -241,8 +401,10 @@ impl AuthorizationService {
         let mismatch = culebra_allow.is_some_and(|value| value != scion_allow);
         let reason = if final_allow {
             "allowed".to_owned()
-        } else if !scion_allow {
+        } else if !path_allow {
             "Scion policy denied".to_owned()
+        } else if !repo_decision.allow {
+            repo_decision.reason.clone()
         } else if !culebra_reason.is_empty() {
             format!("Culebra authorization: {culebra_reason}")
         } else {
@@ -365,6 +527,8 @@ async fn ensure_schema(pool: &Pool) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
     use super::*;
 
     #[test]
@@ -386,5 +550,272 @@ mod tests {
         assert_eq!(Action::Read.as_str(), "read");
         assert_eq!(Action::Write.as_str(), "write");
         assert_eq!(Action::UpdateRef.as_str(), "update_ref");
+    }
+    use std::collections::BTreeMap;
+
+    fn test_policy() -> Policy {
+        Policy::parse(
+            r#"
+version = 1
+
+[groups]
+agents = ["service:agent-a", "service:agent-b", "service:maestro"]
+devops = ["service:maestro"]
+
+[[paths]]
+prefix = "/"
+read = ["group:agents"]
+write = ["group:devops"]
+
+[[paths]]
+prefix = "/lane/a"
+read = ["service:agent-a"]
+write = ["service:agent-a"]
+
+[[paths]]
+prefix = "/lane/b"
+read = ["service:agent-b"]
+write = ["service:agent-b"]
+
+[refs]
+"refs/heads/*" = { update = ["group:agents"] }
+
+[admin]
+refs = ["group:devops"]
+repos = ["group:devops"]
+trunk = ["group:devops"]
+"#,
+        )
+        .expect("test policy parses")
+    }
+
+    fn service_with_repo_acl() -> AuthorizationService {
+        AuthorizationService {
+            mode: AuthMode::ScionOnly,
+            pool: None,
+            repo_acl: RepoAcl::memory(BTreeMap::new()),
+        }
+    }
+
+    fn principal(raw: &str) -> Principal {
+        Principal::parse(raw).expect("test principal")
+    }
+
+    async fn claimed(service: &AuthorizationService, repository: &str, raw: &str) {
+        service
+            .claim_repo_owner(repository, &principal(raw))
+            .await
+            .expect("claim repository");
+    }
+
+    #[tokio::test]
+    async fn cross_repository_read_and_write_are_denied_by_repository_identity() {
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let agent_a = principal("service:agent-a");
+        claimed(&service, "pilot-a", "service:agent-a").await;
+        claimed(&service, "pilot-b", "service:agent-b").await;
+
+        assert!(
+            service
+                .authorize(&policy, &agent_a, "pilot-a", Action::Read, None, None)
+                .await
+                .expect("read own repo")
+                .allow
+        );
+        assert!(
+            service
+                .authorize(
+                    &policy,
+                    &agent_a,
+                    "pilot-a",
+                    Action::Write,
+                    Some("lane/a/x"),
+                    None,
+                )
+                .await
+                .expect("write own repo")
+                .allow
+        );
+        let cross_read = service
+            .authorize(&policy, &agent_a, "pilot-b", Action::Read, None, None)
+            .await
+            .expect("read other repo");
+        assert!(
+            !cross_read.allow,
+            "agent-a must not read agent-b's repository"
+        );
+        let cross_write = service
+            .authorize(
+                &policy,
+                &agent_a,
+                "pilot-b",
+                Action::Write,
+                Some("lane/a/x"),
+                None,
+            )
+            .await
+            .expect("write other repo");
+        assert!(
+            !cross_write.allow,
+            "agent-a must not write agent-b's repository"
+        );
+        let cross_ref = service
+            .authorize(
+                &policy,
+                &agent_a,
+                "pilot-b",
+                Action::UpdateRef,
+                None,
+                Some("refs/heads/lane"),
+            )
+            .await
+            .expect("update ref in other repo");
+        assert!(
+            !cross_ref.allow,
+            "agent-a must not update refs in agent-b's repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn repository_admin_bypasses_identity_but_not_path_policy() {
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let admin = principal("service:maestro");
+        claimed(&service, "pilot-b", "service:agent-b").await;
+
+        assert!(
+            service
+                .authorize(&policy, &admin, "pilot-b", Action::Read, None, None)
+                .await
+                .expect("admin read")
+                .allow,
+            "admin.repos may read a repository it does not own"
+        );
+        assert!(
+            !service
+                .authorize(
+                    &policy,
+                    &admin,
+                    "pilot-b",
+                    Action::Write,
+                    Some("lane/a/x"),
+                    None,
+                )
+                .await
+                .expect("admin write")
+                .allow,
+            "the admin bypass is repository identity only; path grants still apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_authorizes_each_delta_path_and_refuses_outside_the_grant() {
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let agent_a = principal("service:agent-a");
+        claimed(&service, "pilot-a", "service:agent-a").await;
+
+        let allowed = service
+            .authorize_push(
+                &policy,
+                &agent_a,
+                "pilot-a",
+                "refs/heads/lane",
+                &["lane/a/one.rs".to_owned()],
+            )
+            .await
+            .expect("push");
+        assert!(allowed.allow, "write on lane/a/** may push lane/a/**");
+
+        let outside = service
+            .authorize_push(
+                &policy,
+                &agent_a,
+                "pilot-a",
+                "refs/heads/lane",
+                &["lane/b/other.rs".to_owned()],
+            )
+            .await
+            .expect("push");
+        assert!(
+            !outside.allow,
+            "write on lane/a/** must not push outside it"
+        );
+
+        let mixed = service
+            .authorize_push(
+                &policy,
+                &agent_a,
+                "pilot-a",
+                "refs/heads/lane",
+                &["lane/a/one.rs".to_owned(), "src/lib.rs".to_owned()],
+            )
+            .await
+            .expect("push");
+        assert!(!mixed.allow, "one refused path refuses the whole push");
+
+        let empty = service
+            .authorize_push(&policy, &agent_a, "pilot-a", "refs/heads/lane", &[])
+            .await
+            .expect("push");
+        assert!(
+            !empty.allow,
+            "an empty delta has no path to scope and keeps the coarse write-on-root gate"
+        );
+
+        let cross_repo = service
+            .authorize_push(
+                &policy,
+                &agent_a,
+                "pilot-b",
+                "refs/heads/lane",
+                &["lane/a/one.rs".to_owned()],
+            )
+            .await
+            .expect("push");
+        assert!(!cross_repo.allow, "repository identity applies to push");
+    }
+    #[tokio::test]
+    async fn provisioning_skips_repository_identity_but_business_requests_deny() {
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let admin = principal("service:maestro");
+
+        // `init` runs before an owner exists, so provisioning evaluates the path/ref policy only.
+        assert!(
+            service
+                .authorize_provisioning(
+                    &policy,
+                    &admin,
+                    "brand-new-repo",
+                    Action::Write,
+                    Some("/"),
+                    None,
+                )
+                .await
+                .expect("provisioning")
+                .allow,
+            "the DevOps seat may initialize a repository that has no owner yet"
+        );
+        // The same request as a business write is denied by the repository layer: an ownerless
+        // repository is not readable/writable by anyone except via the admin bypass. Here the
+        // admin bypass applies, so assert an agent is the one refused.
+        let agent_a = principal("service:agent-a");
+        assert!(
+            !service
+                .authorize(
+                    &policy,
+                    &agent_a,
+                    "brand-new-repo",
+                    Action::Write,
+                    Some("lane/a/x"),
+                    None,
+                )
+                .await
+                .expect("business write")
+                .allow,
+            "an unowned repository must not be writable by an agent"
+        );
     }
 }

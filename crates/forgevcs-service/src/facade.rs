@@ -45,14 +45,15 @@ use scion_core::{ConflictReport, EntryInfo, ErrorPayload, ObjectId};
 use scion_object::{Canonical, RepoPath};
 use scion_proto::{convert, error_from_status, status_from_error, v1};
 use scion_server::AppContext;
-use scion_store::BlobStore;
 use scion_server::context::CallerCtx;
 use scion_server::handlers;
+use scion_store::BlobStore;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tonic::Status;
 
 use crate::authz::Action;
+use crate::repo_acl::ClaimOutcome;
 
 use crate::engine::Engine;
 use crate::http::{
@@ -76,13 +77,7 @@ const DELTA_PUT: u32 = 1;
 /// `repos.name` row and a log field. Lowercase keeps it URL- and policy-predictable; the
 /// dot rules keep a name from becoming a path traversal if a later layer ever uses it as one.
 fn valid_repo_name(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 100
-        && !name.starts_with('.')
-        && !name.contains("..")
-        && name.bytes().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'-' | b'_' | b'.')
-        })
+    crate::repo_acl::valid_repo_name(name)
 }
 
 /// The engine for an addressed repository, or 404. Reads never create a repository: a typo in
@@ -243,6 +238,28 @@ async fn authorize(
     }
 }
 
+/// Repository provisioning (`init`) runs before the repository has an owner, so it evaluates the
+/// path/ref policy only; the owner is claimed immediately after the engine boots (FVCS-01).
+async fn authorize_provisioning(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    action: Action,
+) -> Result<(), Response> {
+    let app = engine.context();
+    let policy = app.policy.current();
+    match state
+        .authz
+        .authorize_provisioning(&policy, &caller.principal, repo, action, Some("/"), None)
+        .await
+    {
+        Ok(decision) if decision.allow => Ok(()),
+        Ok(decision) => Err(status_response(Status::permission_denied(decision.reason))),
+        Err(status) => Err(status_response(status)),
+    }
+}
+
 pub(crate) async fn init(
     State(state): State<Arc<AppState>>,
     Path(repo): Path<String>,
@@ -260,16 +277,8 @@ pub(crate) async fn init(
         Ok(value) => value,
         Err(response) => return response,
     };
-    if let Err(response) = authorize(
-        &state,
-        &auth_engine,
-        &caller,
-        &repo,
-        Action::Write,
-        Some("/"),
-        None,
-    )
-    .await
+    if let Err(response) =
+        authorize_provisioning(&state, &auth_engine, &caller, &repo, Action::Write).await
     {
         return response;
     }
@@ -326,6 +335,27 @@ pub(crate) async fn init(
             }
         }
     };
+
+    // FVCS-01: the first successful init claims the repository. `claim` is first-writer-wins and
+    // never reassigns, so an idempotent init or a concurrent instance cannot steal it. Only the
+    // DevOps seat (admin.repos) may initialize a repository owned by another principal.
+    match state.authz.claim_repo_owner(&repo, &caller.principal).await {
+        Ok(ClaimOutcome::Claimed | ClaimOutcome::AlreadyOwner) => {}
+        Ok(ClaimOutcome::OwnedByOther { owner }) => {
+            if !app
+                .policy
+                .current()
+                .can_admin(&caller.principal, scion_policy::AdminPerm::Repos)
+            {
+                return error_response(
+                    StatusCode::FORBIDDEN,
+                    "permission_denied",
+                    &format!("repository {repo:?} is owned by {owner}"),
+                );
+            }
+        }
+        Err(status) => return status_response(status),
+    }
 
     match list_refs(&engine, &caller).await {
         Ok(refs) => (
@@ -1753,7 +1783,11 @@ fn require_devops(
     message: &str,
 ) -> Result<(), Response> {
     let app = engine.context();
-    if app.policy.current().can_admin(&caller.principal, permission) {
+    if app
+        .policy
+        .current()
+        .can_admin(&caller.principal, permission)
+    {
         Ok(())
     } else {
         Err(error_response(
@@ -1764,11 +1798,7 @@ fn require_devops(
     }
 }
 
-fn require_trunk(
-    engine: &Arc<Engine>,
-    caller: &CallerCtx,
-    ref_name: &str,
-) -> Result<(), Response> {
+fn require_trunk(engine: &Arc<Engine>, caller: &CallerCtx, ref_name: &str) -> Result<(), Response> {
     if ref_name != DEFAULT_REF {
         return Ok(());
     }
@@ -1778,6 +1808,16 @@ fn require_trunk(
         scion_policy::AdminPerm::Trunk,
         "advancing the trunk ref requires the DevOps seat (admin.trunk)",
     )
+}
+
+/// The repository paths one push writes: every changeset delta path. The façade authorizes each
+/// one (FVCS-02), and upstream's `create_changeset` checks the same paths again (defense in depth).
+fn push_delta_paths(changeset: &ChangesetBody) -> Vec<String> {
+    changeset
+        .delta
+        .iter()
+        .map(|delta| delta.path.clone())
+        .collect()
 }
 
 /// `POST /repos/{repo}/push` — upload objects, create a changeset, then land or update a ref.
@@ -1820,6 +1860,10 @@ pub(crate) async fn push(
         allow_non_fast_forward,
         allow_empty,
     } = body;
+    // FVCS-02: only the changeset delta names the paths this push writes. Authorize each of them
+    // below instead of the coarse write-on-`/` the push used to require; the coarse gate stays
+    // for repository and ref provisioning (`init`, `ref_create`, the ref rules).
+    let delta_paths = push_delta_paths(&changeset);
 
     if matches!(mode.as_str(), "land" | "update")
         && let Err(response) = require_trunk(&engine, &caller, &ref_name)
@@ -1827,18 +1871,15 @@ pub(crate) async fn push(
         return response;
     }
 
-    if let Err(response) = authorize(
-        &state,
-        &engine,
-        &caller,
-        &repo,
-        Action::Write,
-        Some("/"),
-        Some(&ref_name),
-    )
-    .await
+    let policy = engine.context().policy.current();
+    match state
+        .authz
+        .authorize_push(&policy, &caller.principal, &repo, &ref_name, &delta_paths)
+        .await
     {
-        return response;
+        Ok(decision) if decision.allow => {}
+        Ok(decision) => return status_response(Status::permission_denied(decision.reason)),
+        Err(status) => return status_response(status),
     }
 
     let mut uploads = Vec::with_capacity(objects.len());
@@ -2282,13 +2323,10 @@ pub(crate) async fn merge_land(
         .author
         .clone()
         .unwrap_or_else(|| "ForgeVCS merge-land <merge@example.test>".to_owned());
-    let message = body.message.clone().unwrap_or_else(|| {
-        format!(
-            "merge-land {} onto {}",
-            head.to_text(),
-            body.ref_name
-        )
-    });
+    let message = body
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("merge-land {} onto {}", head.to_text(), body.ref_name));
     let merge_change_id = match body.change_id.as_deref() {
         Some(raw) => match parse_change_id(raw) {
             Ok(id) => id,
@@ -2536,8 +2574,8 @@ async fn changeset_parents(
             .map(|raw| ObjectId::from_bytes(raw).map_err(|error| status_from_error(&error)))
             .collect(),
         Some(v1::changeset_item::View::Encoded(bytes)) => {
-            let changeset =
-                scion_object::Changeset::decode(bytes).map_err(|error| status_from_error(&error))?;
+            let changeset = scion_object::Changeset::decode(bytes)
+                .map_err(|error| status_from_error(&error))?;
             Ok(changeset.parents)
         }
         None => Err(Status::not_found(format!("changeset {id} has no view"))),
@@ -2555,15 +2593,17 @@ fn conflict_report_of(status: &Status) -> Option<ConflictReport> {
 }
 
 fn conflict_hunks_json(conflict: &scion_core::Conflict) -> Value {
-    json!(conflict
-        .hunks
-        .iter()
-        .map(|hunk| json!({
-            "base":   { "start": hunk.base.start,   "end": hunk.base.end },
-            "ours":   { "start": hunk.ours.start,   "end": hunk.ours.end },
-            "theirs": { "start": hunk.theirs.start, "end": hunk.theirs.end },
-        }))
-        .collect::<Vec<_>>())
+    json!(
+        conflict
+            .hunks
+            .iter()
+            .map(|hunk| json!({
+                "base":   { "start": hunk.base.start,   "end": hunk.base.end },
+                "ours":   { "start": hunk.ours.start,   "end": hunk.ours.end },
+                "theirs": { "start": hunk.theirs.start, "end": hunk.theirs.end },
+            }))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// `POST /repos/{repo}/conflict-context` — the three sides of a refused merge or rebase.
@@ -2748,7 +2788,8 @@ pub(crate) async fn conflict_context(
                 Ok(data) => data,
                 Err(status) => return status_response(status),
             };
-            let theirs_data = match read_version(&app, &caller, Some(&theirs), &conflict.path).await {
+            let theirs_data = match read_version(&app, &caller, Some(&theirs), &conflict.path).await
+            {
                 Ok(data) => data,
                 Err(status) => return status_response(status),
             };
@@ -2973,7 +3014,11 @@ pub(crate) async fn claim_conflict(
         return response;
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "id is not a UUID",
+        );
     }
     let Some(pool) = state.db.as_ref() else {
         return queue_unavailable();
@@ -3026,7 +3071,11 @@ pub(crate) async fn resolve_conflict(
         return response;
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "id is not a UUID",
+        );
     }
     let Some(pool) = state.db.as_ref() else {
         return queue_unavailable();
@@ -3131,10 +3180,7 @@ async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Respon
         })?;
         rows.insert(table.to_owned(), json!(removed));
     }
-    for table in [
-        "forgevcs_workspaces",
-        "forgevcs_conflict_escalations",
-    ] {
+    for table in ["forgevcs_workspaces", "forgevcs_conflict_escalations"] {
         let sql = format!("DELETE FROM {table} WHERE repo = $1");
         let removed = tx.execute(&sql, &[&repo]).await.map_err(|error| {
             error_response(
@@ -3145,6 +3191,22 @@ async fn delete_repository_rows(pool: &Pool, repo: &str) -> Result<Value, Respon
         })?;
         rows.insert(table.to_owned(), json!(removed));
     }
+    // FVCS-01: repository deletion releases the owner row in the same transaction, so a later
+    // recreation starts with no owner instead of inheriting the deleted repository's principal.
+    let removed_owner = tx
+        .execute(
+            "DELETE FROM forgevcs_repo_acl WHERE repository = $1",
+            &[&repo],
+        )
+        .await
+        .map_err(|error| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("deleting forgevcs_repo_acl: {error}"),
+            )
+        })?;
+    rows.insert("forgevcs_repo_acl".to_owned(), json!(removed_owner));
     let removed = tx
         .execute("DELETE FROM repos WHERE repo_id = $1", &[&repo_id])
         .await
@@ -3346,7 +3408,11 @@ pub(crate) async fn delete_conflict(
         return response;
     }
     if uuid::Uuid::parse_str(&id).is_err() {
-        return error_response(StatusCode::BAD_REQUEST, "invalid_argument", "id is not a UUID");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "id is not a UUID",
+        );
     }
     let Some(pool) = state.db.as_ref() else {
         return queue_unavailable();
@@ -4099,7 +4165,11 @@ pub(crate) async fn workspace_submit(
         );
     }
     if matches!(body.mode.as_str(), "land" | "update")
-        && let Err(response) = require_trunk(&engine, &caller, body.ref_name.as_deref().unwrap_or(DEFAULT_REF))
+        && let Err(response) = require_trunk(
+            &engine,
+            &caller,
+            body.ref_name.as_deref().unwrap_or(DEFAULT_REF),
+        )
     {
         return response;
     }
@@ -4321,5 +4391,26 @@ mod tests {
         assert_eq!(item_status(0), "unspecified");
         assert_eq!(encoding_name(v1::Encoding::Zstd as i32), "zstd");
         assert_eq!(encoding_name(0), "unspecified");
+    }
+    /// FVCS-02: the push façade feeds every changeset delta path into the authorizer. A regression
+    /// that drops the paths would silently fall back to the coarse write-on-`/` gate this work
+    /// removed, so the extraction is asserted directly.
+    #[test]
+    fn a_push_authorizes_every_changeset_delta_path() {
+        let body: PushBody = serde_json::from_value(json!({
+            "changeset": {
+                "delta": [
+                    {"path": "lane/a/one.rs"},
+                    {"path": "lane/a/two.rs", "op": 2}
+                ],
+                "meta": {"author": "A <a@example.com>", "message": "two paths"},
+                "change_id": "ab".repeat(16)
+            }
+        }))
+        .expect("push body parses");
+        assert_eq!(
+            push_delta_paths(&body.changeset),
+            vec!["lane/a/one.rs".to_owned(), "lane/a/two.rs".to_owned()]
+        );
     }
 }

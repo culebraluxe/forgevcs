@@ -66,6 +66,11 @@ pub struct Config {
     pub service_principals: Option<String>,
     /// Authorization A/B mode (`$FORGEVCS_AUTH_MODE`; `SCION_ONLY` by default).
     pub auth_mode: Option<String>,
+    /// Operator-configured repository ACLs (`FORGEVCS_REPO_ACLS`), JSON
+    /// `repository -> {owner, readers?, writers?}`. Repository identity is not part of the
+    /// vendored `acl.toml` policy; this value is how a pilot pre-assigns a repository to an
+    /// agent without an admin API. Owners are otherwise claimed by the first `init`.
+    pub repo_acls: Option<String>,
 }
 
 impl Config {
@@ -98,6 +103,7 @@ impl Config {
             github_client_id: get(&["FORGEVCS_GITHUB_CLIENT_ID"]),
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
+            repo_acls: get(&["FORGEVCS_REPO_ACLS"]),
         }
     }
 
@@ -140,6 +146,10 @@ impl Config {
             return Err("object-storage credentials are half-configured: set both \
                  FORGEVCS_AWS_ACCESS_KEY_ID and FORGEVCS_AWS_SECRET_ACCESS_KEY"
                 .to_owned());
+        }
+        if let Some(raw) = &self.repo_acls {
+            crate::repo_acl::parse_configured(raw)
+                .map_err(|error| format!("FORGEVCS_REPO_ACLS is invalid: {error}"))?;
         }
         if let Some(mode) = &self.auth_mode
             && !matches!(
@@ -319,6 +329,28 @@ mod tests {
 
         let cfg = config(&[("FORGEVCS_AUTH_MODE", "SCION_AND_CULEBRA")]);
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn repo_acls_are_validated_at_startup() {
+        let cfg = config(&[(
+            "FORGEVCS_REPO_ACLS",
+            r#"{"pilot-a":{"owner":"service:agent-a","writers":["service:agent-a"]}}"#,
+        )]);
+        assert!(cfg.repo_acls.is_some());
+        assert_eq!(cfg.validate(), Ok(()));
+
+        let cfg = config(&[("FORGEVCS_REPO_ACLS", r#"{"pilot-a":{"owner":"agent-a"}}"#)]);
+        assert!(
+            cfg.validate().is_err(),
+            "a malformed repo ACL must not silently disable isolation"
+        );
+        assert!(
+            cfg.validate()
+                .err()
+                .is_some_and(|error| error.contains("FORGEVCS_REPO_ACLS")),
+            "the error names the variable an operator must fix"
+        );
     }
 
     #[test]

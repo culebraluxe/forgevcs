@@ -139,7 +139,10 @@ mod tests {
     fn keys_parse_repo_id() {
         assert_eq!(repo_id_of_key("r/42/b/ab/abcd"), Some(42));
         assert_eq!(repo_id_of_key("q/7/t/00/0000"), Some(7));
-        assert_eq!(repo_id_of_key("forgevcs-ci/w3-1/conf/r/1/b/aa/big"), Some(1));
+        assert_eq!(
+            repo_id_of_key("forgevcs-ci/w3-1/conf/r/1/b/aa/big"),
+            Some(1)
+        );
         assert_eq!(repo_id_of_key("r/not-a-number/b/ab/abcd"), None);
         assert_eq!(repo_id_of_key("junk"), None);
         assert_eq!(repo_id_of_key("r"), None);

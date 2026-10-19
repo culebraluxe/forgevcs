@@ -46,3 +46,31 @@ write = ["group:agents"]
 refs = ["group:devops"]
 repos = ["group:devops"]
 trunk = ["group:devops"]
+
+# ---------------------------------------------------------------------------------------------
+# Repository scoping (FVCS-01, 2026-10-18)
+#
+# Repository identity is NOT expressed in this file. The vendored Scion parser is strict
+# (`deny_unknown_fields`), so a `[repos]` table here would make this file unloadable. The service
+# evaluates repository identity as a second, mandatory layer after this policy:
+#
+#   every business request must pass BOTH this path/ref policy AND `forgevcs_repo_acl`.
+#
+# The owner is claimed by the first successful `POST /repos/{repo}/init` (first writer wins; an
+# idempotent init or a concurrent instance cannot reassign it). Operators can pre-assign an
+# owner / readers / writers with `FORGEVCS_REPO_ACLS`, JSON, e.g.
+#
+#   {"pilot-a":{"owner":"service:agent-a","writers":["service:agent-a"]}}
+#
+# `admin.repos` (the DevOps seat, below) bypasses repository identity for administration but does
+# NOT bypass the path/ref rules in this file. An ownerless repository is denied to agents.
+#
+# Path-prefix pushes (FVCS-02): `POST /repos/{repo}/push` authorizes each changeset delta path
+# instead of requiring write on `/`, so a principal whose write grant is `lane/a/**` can push
+# exactly those paths. Repository and ref provisioning still require the coarse root/ref gates.
+# IMPORTANT: this file still grants `write` on `/` to `group:agents` (the pre-FVCS-02 default), so
+# every agent keeps write everywhere until an operator narrows this rule to the lane prefixes an
+# agent may push (e.g. replace `write = ["group:agents"]` on `/` with per-lane `[[paths]]` rules).
+# Until then the push gate is path-fine but the policy still grants every path.
+#
+# See docs/M1-repo-acl-and-path-scopes.md.

@@ -14,4 +14,5 @@ pub mod escalations;
 pub mod facade;
 pub mod gc;
 pub mod http;
+pub mod repo_acl;
 pub mod workspace;
