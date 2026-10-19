@@ -35,6 +35,7 @@ struct Captured {
 struct MockState {
     captured: Arc<Mutex<Vec<Captured>>>,
     deny: bool,
+    conflict: bool,
 }
 
 struct Mock {
@@ -43,10 +44,21 @@ struct Mock {
 }
 
 async fn mock(deny: bool) -> Mock {
+    mock_with(deny, false).await
+}
+
+/// A mock that answers every request with the façade's paused-conflict `409` envelope (so the
+/// CLI's conflict/stale payload surfacing can be asserted).
+async fn mock_conflict() -> Mock {
+    mock_with(false, true).await
+}
+
+async fn mock_with(deny: bool, conflict: bool) -> Mock {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let state = MockState {
         captured: Arc::clone(&captured),
         deny,
+        conflict,
     };
     let router = axum::Router::new()
         .route("/health", any(capture))
@@ -87,6 +99,31 @@ async fn capture(State(state): State<MockState>, request: axum::extract::Request
         authorization,
         body,
     });
+    if state.conflict {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "service": "forgevcs",
+                "status": "error",
+                "code": "conflict",
+                "message": "stale conflict: ref \"main\" moved since the conflict was paused",
+                "details": {
+                    "kind": "merge_conflict",
+                    "report": { "conflicts": [{ "path": "hello.txt" }], "clean_entries": [] }
+                },
+                "conflict": {
+                    "id": "conflict-id",
+                    "status": "resolved",
+                    "ref": "main",
+                    "resolve_parent": "c1tip"
+                },
+                "stale": true,
+                "current_version": 4,
+                "current_target": "c1tip"
+            })),
+        )
+            .into_response();
+    }
     if state.deny {
         return (
             StatusCode::FORBIDDEN,
@@ -482,6 +519,31 @@ async fn every_command_hits_its_façade_route() {
         .cloned()
         .expect("pull request");
     assert_eq!(pull.body["objects"], json!(["b1aa"]));
+}
+
+#[tokio::test]
+async fn a_paused_conflict_error_surfaces_the_conflict_and_stale_details() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mock = mock_conflict().await;
+    token::write_token(&dir.path().join("token"), "tok-culebraluxe").expect("token");
+
+    let error = run(
+        &mock.base_url,
+        dir.path(),
+        &["conflicts", "continue", "repo", "conflict-id"],
+    )
+    .await
+    .expect_err("the mock answers 409 conflict");
+    let message = format!("{error:#}");
+    // The human/agent sees the facade envelope, not a flattened one-liner.
+    assert!(message.contains("409"), "{message}");
+    assert!(message.contains("stale conflict"), "{message}");
+    assert!(message.contains("\"conflict\""), "{message}");
+    assert!(message.contains("conflict-id"), "{message}");
+    assert!(message.contains("\"stale\": true"), "{message}");
+    assert!(message.contains("\"current_version\": 4"), "{message}");
+    assert!(message.contains("merge_conflict"), "{message}");
+    assert!(message.contains("hello.txt"), "{message}");
 }
 
 #[tokio::test]

@@ -1217,15 +1217,14 @@ pub(crate) async fn push(
                                 &engine,
                                 &caller,
                                 &repo,
-                                PauseRequest {
-                                    operation: "push",
-                                    ref_name: Some(ref_name.clone()),
-                                    head: changeset_id,
-                                    resolve_parent: changeset_id,
+                                land_pause(
+                                    "push",
+                                    ref_name.clone(),
+                                    changeset_id,
                                     ours,
-                                    theirs: changeset_id,
+                                    changeset_id,
                                     base,
-                                },
+                                ),
                                 &status,
                             )
                             .await;
@@ -1393,15 +1392,7 @@ pub(crate) async fn rebase(
                 &engine,
                 &caller,
                 &repo,
-                PauseRequest {
-                    operation: "rebase",
-                    ref_name: None,
-                    head: changeset,
-                    resolve_parent: changeset,
-                    ours: onto,
-                    theirs: changeset,
-                    base,
-                },
+                rebase_pause(changeset, onto, base),
                 &status,
             )
             .await
@@ -1484,15 +1475,7 @@ pub(crate) async fn merge(
                 &engine,
                 &caller,
                 &repo,
-                PauseRequest {
-                    operation: "merge",
-                    ref_name: None,
-                    head: a,
-                    resolve_parent: a,
-                    ours: a,
-                    theirs: b,
-                    base,
-                },
+                merge_pause(a, b, base),
                 &status,
             )
             .await
@@ -1574,15 +1557,7 @@ pub(crate) async fn land(
                     &engine,
                     &caller,
                     &repo,
-                    PauseRequest {
-                        operation: "land",
-                        ref_name: Some(body.ref_name.clone()),
-                        head,
-                        resolve_parent: head,
-                        ours,
-                        theirs: head,
-                        base,
-                    },
+                    land_pause("land", body.ref_name.clone(), head, ours, head, base),
                     &status,
                 )
                 .await
@@ -1705,15 +1680,7 @@ pub(crate) async fn merge_land(
                 &engine,
                 &caller,
                 &repo,
-                PauseRequest {
-                    operation: "merge-land",
-                    ref_name: Some(body.ref_name.clone()),
-                    head: tip,
-                    resolve_parent: tip,
-                    ours: tip,
-                    theirs: head,
-                    base,
-                },
+                land_pause("merge-land", body.ref_name.clone(), tip, tip, head, base),
                 &status,
             )
             .await
@@ -2164,6 +2131,69 @@ struct PauseRequest {
     base: Option<ObjectId>,
 }
 
+/// Pause shape for a land-family operation (`land`, `push` mode=land, `merge-land`).
+///
+/// The resolution is parented on the ref tip, **not** on the paused head: `continue` then lands
+/// a single linear changeset. Parenting on the head would make land replay the conflicting head
+/// onto the tip again before reaching the resolution (the original R2 defect).
+fn land_pause(
+    operation: &'static str,
+    ref_name: String,
+    head: ObjectId,
+    tip: ObjectId,
+    theirs: ObjectId,
+    base: Option<ObjectId>,
+) -> PauseRequest {
+    PauseRequest {
+        operation,
+        ref_name: Some(ref_name),
+        head,
+        resolve_parent: tip,
+        ours: tip,
+        theirs,
+        base,
+    }
+}
+
+/// Pause shape for an explicit two-parent `merge`: the resolution is parented on `a` (ours).
+fn merge_pause(a: ObjectId, b: ObjectId, base: Option<ObjectId>) -> PauseRequest {
+    PauseRequest {
+        operation: "merge",
+        ref_name: None,
+        head: a,
+        resolve_parent: a,
+        ours: a,
+        theirs: b,
+        base,
+    }
+}
+
+/// Pause shape for `rebase`: the resolution is parented on the rebase target `onto` (usually the
+/// ref tip), so `continue` lands the resolution without replaying the conflicting changeset.
+fn rebase_pause(changeset: ObjectId, onto: ObjectId, base: Option<ObjectId>) -> PauseRequest {
+    PauseRequest {
+        operation: "rebase",
+        ref_name: None,
+        head: changeset,
+        resolve_parent: onto,
+        ours: onto,
+        theirs: changeset,
+        base,
+    }
+}
+
+/// The 409 for a `continue` whose land itself conflicted (the resolution no longer applies
+/// cleanly). The paused record is attached so the caller can see what was being continued.
+fn continue_land_failure(status: Status, record: &Record) -> ApiError {
+    let is_conflict = conflict_report_of(&status).is_some();
+    let error = ApiError::from(status);
+    if is_conflict {
+        error.with_extra(json!({ "conflict": paused_conflicts::record_json(record) }))
+    } else {
+        error
+    }
+}
+
 /// The ref tip and version, resolved through the same upstream handler every read uses.
 async fn ref_state(
     engine: &Arc<Engine>,
@@ -2357,6 +2387,15 @@ fn stale_response(record: &Record, current_version: u64, current_target: &Object
 // agent per item. The queue stores pointers and the conflict report, never content: the DevOps
 // agent re-reads the three sides with `/conflict-context`.
 // ---------------------------------------------------------------------------------------------
+
+/// Reject a malformed paused-conflict id before it reaches a `$1::text::uuid` cast (which would
+/// surface as a 500 database error rather than a 400 invalid_argument).
+fn check_conflict_id(id: &str) -> ApiResult<()> {
+    if uuid::Uuid::parse_str(id).is_err() {
+        return Err(ApiError::invalid_argument("id is not a UUID"));
+    }
+    Ok(())
+}
 
 fn queue_unavailable() -> ApiError {
     ApiError::unavailable("the conflict queue needs FORGEVCS_DATABASE_URL")
@@ -2600,8 +2639,8 @@ pub(crate) async fn resolve_conflict(
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
     };
-    if uuid::Uuid::parse_str(&id).is_err() {
-        return ApiError::invalid_argument("id is not a UUID").into_response();
+    if let Err(error) = check_conflict_id(&id) {
+        return error.into_response();
     }
     // Paused conflicts and the DevOps escalation queue share this route (as they share the
     // `/conflicts` route for listing). A paused id wins; escalation bodies never carry
@@ -2666,6 +2705,9 @@ pub(crate) async fn show_conflict(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = check_conflict_id(&id) {
+        return error.into_response();
+    }
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
@@ -2785,6 +2827,9 @@ pub(crate) async fn continue_conflict(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = check_conflict_id(&id) {
+        return error.into_response();
+    }
     let engine = match repo_engine(&state, &repo).await {
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
@@ -2891,7 +2936,7 @@ pub(crate) async fn continue_conflict(
                 Err(error) => ApiError::internal(error).into_response(),
             }
         }
-        Err(status) => ApiError::from(status).into_response(),
+        Err(status) => continue_land_failure(status, &record).into_response(),
     }
 }
 
@@ -2903,6 +2948,15 @@ pub(crate) async fn continue_conflict(
 // blob set to remove safely. The rows are deleted in one transaction; blobs stay until a
 // garbage-collection workstream can prove no other repository references them.
 // ---------------------------------------------------------------------------------------------
+
+/// ForgeVCS-owned tables keyed by the repository **name** (not `repo_id`), removed in the same
+/// transaction as the repository rows so a deleted repository leaves no paused conflicts or
+/// workspace/queue state behind.
+const SERVICE_REPO_TABLES: [&str; 3] = [
+    "forgevcs_workspaces",
+    "forgevcs_conflict_escalations",
+    "forgevcs_paused_conflicts",
+];
 
 /// Tables whose rows are keyed by `repo_id` (SPEC 5.2). No foreign keys, so order is only for
 /// readability.
@@ -2948,7 +3002,7 @@ async fn delete_repository_rows(pool: &Pool, repo: &str) -> ApiResult<Value> {
             .map_err(|error| ApiError::internal(format!("deleting {table}: {error}")))?;
         rows.insert(table.to_owned(), json!(removed));
     }
-    for table in ["forgevcs_workspaces", "forgevcs_conflict_escalations"] {
+    for table in SERVICE_REPO_TABLES {
         let sql = format!("DELETE FROM {table} WHERE repo = $1");
         let removed = tx
             .execute(&sql, &[&repo])
@@ -4033,6 +4087,67 @@ mod tests {
             continued_version: None,
             continued_at: None,
         }
+    }
+
+    #[test]
+    fn pause_shapes_parent_every_resolution_on_a_landable_changeset() {
+        let tip = ObjectId::hash_blob(b"tip");
+        let head = ObjectId::hash_blob(b"head");
+        let other = ObjectId::hash_blob(b"other");
+
+        // push/land/merge-land: parent on the ref tip, never on the paused head.
+        for operation in ["push", "land", "merge-land"] {
+            let pause = land_pause(operation, "main".to_owned(), head, tip, head, None);
+            assert_eq!(pause.resolve_parent, tip, "{operation}");
+            assert_eq!(pause.ours, tip, "{operation}");
+            assert_eq!(pause.head, head, "{operation}");
+            assert_eq!(pause.theirs, head, "{operation}");
+            assert_ne!(pause.resolve_parent, pause.head, "{operation}");
+        }
+        // merge: parent on `a`; rebase: parent on `onto` (the rebase target / ref tip).
+        assert_eq!(merge_pause(tip, head, None).resolve_parent, tip);
+        assert_eq!(rebase_pause(head, tip, None).resolve_parent, tip);
+        assert_eq!(rebase_pause(head, tip, None).head, head);
+        assert_eq!(rebase_pause(head, tip, None).theirs, head);
+        assert_eq!(rebase_pause(other, tip, None).ours, tip);
+    }
+
+    #[tokio::test]
+    async fn a_continue_land_conflict_keeps_the_paused_record() {
+        use scion_core::{ErrorCode, ErrorPayload};
+        let error =
+            scion_core::ScionError::new(ErrorCode::MergeConflict, "rebase: 1 conflicting path(s)")
+                .with_payload(ErrorPayload::MergeConflict(Box::default()));
+        let api = continue_land_failure(
+            status_from_error(&error),
+            &paused_record("resolved", Some(7)),
+        );
+        let response = api.into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["code"], "conflict");
+        assert_eq!(body["details"]["kind"], "merge_conflict");
+        assert_eq!(body["conflict"]["id"], "conflict-id");
+    }
+
+    #[test]
+    fn malformed_conflict_ids_are_a_400_before_any_database_cast() {
+        assert!(check_conflict_id("not-a-uuid").is_err());
+        assert!(check_conflict_id("").is_err());
+        let valid = uuid::Uuid::new_v4().to_string();
+        assert!(check_conflict_id(&valid).is_ok());
+    }
+
+    #[test]
+    fn repository_deletion_cleans_the_paused_conflict_rows() {
+        // A deleted repository must not leave paused conflicts behind (QA residue finding).
+        assert!(
+            SERVICE_REPO_TABLES.contains(&"forgevcs_paused_conflicts"),
+            "delete_repository_rows must remove paused conflicts: {SERVICE_REPO_TABLES:?}"
+        );
     }
 
     #[test]

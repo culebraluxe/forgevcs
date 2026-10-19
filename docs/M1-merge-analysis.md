@@ -142,16 +142,26 @@ land / push(mode=land) / merge-land / merge / rebase
 ```
 
 - `resolve` only accepts an `open` conflict and validates the resolved changeset's parent; a
-  second resolve, a wrong parent or a missing changeset is refused.
+  second resolve, a wrong parent or a missing changeset is refused. For operations that land
+  (`land`, `push` mode=land, `merge-land`) `resolve_parent` is the **ref tip observed at pause**:
+  the resolution is the resolved tree on top of that tip, so `continue` lands one linear
+  changeset instead of replaying the conflicting head. `merge` resolves on top of `a` and
+  `rebase` on top of `onto` (its rebase target, usually the ref tip), for the same reason.
 - `continue` only accepts a `resolved` conflict, checks the ref is still at the version observed
   at pause (stale → `409 conflict` with `stale:true` and the current target/version), then lands
-  through the ordinary `Land` handler so write-path and ref-CAS checks still apply.
+  through the ordinary `Land` handler so write-path and ref-CAS checks still apply. If the
+  resolution itself conflicts during that land (e.g. the caller moved the ref outside the
+  version check's window), the `409` keeps the paused record attached instead of dropping it.
 - Operations without a target ref (`merge`, `rebase`) can be resolved and are continued with an
   explicit `ref` (the CLI's `conflicts continue --ref`).
 - Only the principal that hit the conflict, or a repository administrator, may resolve/continue
   it: the stored sides were read under the creator's read policy.
+- A deleted repository removes its paused-conflict rows in the same metadata transaction as the
+  repository/workspace/queue rows, so deletion leaves no residue.
 
-CLI: `forgevcs conflicts list|show|resolve|continue`. Tests: paused-store state machine
+CLI: `forgevcs conflicts list|show|resolve|continue`; failured responses keep the façade
+envelope (`conflict`, `details`, `stale`, `current_*`) in the CLI error text instead of a
+flattened one-line message. Tests: paused-store state machine
 (open→resolved→continued, compare-and-set, unknown ids, stale/parent decisions) plus the CLI
 route tests; the live end-to-end (conflict → resolve → continue → linear ref) runs in the local
 Postgres+moto harness (QA evidence, not in the hermetic gate).

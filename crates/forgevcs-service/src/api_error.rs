@@ -57,6 +57,16 @@ pub(crate) enum ApiError {
     /// fencing token and expiry so the caller can back off or surface the conflict instead of
     /// retrying blindly.
     WorkspaceLeaseConflict(Box<LeaseConflictDetails>),
+    /// Any failure with additive top-level fields (e.g. the paused `conflict` record or the
+    /// stale-ref details). `with_extra` promotes a typed error to this shape for every variant,
+    /// not only upstream statuses.
+    Enriched {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+        details: Option<Box<Value>>,
+        extra: Box<Value>,
+    },
 }
 
 /// The current holder reported by a workspace write-lease conflict.
@@ -126,30 +136,36 @@ impl ApiError {
         )))
     }
 
-    /// Attach additive top-level fields to an upstream error envelope (e.g. `conflict`).
+    /// Attach additive top-level fields to any error envelope (e.g. the paused `conflict`
+    /// record, or stale-ref details). Works for typed errors (`Conflict`, `NotFound`, …) as well
+    /// as upstream statuses; the base status/code/message stay unchanged.
     pub(crate) fn with_extra(self, extra: Value) -> Self {
-        match self {
-            Self::Upstream {
-                status,
-                code,
-                message,
-                details,
-                ..
-            } => Self::Upstream {
-                status,
-                code,
-                message,
-                details,
-                extra: Some(Box::new(extra)),
-            },
-            other => other,
+        let (status, code, message, details, existing) = self.parts();
+        let extra = match existing {
+            Some(existing) => merge_extras(*existing, extra),
+            None => extra,
+        };
+        Self::Enriched {
+            status,
+            code,
+            message,
+            details,
+            extra: Box::new(extra),
         }
     }
-}
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        let (status, code, message, details, extra) = match self {
+    /// The envelope fields of this error.
+    #[allow(clippy::type_complexity)]
+    fn parts(
+        self,
+    ) -> (
+        StatusCode,
+        &'static str,
+        String,
+        Option<Box<Value>>,
+        Option<Box<Value>>,
+    ) {
+        match self {
             Self::InvalidArgument(message) => (
                 StatusCode::BAD_REQUEST,
                 "invalid_argument",
@@ -214,7 +230,33 @@ impl IntoResponse for ApiError {
                     None,
                 )
             }
-        };
+            Self::Enriched {
+                status,
+                code,
+                message,
+                details,
+                extra,
+            } => (status, code, message, details, Some(extra)),
+        }
+    }
+}
+
+/// Merge two additive-field objects; a later value wins on a key collision.
+fn merge_extras(base: Value, extra: Value) -> Value {
+    match (base, extra) {
+        (Value::Object(mut base), Value::Object(extra)) => {
+            for (key, value) in extra {
+                base.insert(key, value);
+            }
+            Value::Object(base)
+        }
+        (_, extra) => extra,
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, code, message, details, extra) = self.parts();
         let mut body = json!({
             "service": SERVICE,
             "status": "error",
@@ -494,6 +536,37 @@ mod tests {
             assert_eq!(body["status"], "error");
             assert_eq!(body["code"], code);
         }
+    }
+
+    #[tokio::test]
+    async fn extras_attach_to_typed_errors_not_only_upstream_statuses() {
+        // R2's stale continue / double-resolve responses are `Conflict` errors with extras.
+        let (status, body) = body_of(ApiError::conflict("stale conflict: ref moved").with_extra(
+            json!({
+                "stale": true,
+                "current_version": 4,
+                "current_target": "c1tip",
+                "conflict": { "id": "conflict-id", "status": "resolved" },
+            }),
+        ))
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["code"], "conflict");
+        assert_eq!(body["message"], "stale conflict: ref moved");
+        assert_eq!(body["stale"], true);
+        assert_eq!(body["current_version"], 4);
+        assert_eq!(body["current_target"], "c1tip");
+        assert_eq!(body["conflict"]["id"], "conflict-id");
+        assert_eq!(body["conflict"]["status"], "resolved");
+
+        // Extras also attach to non-conflict typed errors (e.g. 404 with context).
+        let (status, body) = body_of(
+            ApiError::not_found("paused conflict x not found")
+                .with_extra(json!({ "conflict": { "id": "x" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["conflict"]["id"], "x");
     }
 
     #[tokio::test]

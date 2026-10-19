@@ -92,7 +92,11 @@ impl Client {
                 .get("message")
                 .and_then(Value::as_str)
                 .map_or_else(|| value.to_string(), str::to_owned);
-            bail!("HTTP {status}: {code}: {message}");
+            // The facade's error envelope is part of the contract: `details` (merge conflict
+            // report), `conflict` (paused id/status/sides), `stale`/`current_*` and lease fields
+            // must reach the human/agent instead of being flattened to one line.
+            let body = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+            bail!("HTTP {status}: {code}: {message}\n{body}");
         }
         Ok(value)
     }
