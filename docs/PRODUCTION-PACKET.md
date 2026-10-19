@@ -29,11 +29,10 @@ deliberate: isolation before load, load before scale, offsite before calling it 
   ref scopes still work; tests.
 - **Est:** 0.5–1 day. **Owner:** façade. **Depends:** P0-1 (repo identity in the check).
 
-### P0-3 App-level rate limiting and per-agent quotas
-- **Gap:** one agent can exhaust the pool/connection budget.
-- **Change:** token bucket per principal at the façade; 429 + Retry-After; per-agent quota config.
-- **Acceptance:** burst test returns 429, no 5xx cascade, quotas observable; tests.
-- **Est:** 0.5–1 day. **Owner:** façade/ops.
+### P0-3 Rate limiting/quotas — MOVED TO TECH DEBT (2026-10-18)
+- **Why:** free models are in use and there is no spend worth gating. Enforcing quotas now is fake rigor.
+- **Deferred to:** `docs/TECH_DEBT.md` TD-4. Reopen only if paid models or shared production load return.
+- **Replaced by:** wall-time check — `Culebraluxe docs/agent/RUN-BUDGET.md` (flag over N=120 min, not block).
 
 ### P0-4 N-agent soak with real agents
 - **Gap:** no load/soak/chaos; pilot was one local process, one branch.

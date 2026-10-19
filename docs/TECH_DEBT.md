@@ -76,3 +76,15 @@ Every service boot `ensure_repo`s the configured default repository (`forgevcs`)
 pruned control plane is never fully empty: the next boot recreates it. This is by design and is
 documented in `docs/M1-roles.md`; it belongs to the DevOps seat's operational model rather than
 the engine's debt.
+
+## TD-4 — Rate limiting / per-agent quotas deferred (2026-10-18)
+
+**Gap.** No app-level rate limiting or per-agent quotas at the façade.
+
+**Why deferred.** Free models are in use and there is no spend worth gating; quotas would be
+ceremony without a real cost driver. The operational proxy now is wall time:
+`Culebraluxe docs/agent/RUN-BUDGET.md` (flag over N=120 minutes, do not block).
+
+**Reopen when.** Paid models return, multiple tenants share the service, or a real connection-pool
+incident occurs. Closing requires token bucket per principal, 429 + Retry-After, observable quotas,
+burst tests.
