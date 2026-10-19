@@ -24,6 +24,7 @@ import argparse
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -51,6 +52,12 @@ REPO_TABLES = [
 
 FORMAT = "forgevcs-repo-backup-v1"
 
+# Loopback VCS calls must not go through proxy discovery. Under launchd (a non-login context)
+# macOS's urllib proxy path (_scproxy) can block for minutes inside SystemConfiguration; that is
+# how the installed daily job booted the service and then hung instead of finishing. These calls
+# are always to 127.0.0.1, so an explicit empty ProxyHandler is both correct and fast.
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class BackupError(RuntimeError):
     pass
@@ -72,7 +79,8 @@ class Vcs:
         for key, value in self.extra_headers.items():
             request.add_header(key, value)
         try:
-            with urllib.request.urlopen(request, timeout=300) as response:
+            # _NO_PROXY_OPENER, not urlopen(): see the comment on its definition (launchd hang).
+            with _NO_PROXY_OPENER.open(request, timeout=300) as response:
                 return json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as error:
             raise BackupError(
@@ -96,9 +104,27 @@ def mint(base: str, principal: str, secret: str) -> str:
     )["token"]
 
 
+def require_psql() -> str:
+    """Resolve the psql binary (TD-2): the archive's metadata half is a psql COPY export.
+
+    A missing client is a named refusal with the install hint, not a mid-zip stack trace; the
+    scheduled job preflights this and turns it into a failure alert.
+    """
+    explicit = os.environ.get("FORGEVCS_PSQL", "").strip()
+    if explicit and os.path.isfile(explicit) and os.access(explicit, os.X_OK):
+        return explicit
+    found = shutil.which("psql")
+    if found:
+        return found
+    raise BackupError(
+        "psql not found on PATH (TD-2): the archive metadata is exported with psql COPY. "
+        "Install the PostgreSQL client (brew install postgresql@16) or set FORGEVCS_PSQL."
+    )
+
+
 def psql(url: str, sql: str, stdin: bytes | None = None) -> bytes:
     result = subprocess.run(
-        ["psql", url, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-Atc", sql],
+        [require_psql(), url, "-X", "-q", "-v", "ON_ERROR_STOP=1", "-Atc", sql],
         input=stdin,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -144,6 +170,8 @@ def backup(base: str, token: str, database_url: str, repo: str, out_path: str) -
         archive.writestr("blobs.json", json.dumps(blobs))
         for table, data in rows.items():
             archive.writestr(f"rows/{table}.copy", data)
+    # Every backup verifies its own archive before it is reported as a backup.
+    manifest["verified"] = verify_archive(out_path)["repo"] == repo
     return manifest
 
 
@@ -155,6 +183,63 @@ def read_archive(zip_path: str):
     return manifest, rows, blobs
 
 
+def verify_archive(zip_path: str) -> dict:
+    """Open an archive and prove its contents agree with its manifest.
+
+    Every backup runs this immediately after writing, and the restore drill runs it before
+    restoring: an archive whose row files disagree with `manifest.json` is not a backup. No
+    database and no service are involved.
+    """
+    if not os.path.isfile(zip_path):
+        raise BackupError(f"archive does not exist: {zip_path}")
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            missing = [
+                name
+                for name in ["manifest.json", "blobs.json"]
+                + [f"rows/{table}.copy" for table in REPO_TABLES]
+                if name not in archive.namelist()
+            ]
+            if missing:
+                raise BackupError(f"{zip_path} is missing archive members: {missing}")
+            manifest = json.loads(archive.read("manifest.json"))
+            blobs = json.loads(archive.read("blobs.json"))
+            rows = {table: archive.read(f"rows/{table}.copy") for table in REPO_TABLES}
+    except zipfile.BadZipFile as error:
+        raise BackupError(f"{zip_path} is not a readable zip: {error}") from error
+    if manifest.get("format") != FORMAT:
+        raise BackupError(f"{zip_path} is not a {FORMAT} archive")
+    if not manifest.get("repo") or not manifest.get("repo_id"):
+        raise BackupError(f"{zip_path} manifest has no repo identity")
+    if not isinstance(manifest.get("refs"), list):
+        raise BackupError(f"{zip_path} manifest has no refs list")
+    stored_counts = {table: int(manifest.get("row_counts", {}).get(table, -1)) for table in REPO_TABLES}
+    actual_counts = {
+        table: 0 if not data.strip() else data.rstrip(b"\n").count(b"\n") + 1
+        for table, data in rows.items()
+    }
+    if actual_counts != stored_counts:
+        raise BackupError(
+            f"{zip_path} row counts disagree with its manifest: {actual_counts} vs {stored_counts}"
+        )
+    entries = blobs.get("entries")
+    if not isinstance(entries, list):
+        raise BackupError(f"{zip_path} blobs.json has no entries list")
+    if len(entries) != int(manifest.get("blob_count", -1)):
+        raise BackupError(
+            f"{zip_path} blob count disagrees with its manifest: "
+            f"{len(entries)} vs {manifest.get('blob_count')}"
+        )
+    return {
+        "repo": manifest["repo"],
+        "repo_id": int(manifest["repo_id"]),
+        "row_counts": actual_counts,
+        "blob_count": len(entries),
+        "refs": len(manifest["refs"]),
+        "zip_bytes": os.path.getsize(zip_path),
+    }
+
+
 def restore(
     base: str,
     token: str,
@@ -163,6 +248,7 @@ def restore(
     zip_path: str,
     replace: bool,
 ) -> dict:
+    verification = verify_archive(zip_path)
     manifest, rows, blobs = read_archive(zip_path)
     if manifest.get("format") != FORMAT:
         raise BackupError(f"{zip_path} is not a {FORMAT} archive")
@@ -190,16 +276,30 @@ def restore(
         data = rows[table]
         if data.strip():
             psql(database_url, f"COPY {table} FROM STDIN", stdin=data)
-    vcs.call(
-        "POST",
-        f"/repos/{repo}/blobs/import",
-        {"entries": blobs.get("entries", [])},
-    )
+    # Exact metadata verification happens BEFORE the blob import, because an import can legitimately
+    # add service-written rows; at this point the rows must be byte-for-byte the archived set.
+    restored_counts = {
+        table: int(psql(database_url, f"SELECT count(*) FROM {table} WHERE repo_id = {rid}").strip() or 0)
+        for table in REPO_TABLES
+    }
+    if restored_counts != verification["row_counts"]:
+        raise BackupError(
+            f"restored row counts do not match the archive: {restored_counts} vs {verification['row_counts']}"
+        )
+    entries = blobs.get("entries", [])
+    vcs.call("POST", f"/repos/{repo}/blobs/import", {"entries": entries})
+    exported = vcs.call("GET", f"/repos/{repo}/blobs/export").get("count", 0)
+    if exported != len(entries):
+        raise BackupError(
+            f"restored blob count does not match the archive: service reports {exported}, archive has {len(entries)}"
+        )
     return {
         "repo": repo,
-        "rows": {table: 0 if not rows[table].strip() else rows[table].rstrip(b"\n").count(b"\n") + 1 for table in REPO_TABLES},
-        "blobs": len(blobs.get("entries", [])),
+        "rows": restored_counts,
+        "blobs": len(entries),
+        "refs": verification["refs"],
         "manifest": manifest,
+        "verified": True,
     }
 
 
@@ -215,8 +315,21 @@ def main() -> int:
         p.add_argument("--zip", required=True)
         if name == "restore":
             p.add_argument("--replace", action="store_true")
+    p = sub.add_parser("verify", help="verify a zip's contents against its manifest (no service)")
+    p.add_argument("--zip", required=True)
     args = parser.parse_args()
-    if not args.database_url:
+    if args.command == "verify":
+        try:
+            verification = verify_archive(args.zip)
+        except BackupError as error:
+            print(f"FAIL  {error}", file=sys.stderr)
+            return 1
+        print(
+            f"OK  {args.zip}: repo={verification['repo']} rows={sum(verification['row_counts'].values())} "
+            f"blobs={verification['blob_count']} refs={verification['refs']}"
+        )
+        return 0
+    if not args.database_url and args.command != "verify":
         print("FAIL  --database-url or FORGEVCS_BACKUP_DATABASE_URL is required", file=sys.stderr)
         return 2
     token = mint(args.base, "devops", args.devops_secret)

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """backup_acceptance.py — the backup/restore drill for one repository.
 
-Creates a repository with history, zips it, deletes it, restores it, and proves refs and file
-bytes survived. Then it deletes the repository again and runs the orphan GC so the drill leaves
-no rows and no blobs behind. Run through scripts/backup-acceptance.sh (it boots the service).
+Creates a repository with history, zips it, verifies the archive's contents against its manifest,
+deletes the repository, restores it, and proves refs and file bytes survived. Row counts are
+compared to the archive exactly before blob import, and the restored blob count must match. Then
+it deletes the repository again and runs the orphan GC so the drill leaves no rows and no blobs
+behind. Run through scripts/backup-acceptance.sh or scripts/restore-drill.sh (they boot the
+service).
+
+Every check is recorded; when --evidence is given the drill writes a JSON evidence file (used by
+the unattended restore drill and the quarterly proof).
 """
 
 from __future__ import annotations
@@ -11,6 +17,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import secrets
 import sys
 import time
@@ -26,8 +33,10 @@ CONTENT_B = b"ForgeVCS smoke test\n"
 class Check:
     def __init__(self) -> None:
         self.count = 0
+        self.records: list[dict] = []
 
     def ok(self, name: str, condition: bool, detail: str = "") -> None:
+        self.records.append({"name": name, "ok": bool(condition), "detail": detail})
         if not condition:
             raise repo_backup.BackupError(f"{name}: {detail}")
         self.count += 1
@@ -51,19 +60,60 @@ def push_body(parent: str, path: str, blob: str, content: bytes, message: str) -
     }
 
 
+def write_evidence(
+    path: str,
+    *,
+    base: str,
+    repo: str,
+    zip_path: str,
+    check: Check,
+    manifest: dict | None,
+    verification: dict | None,
+    error: str | None,
+) -> None:
+    payload = {
+        "format": "forgevcs-restore-drill-evidence-v1",
+        "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "base": base,
+        "repo": repo,
+        "zip": zip_path,
+        "zip_bytes": os.path.getsize(zip_path) if os.path.isfile(zip_path) else None,
+        "checks": check.records,
+        "checks_passed": check.count,
+        "result": "failed" if error else "ok",
+        "error": error,
+        "manifest": manifest,
+        "archive_verification": verification,
+        "tool_versions": {
+            "python": sys.version.split()[0],
+            "psql_required": True,
+        },
+    }
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    print(f"EVIDENCE {path}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", default="http://127.0.0.1:3994")
     parser.add_argument("--devops-secret", required=True)
     parser.add_argument("--database-url", default=None)
     parser.add_argument("--zip", default="/tmp/forgevcs-backup-acceptance.zip")
+    parser.add_argument("--evidence", default=None, help="write JSON drill evidence here")
     args = parser.parse_args()
-    database_url = args.database_url or __import__("os").environ["FORGEVCS_BACKUP_DATABASE_URL"]
+    database_url = args.database_url or os.environ["FORGEVCS_BACKUP_DATABASE_URL"]
 
     token = repo_backup.mint(args.base, "devops", args.devops_secret)
     vcs = repo_backup.Vcs(args.base, token)
     repo = f"accept-backup-{time.strftime('%y%m%d%H%M%S')}{secrets.token_hex(2)}"
     check = Check()
+    manifest: dict | None = None
+    verification: dict | None = None
+    error: str | None = None
 
     try:
         vcs.call("POST", f"/repos/{repo}/init", {})
@@ -97,6 +147,15 @@ def main() -> int:
             manifest["row_counts"]["changesets"] >= 3 and manifest["blob_count"] >= 1,
             str(manifest["row_counts"]),
         )
+        # TD-2 follow-through: every backup and every drill opens the zip and proves its contents
+        # agree with the manifest (rows files, row counts, blob count, refs).
+        verification = repo_backup.verify_archive(args.zip)
+        check.ok(
+            "backup: archive verified (zip contents match the manifest)",
+            verification["row_counts"] == manifest["row_counts"]
+            and verification["blob_count"] == manifest["blob_count"],
+            f"rows={verification['row_counts']} blobs={verification['blob_count']}",
+        )
 
         vcs.call("DELETE", f"/repos/{repo}", {"confirm": repo})
         check.ok(
@@ -109,6 +168,16 @@ def main() -> int:
             "restore: rows and blobs reimported",
             result["rows"]["changesets"] >= 3 and result["blobs"] >= 1,
             str(result["rows"]),
+        )
+        check.ok(
+            "restore: row counts match the archive exactly",
+            result["rows"] == manifest["row_counts"],
+            f"{result['rows']} vs {manifest['row_counts']}",
+        )
+        check.ok(
+            "restore: blob count matches the archive",
+            result["blobs"] == manifest["blob_count"],
+            f"{result['blobs']} vs {manifest['blob_count']}",
         )
         after_refs = vcs.call("GET", f"/repos/{repo}/refs")["refs"]
         before = {ref["name"]: (ref["target"], ref["version"]) for ref in before_refs}
@@ -124,12 +193,29 @@ def main() -> int:
             "restore: both file versions survived",
             after_a == CONTENT_A and after_b == CONTENT_B,
         )
+    except repo_backup.BackupError as caught:
+        error = str(caught)
+        raise
     finally:
-        # Teardown: delete the repository, then collect its orphan blobs.
-        if vcs.status("GET", f"/repos/{repo}/refs") == 200:
-            vcs.call("DELETE", f"/repos/{repo}", {"confirm": repo})
-        gc = vcs.call("POST", "/admin/gc/objects", {"apply": True})["gc"]
-        print(f"TEARDOWN  deleted {repo}; GC removed {gc['deleted_keys']} orphan keys")
+        # Teardown: delete the repository, then collect its orphan blobs. The drill leaves nothing.
+        try:
+            if vcs.status("GET", f"/repos/{repo}/refs") == 200:
+                vcs.call("DELETE", f"/repos/{repo}", {"confirm": repo})
+            gc = vcs.call("POST", "/admin/gc/objects", {"apply": True})["gc"]
+            print(f"TEARDOWN  deleted {repo}; GC removed {gc['deleted_keys']} orphan keys")
+        except repo_backup.BackupError as teardown_error:
+            print(f"WARN  teardown: {teardown_error}", file=sys.stderr)
+        if args.evidence:
+            write_evidence(
+                args.evidence,
+                base=args.base,
+                repo=repo,
+                zip_path=args.zip,
+                check=check,
+                manifest=manifest,
+                verification=verification,
+                error=error,
+            )
 
     print(f"OK  {check.count} backup/restore checks passed ({args.zip})")
     return 0
