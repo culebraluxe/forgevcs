@@ -127,6 +127,30 @@ async fn authorize_provisioning(
 // POST /repos/{repo}/init
 // ---------------------------------------------------------------------------------------------
 
+/// The FVCS-01 repository-identity check alone.
+///
+/// Used by operations that call a vendored handler directly (`merge`, `rebase`, `land`,
+/// `merge-land`, ref provisioning): upstream enforces the path/ref policy, so the façade must
+/// still enforce repository identity or a principal could act in another agent's repository.
+async fn authorize_repository(
+    state: &Arc<AppState>,
+    engine: &Arc<Engine>,
+    caller: &CallerCtx,
+    repo: &str,
+    action: Action,
+) -> ApiResult<()> {
+    let policy = engine.context().policy.current();
+    match state
+        .authz
+        .authorize_repository(&policy, &caller.principal, repo, action)
+        .await
+    {
+        Ok(decision) if decision.allow => Ok(()),
+        Ok(decision) => Err(ApiError::permission_denied(decision.reason)),
+        Err(status) => Err(ApiError::from(status)),
+    }
+}
+
 /// `POST /repos/{repo}/init` — create the repository if this process has not already booted it.
 ///
 /// `Engine::connect` creates the `repos` row and upstream's `ServerApp::build` bootstraps the
@@ -1239,6 +1263,11 @@ pub(crate) async fn ref_create(
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) =
+        authorize_repository(&state, &engine, &caller, &repo, Action::UpdateRef).await
+    {
+        return error.into_response();
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
@@ -1290,6 +1319,9 @@ pub(crate) async fn rebase(
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = authorize_repository(&state, &engine, &caller, &repo, Action::Read).await {
+        return error.into_response();
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
@@ -1346,6 +1378,9 @@ pub(crate) async fn merge(
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = authorize_repository(&state, &engine, &caller, &repo, Action::Write).await {
+        return error.into_response();
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
@@ -1413,6 +1448,9 @@ pub(crate) async fn land(
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = authorize_repository(&state, &engine, &caller, &repo, Action::Write).await {
+        return error.into_response();
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
@@ -1485,6 +1523,9 @@ pub(crate) async fn merge_land(
         Ok(engine) => engine,
         Err(error) => return error.into_response(),
     };
+    if let Err(error) = authorize_repository(&state, &engine, &caller, &repo, Action::Write).await {
+        return error.into_response();
+    }
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),

@@ -63,11 +63,16 @@ bearer token -> principal -> Scion path/ref policy
   of inheriting the deleted repository's principal. Operator-configured rules are config and are
   not removed.
 
-`AuthorizationService::authorize` is the single choke point, so every business route (pull, refs,
-commits, changeset, file, tree, diff, merge-base, workspaces, ref updates) inherits repository
-scoping. `AuthorizationService::authorize_provisioning` is init-only and skips the repository
-layer because the owner does not exist until after the engine boots; `claim_repo_owner` runs
-immediately after.
+`AuthorizationService::authorize` is the choke point for every route whose handler relies on the
+façade's path/ref pre-flight (pull, refs, commits, changeset, file, tree, diff, merge-base,
+workspaces, push). `AuthorizationService::authorize_repository` applies the **same repository
+layer alone** to operations the vendored handler authorizes itself: `merge` and `land`
+(write), `rebase` (read), `merge-land` (write) and `ref create` (update-ref). Those handlers
+previously inherited only upstream's path/ref check, so without this call a principal could act
+in another agent's repository; `authz::tests::repository_identity_applies_to_upstream_checked_operations`
+covers the refusal. `AuthorizationService::authorize_provisioning` is init-only and skips the
+repository layer because the owner does not exist until after the engine boots;
+`claim_repo_owner` runs immediately after.
 
 ## FVCS-02 — path-prefix push scopes
 

@@ -6,6 +6,7 @@
 //! stack runs (ADR-0002 D4). No loopback gRPC, no second authorization path.
 
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -26,6 +27,7 @@ use crate::authz::AuthorizationService;
 use crate::config::{self, Config};
 use crate::engine::{Engine, Engines};
 use crate::facade;
+use crate::human::HumanPrincipals;
 
 /// Service name reported by every probe and façade response.
 pub const SERVICE: &str = "forgevcs";
@@ -45,6 +47,8 @@ pub struct AppState {
     pub authz: Arc<AuthorizationService>,
     /// Pool for the `repos` registry, used to boot an existing repository on demand.
     pub db: Option<Pool>,
+    /// Configured human principals for the browserless token path (`FORGEVCS_HUMAN_PRINCIPALS`).
+    pub humans: Arc<HumanPrincipals>,
 }
 
 impl AppState {
@@ -149,6 +153,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/ready", get(ready_handler))
         .route("/version", get(version))
         .route("/auth/token", post(token))
+        .route("/auth/human-token", post(human_token))
         .route("/auth/whoami", get(whoami))
         .route("/repos/{repo}/init", post(facade::init))
         .route("/repos/{repo}/push", post(facade::push))
@@ -278,6 +283,81 @@ async fn token(State(state): State<Arc<AppState>>, Json(body): Json<TokenRequest
     }
 }
 
+/// `POST /auth/human-token` body: a configured human login plus the secret supplied to the CLI.
+#[derive(Debug, Deserialize)]
+pub struct HumanTokenRequest {
+    /// Human login configured in `FORGEVCS_HUMAN_PRINCIPALS` (e.g. `culebraluxe`).
+    login: String,
+    /// The human's locally supplied secret. Never stored or logged; only its digest is compared.
+    secret: String,
+}
+
+fn unix_seconds(t: SystemTime) -> i64 {
+    t.duration_since(UNIX_EPOCH).map_or(i64::MAX, |duration| {
+        i64::try_from(duration.as_secs()).unwrap_or(i64::MAX)
+    })
+}
+
+/// `POST /auth/human-token` — mint a bearer token for a configured human, without a browser.
+///
+/// This is the human counterpart of `AuthService.Login`'s GitHub flow: the credential is a
+/// locally supplied secret whose SHA-256 digest is configured (never the secret itself), and the
+/// issued principal is the same `github:<login>` identity a browser login would produce — so
+/// `acl.toml`, the repository ACL and the decision audit need no human-specific branch. The mint
+/// is written to `forgevcs_auth_decisions` (`action = token_mint`) when an audit store is
+/// configured; human authorization decisions are audited there too.
+///
+/// No password is stored in this repository or in the token: the token is signed by the engine
+/// keyring exactly like the service-principal token, and the CLI stores it locally with mode
+/// 0600.
+async fn human_token(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<HumanTokenRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return ApiError::from(rejection).into_response(),
+    };
+    let Some(human) = state
+        .humans
+        .authenticate(&body.login, body.secret.as_bytes())
+    else {
+        tracing::info!(login = %body.login, "human login rejected");
+        return ApiError::unauthenticated("invalid human credentials").into_response();
+    };
+    let Some(engine) = state.auth_engine() else {
+        return no_engine(&state.repo).into_response();
+    };
+    let app = engine.context();
+    let principal = human.principal();
+    let (token, claims) =
+        match app
+            .keyring
+            .issue(&principal, app.config.auth.token_ttl, app.clock.now())
+        {
+            Ok(value) => value,
+            Err(error) => return ApiError::from(error).into_response(),
+        };
+    if let Err(error) = state.authz.record_token_mint(human.id()).await {
+        // The mint is not blocked on the audit store (it may be a storage-less pilot); the
+        // failure is visible in the service log instead.
+        tracing::warn!(%error, subject = human.id(), "human token mint was not audited");
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "service": SERVICE,
+            "status": "ok",
+            "token": token,
+            "principal": principal.id_string(),
+            "email": human.email(),
+            "display": human.display(),
+            "expires_at_unix": unix_seconds(claims.exp),
+        })),
+    )
+        .into_response()
+}
+
 /// `GET /auth/whoami` (D4 seam for `AuthService.WhoAmI`): proves the token this service minted
 /// is accepted by the same verifier every façade call will use.
 async fn whoami(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
@@ -333,8 +413,7 @@ mod tests {
 
     /// Router-level tests must not depend on Neon: with no `FORGEVCS_DATABASE_URL` the registry
     /// boots empty, which is exactly the "engine is down" state /ready and the façade report.
-    async fn app() -> Router {
-        let config = Config::from_lookup(|_| None);
+    async fn app_with(config: Config) -> Router {
         let engines = Arc::new(Engines::boot(&config).await);
         router(Arc::new(AppState {
             ready: Arc::new(StubReadiness),
@@ -345,8 +424,26 @@ mod tests {
                 .database_url
                 .as_deref()
                 .and_then(|url| crate::db::build_pool(url).ok()),
+            humans: Arc::new(HumanPrincipals::from_config(&config)),
             config,
         }))
+    }
+
+    async fn app() -> Router {
+        app_with(Config::from_lookup(|_| None)).await
+    }
+
+    /// SHA-256 of `test-human-secret` (never a real secret).
+    const HUMAN_DIGEST: &str = "1f3fb03fc0864bd597bcb0264e48b55d7138cf5c49a9f5f9007b579d43ef86a7";
+
+    async fn app_with_human() -> Router {
+        let raw = format!(
+            r#"{{"culebraluxe":{{"email":"culebraluxe@gmail.com","display":"Culebraluxe","secret_sha256":"{HUMAN_DIGEST}"}}}}"#
+        );
+        app_with(Config::from_lookup(move |key| {
+            (key == crate::human::HUMAN_PRINCIPALS_VAR).then(|| raw.clone())
+        }))
+        .await
     }
 
     struct StubReadiness;
@@ -441,6 +538,7 @@ mod tests {
                 .database_url
                 .as_deref()
                 .and_then(|url| crate::db::build_pool(url).ok()),
+            humans: Arc::new(HumanPrincipals::default()),
             config,
         }));
         let (status, _, body) = send(
@@ -527,6 +625,74 @@ mod tests {
         assert_eq!(body["status"], "error");
         assert_eq!(body["code"], "unauthenticated");
         assert_eq!(body["message"], "bad token");
+    }
+
+    #[tokio::test]
+    async fn human_token_rejects_an_unknown_login_or_wrong_secret() {
+        let router = app_with_human().await;
+        for body in [
+            r#"{"login":"someone-else","secret":"test-human-secret"}"#,
+            r#"{"login":"culebraluxe","secret":"wrong"}"#,
+            r#"{"login":"","secret":""}"#,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/human-token")
+                        .header(axum::http::header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_owned()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{body}");
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["code"], "unauthenticated", "{body}");
+            assert_eq!(body["message"], "invalid human credentials");
+        }
+    }
+
+    #[tokio::test]
+    async fn human_token_with_valid_credentials_needs_an_engine() {
+        // The credential is checked first, so a storage-less process answers 503 (not 401) once
+        // the human is authenticated; that is the same D5 contract as every engine-backed route.
+        let (status, _, body) = send(
+            app_with_human().await,
+            Request::builder()
+                .method("POST")
+                .uri("/auth/human-token")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"login":"culebraluxe","secret":"test-human-secret"}"#,
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "unavailable");
+    }
+
+    #[tokio::test]
+    async fn human_token_rejects_a_malformed_body() {
+        let (status, _, body) = send(
+            app_with_human().await,
+            Request::builder()
+                .method("POST")
+                .uri("/auth/human-token")
+                .header(axum::http::header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"login":"culebraluxe"}"#))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["code"], "invalid_argument");
     }
 
     #[tokio::test]

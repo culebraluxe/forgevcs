@@ -1,0 +1,28 @@
+{
+  "objects": [
+    {
+      "id": "b18d4a0cdcc288bea07a73911afc5ec5eefa1a31ad3a8bcc190d7deb50ba2bb298",
+      "kind": 1,
+      "data": "aGVsbG8gZnJvbSBmb3JnZXZjcy1jbGkK"
+    }
+  ],
+  "changeset": {
+    "parents": ["__PARENT_CHANGESET__"],
+    "delta": [
+      {
+        "path": "hello.txt",
+        "op": 1,
+        "mode": 1,
+        "id": "b18d4a0cdcc288bea07a73911afc5ec5eefa1a31ad3a8bcc190d7deb50ba2bb298",
+        "size": 24
+      }
+    ],
+    "meta": {
+      "author": "Culebraluxe <culebraluxe@gmail.com>",
+      "message": "demo: add hello.txt from the human CLI"
+    },
+    "change_id": "__CHANGE_ID__"
+  },
+  "ref": "main",
+  "mode": "land"
+}

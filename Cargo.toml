@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/forgevcs-service"]
+members = ["crates/forgevcs-service", "crates/forgevcs-cli"]
 # `upstream/` has its own [workspace] root and its own gate. Without this,
 # cargo would auto-claim the vendored crates as members of *this* workspace and
 # try to resolve their `version.workspace = true` inheritance here.
@@ -55,6 +55,9 @@ tokio-postgres = "=0.7.18"
 tokio-postgres-rustls = { version = "=0.14.0", default-features = false, features = ["ring"] }
 anyhow = "=1.0.104"
 tracing = "=0.1.44"
+sha2 = "=0.10.9"
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json", "http2"] }
+toml = "=0.9.12"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

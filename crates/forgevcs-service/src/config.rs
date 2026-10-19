@@ -71,6 +71,11 @@ pub struct Config {
     /// vendored `acl.toml` policy; this value is how a pilot pre-assigns a repository to an
     /// agent without an admin API. Owners are otherwise claimed by the first `init`.
     pub repo_acls: Option<String>,
+    /// Configured human principals (`FORGEVCS_HUMAN_PRINCIPALS`), JSON
+    /// `login -> {email, display, secret_sha256}`. A human authenticates through
+    /// `POST /auth/human-token` and is then the same `github:<login>` principal the browser
+    /// login issues; the secret itself is never stored here.
+    pub human_principals: Option<String>,
 }
 
 impl Config {
@@ -104,6 +109,7 @@ impl Config {
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
             repo_acls: get(&["FORGEVCS_REPO_ACLS"]),
+            human_principals: get(&["FORGEVCS_HUMAN_PRINCIPALS"]),
         }
     }
 
@@ -150,6 +156,10 @@ impl Config {
         if let Some(raw) = &self.repo_acls {
             crate::repo_acl::parse_configured(raw)
                 .map_err(|error| format!("FORGEVCS_REPO_ACLS is invalid: {error}"))?;
+        }
+        if let Some(raw) = &self.human_principals {
+            crate::human::parse_configured(raw)
+                .map_err(|error| format!("FORGEVCS_HUMAN_PRINCIPALS is invalid: {error}"))?;
         }
         if let Some(mode) = &self.auth_mode
             && !matches!(
@@ -349,6 +359,29 @@ mod tests {
             cfg.validate()
                 .err()
                 .is_some_and(|error| error.contains("FORGEVCS_REPO_ACLS")),
+            "the error names the variable an operator must fix"
+        );
+    }
+
+    #[test]
+    fn human_principals_are_validated_at_startup() {
+        let digest = "a".repeat(64);
+        let raw = format!(
+            r#"{{"culebraluxe":{{"email":"culebraluxe@gmail.com","display":"Culebraluxe","secret_sha256":"{digest}"}}}}"#
+        );
+        let cfg = config(&[("FORGEVCS_HUMAN_PRINCIPALS", &raw)]);
+        assert!(cfg.human_principals.is_some());
+        assert_eq!(cfg.validate(), Ok(()));
+
+        let cfg = config(&[("FORGEVCS_HUMAN_PRINCIPALS", "not json")]);
+        assert!(
+            cfg.validate().is_err(),
+            "a malformed human principal must not silently disable the path"
+        );
+        assert!(
+            cfg.validate()
+                .err()
+                .is_some_and(|error| error.contains("FORGEVCS_HUMAN_PRINCIPALS")),
             "the error names the variable an operator must fix"
         );
     }

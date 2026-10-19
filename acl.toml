@@ -20,8 +20,13 @@
 version = 1
 
 [groups]
-agents = ["service:maestro", "service:opencode", "service:forgevcs-workspace"]
-devops = ["service:maestro"]
+# `github:culebraluxe` is the human operator's first-class identity (docs/WORK-ORDER-HUMAN-CLI.md).
+# A human configured in FORGEVCS_HUMAN_PRINCIPALS mints a token through POST /auth/human-token and
+# is then authenticated as the same `github:<login>` principal the browser login issues; it is an
+# ordinary policy member, granted the worker paths and the single DevOps seat because this human
+# runs the repository lifecycle for ForgeVCS.
+agents = ["service:maestro", "service:opencode", "service:forgevcs-workspace", "github:culebraluxe"]
+devops = ["service:maestro", "github:culebraluxe"]
 
 # The `/` rule is required by the parser and is the fallback for every path.
 [[paths]]

@@ -196,8 +196,9 @@ WHERE i.provider = $1 AND i.provider_subject = $2
 "#;
 
 impl AuthorizationService {
-    /// Build the service from configuration. In `SCION_ONLY` no database connection is opened;
-    /// the other modes create a small pool and ensure the decision table exists.
+    /// Build the service from configuration. In `SCION_ONLY` service-principal decisions are not
+    /// written; the pool is opened only to audit human decisions (the human CLI path requires
+    /// it). The other modes create the pool for Culebra decisions and ensure the table exists.
     pub async fn from_config(config: &Config) -> Self {
         let mode = AuthMode::parse(config.auth_mode.as_deref());
         tracing::info!(mode = mode.as_str(), "authorization A/B mode parsed");
@@ -205,9 +206,11 @@ impl AuthorizationService {
         // too (the hosted default), so it is built before the mode-specific early returns.
         let repo_acl = RepoAcl::from_config(config).await;
         if mode == AuthMode::ScionOnly {
+            // Humans are audited in the hosted default (the CLI path depends on the table), while
+            // agent traffic keeps the existing zero-write behavior.
             return Self {
                 mode,
-                pool: None,
+                pool: human_audit_pool(config).await,
                 repo_acl,
             };
         }
@@ -330,6 +333,52 @@ impl AuthorizationService {
             .map_err(repo_acl_unavailable)
     }
 
+    /// The repository-identity layer alone, for operations whose upstream handler already
+    /// enforces the path/ref policy (`Merge`, `Rebase`, `Land`, `CreateRef`).
+    ///
+    /// FVCS-01 requires repository identity on **every** business request; handlers that call a
+    /// vendored handler directly must ask for this layer explicitly, otherwise the upstream
+    /// path/ref check would let a principal act in a repository it does not own. The decision is
+    /// audited for humans exactly like `authorize`'s repository half.
+    pub async fn authorize_repository(
+        &self,
+        policy: &Policy,
+        principal: &Principal,
+        repository: &str,
+        action: Action,
+    ) -> Result<Decision, Status> {
+        let decision = self
+            .repository_scope(policy, principal, repository, action)
+            .await?;
+        if is_human(principal)
+            && let Err(error) = self
+                .record(
+                    principal,
+                    repository,
+                    action,
+                    None,
+                    None,
+                    decision.allow,
+                    None,
+                    decision.allow,
+                    false,
+                    &decision.reason,
+                )
+                .await
+        {
+            tracing::error!(%error, "could not record human repository decision");
+            if self.mode == AuthMode::DualEnforce {
+                return Err(Status::unavailable(
+                    "authorization decision could not be audited; DUAL_ENFORCE fails closed",
+                ));
+            }
+        }
+        Ok(Decision {
+            allow: decision.allow,
+            reason: decision.reason,
+        })
+    }
+
     /// Evaluate one business request: path/ref policy AND repository identity. Culebra is added
     /// for every mode except `SCION_ONLY`. See the module docs for the combination rule.
     pub async fn authorize(
@@ -394,13 +443,34 @@ impl AuthorizationService {
         let scion_allow = path_allow && repo_decision.allow;
 
         if self.mode == AuthMode::ScionOnly {
-            return Ok(if scion_allow {
+            let decision = if scion_allow {
                 allow()
             } else if !path_allow {
                 deny("Scion policy denied")
             } else {
                 deny(repo_decision.reason)
-            });
+            };
+            // A human is audited even in the hosted default. Service principals keep their
+            // existing zero-write behavior in `SCION_ONLY` (W6 shadow mode covers them).
+            if is_human(principal)
+                && let Err(error) = self
+                    .record(
+                        principal,
+                        repository,
+                        action,
+                        path,
+                        ref_name,
+                        scion_allow,
+                        None,
+                        decision.allow,
+                        false,
+                        &decision.reason,
+                    )
+                    .await
+            {
+                tracing::error!(%error, "could not record human authorization decision");
+            }
+            return Ok(decision);
         }
         if self.mode == AuthMode::CulebraOnly {
             return Err(Status::unimplemented(
@@ -514,17 +584,64 @@ impl AuthorizationService {
         mismatch: bool,
         reason: &str,
     ) -> Result<(), String> {
+        self.record_row(
+            &principal.id_string(),
+            action.as_str(),
+            repository,
+            path,
+            ref_name,
+            scion_allow,
+            culebra_allow,
+            final_allow,
+            mismatch,
+            reason,
+        )
+        .await
+    }
+
+    /// Audit a human token mint in `forgevcs_auth_decisions`. The row records the identity and
+    /// the outcome; it never contains the secret or the issued token. An absent audit store is
+    /// reported to the caller (which logs it) rather than blocking the mint.
+    pub async fn record_token_mint(&self, subject: &str) -> Result<(), String> {
+        self.record_row(
+            subject,
+            "token_mint",
+            "-",
+            None,
+            None,
+            true,
+            None,
+            true,
+            false,
+            "human token minted",
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_row(
+        &self,
+        subject: &str,
+        action: &str,
+        repository: &str,
+        path: Option<&str>,
+        ref_name: Option<&str>,
+        scion_allow: bool,
+        culebra_allow: Option<bool>,
+        final_allow: bool,
+        mismatch: bool,
+        reason: &str,
+    ) -> Result<(), String> {
         let Some(pool) = &self.pool else {
             return Err("no database pool".to_owned());
         };
         let client = pool.get().await.map_err(|error| error.to_string())?;
-        let subject = principal.id_string();
         client
             .execute(
                 INSERT_DECISION,
                 &[
                     &subject,
-                    &action.as_str(),
+                    &action,
                     &repository,
                     &path,
                     &ref_name,
@@ -539,6 +656,28 @@ impl AuthorizationService {
             .await
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+}
+
+/// A human principal is the `github:` identity the browser login also issues.
+fn is_human(principal: &Principal) -> bool {
+    matches!(principal, Principal::GitHub { .. })
+}
+
+/// Build the pool used to audit human decisions in `SCION_ONLY`.
+async fn human_audit_pool(config: &Config) -> Option<Pool> {
+    let url = config.database_url.as_deref()?;
+    match crate::db::build_pool(url) {
+        Ok(pool) => {
+            if let Err(error) = ensure_schema(&pool).await {
+                tracing::error!(%error, "could not ensure forgevcs_auth_decisions");
+            }
+            Some(pool)
+        }
+        Err(error) => {
+            tracing::error!(%error, "human authorization audit pool did not start");
+            None
+        }
     }
 }
 
@@ -596,8 +735,8 @@ mod tests {
 version = 1
 
 [groups]
-agents = ["service:agent-a", "service:agent-b", "service:maestro"]
-devops = ["service:maestro"]
+agents = ["service:agent-a", "service:agent-b", "service:maestro", "github:culebraluxe"]
+devops = ["service:maestro", "github:culebraluxe"]
 
 [[paths]]
 prefix = "/"
@@ -813,6 +952,82 @@ trunk = ["group:devops"]
             .expect("push");
         assert!(!cross_repo.allow, "repository identity applies to push");
     }
+    #[tokio::test]
+    async fn repository_identity_applies_to_upstream_checked_operations() {
+        // Merge/Rebase/Land/CreateRef call a vendored handler directly, so the façade asks for
+        // the repository layer itself (qa finding). Every action must still be scoped.
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let agent_a = principal("service:agent-a");
+        claimed(&service, "pilot-a", "service:agent-a").await;
+        claimed(&service, "pilot-b", "service:agent-b").await;
+
+        for action in [Action::Read, Action::Write, Action::UpdateRef] {
+            assert!(
+                service
+                    .authorize_repository(&policy, &agent_a, "pilot-a", action)
+                    .await
+                    .expect("own repository")
+                    .allow,
+                "owner must pass {action:?}"
+            );
+            let refused = service
+                .authorize_repository(&policy, &agent_a, "pilot-b", action)
+                .await
+                .expect("other repository");
+            assert!(
+                !refused.allow,
+                "cross-repository {action:?} must be refused for merge/rebase/land/ref-create"
+            );
+            assert!(refused.reason.contains("cross-repository"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_human_principal_is_authorized_like_any_github_login() {
+        let service = service_with_repo_acl();
+        let policy = test_policy();
+        let human = principal("github:culebraluxe");
+        claimed(&service, "human-repo", "github:culebraluxe").await;
+        claimed(&service, "pilot-b", "service:agent-b").await;
+
+        assert!(
+            service
+                .authorize(
+                    &policy,
+                    &human,
+                    "human-repo",
+                    Action::Write,
+                    Some("docs/readme.md"),
+                    Some("refs/heads/lane"),
+                )
+                .await
+                .expect("human write own repo")
+                .allow
+        );
+        // One refusal: path policy still governs where the human may write. The longest write
+        // rule for `lane/a/**` names only `service:agent-a`, so the DevOps human is refused even
+        // though its `/` write grant and `admin.repos` bypass would allow the repository.
+        let refused = service
+            .authorize(
+                &policy,
+                &human,
+                "human-repo",
+                Action::Write,
+                Some("lane/a/x"),
+                Some("refs/heads/lane"),
+            )
+            .await
+            .expect("human refused path");
+        assert!(!refused.allow);
+        assert_eq!(refused.reason, "Scion policy denied");
+        assert_eq!(
+            service.record_token_mint("github:culebraluxe").await,
+            Err("no database pool".to_owned()),
+            "the audit is optional in a storage-less process, never an allow decision"
+        );
+    }
+
     #[tokio::test]
     async fn provisioning_skips_repository_identity_but_business_requests_deny() {
         let service = service_with_repo_acl();

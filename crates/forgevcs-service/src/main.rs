@@ -51,6 +51,9 @@ async fn main() -> anyhow::Result<()> {
         "forgevcs listening"
     );
 
+    let humans = Arc::new(forgevcs_service::human::HumanPrincipals::from_config(
+        &config,
+    ));
     let state = Arc::new(AppState {
         ready,
         engines,
@@ -58,6 +61,7 @@ async fn main() -> anyhow::Result<()> {
         config,
         authz,
         db,
+        humans,
     });
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown())

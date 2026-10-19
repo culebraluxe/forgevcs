@@ -30,6 +30,8 @@ pub(crate) type ApiResult<T> = Result<T, ApiError>;
 pub(crate) enum ApiError {
     /// 400 — the request is malformed or fails a façade-level validation.
     InvalidArgument(String),
+    /// 401 — the supplied credentials are not accepted (human token mint).
+    Unauthenticated(String),
     /// 403 — authentication succeeded but the principal is not allowed to act.
     PermissionDenied(String),
     /// 404 — the addressed object/repository does not exist.
@@ -54,6 +56,10 @@ impl ApiError {
     // The constructors exist so call sites spell intent, not a status/code pair.
     pub(crate) fn invalid_argument(message: impl Into<String>) -> Self {
         Self::InvalidArgument(message.into())
+    }
+
+    pub(crate) fn unauthenticated(message: impl Into<String>) -> Self {
+        Self::Unauthenticated(message.into())
     }
 
     pub(crate) fn permission_denied(message: impl Into<String>) -> Self {
@@ -82,6 +88,9 @@ impl IntoResponse for ApiError {
         let (status, code, message, details) = match self {
             Self::InvalidArgument(message) => {
                 (StatusCode::BAD_REQUEST, "invalid_argument", message, None)
+            }
+            Self::Unauthenticated(message) => {
+                (StatusCode::UNAUTHORIZED, "unauthenticated", message, None)
             }
             Self::PermissionDenied(message) => {
                 (StatusCode::FORBIDDEN, "permission_denied", message, None)
@@ -337,6 +346,11 @@ mod tests {
                 ApiError::permission_denied("x"),
                 StatusCode::FORBIDDEN,
                 "permission_denied",
+            ),
+            (
+                ApiError::unauthenticated("x"),
+                StatusCode::UNAUTHORIZED,
+                "unauthenticated",
             ),
             (ApiError::not_found("x"), StatusCode::NOT_FOUND, "not_found"),
             (ApiError::conflict("x"), StatusCode::CONFLICT, "conflict"),
