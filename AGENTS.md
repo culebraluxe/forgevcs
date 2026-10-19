@@ -3,6 +3,23 @@
 **The project is ForgeVCS** (source-control engine: Carter's Scion, vendored). Repo root is
 `/Users/Shared/dev/src/forgevcs`.
 
+
+## Hosted service (orientation — read first)
+
+- **Hosted URL:** `https://culebraluxe-forgevcs.vercel.app` (separate Vercel project, not lane-deep).
+- **Health:** `GET /health`, `GET /ready` (200 only when Postgres + object bucket answer),
+  `GET /version` (service version + upstream Scion SHA).
+- **Deploy:** `bash scripts/deploy-forgevcs-prod.sh` (must run from `main`; wraps the Vercel
+  project deploy, prints the deployment URL and rollback instructions). Hosted smoke:
+  `FORGEVCS_HOSTED_URL=https://culebraluxe-forgevcs.vercel.app bash scripts/w8-hosted-smoke.sh`
+  (needs the external service-principal file; do not put secrets in the repo).
+- **Human CLI target:** `forgevcs --base-url https://culebraluxe-forgevcs.vercel.app …`
+  (token from `forgevcs auth mint`; token file 0600). Hosted human principals are configured by
+  `FORGEVCS_HUMAN_PRINCIPALS`; the local dev harness is documented in
+  `scripts/lane-scope-acceptance.sh`.
+- **Environments:** hosted production (Vercel + Neon), local acceptance (`forgevcs-ci` Neon branch
+  or a throwaway local PG/S3 harness). Never run production-mutating tests against the hosted URL.
+
 Layout: ForgeVCS is its own cargo workspace (`crates/forgevcs-*`) and its own Vercel
 deploy (`Dockerfile.vercel`). `upstream/` is vendored Scion and is a **separate** cargo
 workspace — the root manifest sets `exclude = ["upstream"]` so cargo resolves Scion's
