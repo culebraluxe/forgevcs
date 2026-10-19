@@ -207,7 +207,12 @@ impl Config {
             region: self.region.clone()?,
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
-            allow_http: false,
+            // Production endpoints are HTTPS; an explicit `http://` endpoint is a local/CI harness
+            // (moto/minio) and must opt in by scheme. Never infer HTTP for an https endpoint.
+            allow_http: self
+                .endpoint
+                .as_deref()
+                .is_some_and(|endpoint| endpoint.starts_with("http://")),
             path_style: true,
             key_prefix: self.key_prefix.clone().unwrap_or_default(),
         })
