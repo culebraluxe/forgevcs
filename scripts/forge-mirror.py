@@ -350,6 +350,10 @@ def mirror(args: argparse.Namespace) -> dict[str, Any]:
             counts["added"] += 1
     counts["unchanged"] = len(git_entries) - counts["added"] - counts["modified"]
 
+    if args.check and not unchanged:
+        print(f"DRIFT  {args.repo}: {len(delta)} path(s) differ "
+              f"(added={counts['added']} modified={counts['modified']} deleted={counts['deleted']})")
+        return 3
     report: dict[str, Any] = {
         "repo": args.repo,
         "git_ref": args.git_ref,
@@ -459,6 +463,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--max-push-bytes", type=int, default=3_000_000,
                         help="max encoded object bytes per changeset push (Vercel body limit)")
     parser.add_argument("--dry-run", action="store_true", help="print the delta/would-do, no write")
+    parser.add_argument("--check", action="store_true",
+                        help="drift check: exit 3 if the mirror is not already the git tree (no write)")
     parser.add_argument("--json", action="store_true", help="print the report JSON")
     parser.add_argument("--json-report", help="write the report JSON to this file")
     args = parser.parse_args(argv)
