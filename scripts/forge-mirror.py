@@ -323,6 +323,12 @@ def verify(client: Client, target: str, git_entries: dict[str, GitEntry]) -> dic
 
 def mirror(args: argparse.Namespace) -> dict[str, Any]:
     commit, git_entries = read_git_tree(args.git_repo, args.git_ref)
+    excluded: list[str] = []
+    for prefix in getattr(args, "exclude", []) or []:
+        before = len(git_entries)
+        git_entries = {p: e for p, e in git_entries.items() if not (p == prefix or p.startswith(prefix.rstrip("/") + "/"))}
+        excluded.append(f"{prefix} ({before - len(git_entries)} paths)")
+    filtered = bool(excluded)
     client = Client(args.base, args.token, args.repo, args.bypass)
     client.init()
     refs = client.refs()["refs"]
@@ -422,7 +428,9 @@ def mirror(args: argparse.Namespace) -> dict[str, Any]:
     verification["root_tree_id"] = root_tree_id
     verification["server_root_tree_id"] = server_tree_id
     verification["tree_id_reproduced"] = server_tree_id == root_tree_id
-    if not verification["tree_id_reproduced"]:
+    verification["filtered"] = filtered
+    verification["excluded"] = excluded
+    if not filtered and not verification["tree_id_reproduced"]:
         verification["verified"] = False
         verification["mismatches"].append(
             f"root tree id: computed={root_tree_id} server={server_tree_id}"
@@ -446,6 +454,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--token", default=os.environ.get("FORGEVCS_TOKEN", ""))
     parser.add_argument("--bypass", default=os.environ.get("FORGEVCS_BYPASS", ""),
                         help="Vercel protection-bypass header for hosted deployments")
+    parser.add_argument("--exclude", action="append", default=[],
+                        help="path prefix to exclude from the mirror (repeatable); excluded paths are reported")
     parser.add_argument("--max-push-bytes", type=int, default=3_000_000,
                         help="max encoded object bytes per changeset push (Vercel body limit)")
     parser.add_argument("--dry-run", action="store_true", help="print the delta/would-do, no write")
