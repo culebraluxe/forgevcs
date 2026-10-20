@@ -193,10 +193,11 @@ def read_git_tree(repo: str, ref: str) -> tuple[str, dict[str, GitEntry]]:
 
 
 class Client:
-    def __init__(self, base: str, token: str, repo: str) -> None:
+    def __init__(self, base: str, token: str, repo: str, bypass: str = "") -> None:
         self.base = base.rstrip("/")
         self.token = token
         self.repo = repo
+        self.bypass = bypass
         self.calls = 0
 
     def call(self, method: str, path: str, body: Any | None = None, expect: tuple[int, ...] = (200,)) -> Any:
@@ -205,6 +206,8 @@ class Client:
         if data is not None:
             request.add_header("content-type", "application/json")
         request.add_header("authorization", f"Bearer {self.token}")
+        if self.bypass:
+            request.add_header("x-vercel-protection-bypass", self.bypass)
         self.calls += 1
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -320,7 +323,7 @@ def verify(client: Client, target: str, git_entries: dict[str, GitEntry]) -> dic
 
 def mirror(args: argparse.Namespace) -> dict[str, Any]:
     commit, git_entries = read_git_tree(args.git_repo, args.git_ref)
-    client = Client(args.base, args.token, args.repo)
+    client = Client(args.base, args.token, args.repo, args.bypass)
     client.init()
     refs = client.refs()["refs"]
     main = next((ref for ref in refs if ref["name"] == "main"), None)
@@ -357,35 +360,61 @@ def mirror(args: argparse.Namespace) -> dict[str, Any]:
         report["planned_delta"] = delta
         report["forgevcs_calls"] = client.calls
         return report
+    changesets: list[str] = []
+    # Vercel caps a request body (~4.5 MB), so a large tree cannot travel in one push. Split the delta
+    # into batches whose encoded object bytes stay under --max-push-bytes; each batch lands on main and
+    # becomes the parent of the next. Deletes travel with their own batch and carry no objects.
     if not unchanged:
-        # Deduplicate identical blobs: one object upload per content id.
-        seen: set[str] = set()
-        objects = []
-        for path in sorted(git_entries, key=lambda value: value.encode("utf-8")):
-            entry = git_entries[path]
-            if entry.blob_id in seen:
-                continue
-            seen.add(entry.blob_id)
-            objects.append({"id": entry.blob_id, "data": base64.b64encode(entry.data).decode()})
-        push = client.push(
-            {
-                "objects": objects,
-                "changeset": {
-                    "parents": [current_target],
-                    "delta": delta,
-                    "meta": {
-                        "author": "Forge mirror <mirror@forgevcs.local>",
-                        "message": f"WIRE-1 mirror {args.git_ref}@{commit[:12]}",
+        by_path = {path: entry for path, entry in git_entries.items()}
+        max_bytes = max(1, args.max_push_bytes)
+        pending = list(delta)
+        while pending:
+            batch: list[dict[str, Any]] = []
+            batch_bytes = 0
+            rest: list[dict[str, Any]] = []
+            seen_blobs: set[str] = set()
+            for item in pending:
+                entry = by_path.get(item["path"])
+                size = 0
+                if item["op"] == DELTA_PUT and entry is not None and entry.blob_id not in seen_blobs:
+                    size = (len(entry.data) + 2) // 3 * 4 + len(entry.blob_id) + 64
+                if batch and batch_bytes + size > max_bytes:
+                    rest.append(item)
+                    continue
+                batch.append(item)
+                batch_bytes += size
+                if item["op"] == DELTA_PUT and entry is not None:
+                    seen_blobs.add(entry.blob_id)
+            objects = []
+            for item in batch:
+                entry = by_path.get(item["path"])
+                if item["op"] == DELTA_PUT and entry is not None and entry.blob_id in seen_blobs:
+                    objects.append({"id": entry.blob_id, "data": base64.b64encode(entry.data).decode()})
+                    seen_blobs.discard(entry.blob_id)
+            push = client.push(
+                {
+                    "objects": objects,
+                    "changeset": {
+                        "parents": [current_target],
+                        "delta": batch,
+                        "meta": {
+                            "author": "Forge mirror <mirror@forgevcs.local>",
+                            "message": f"WIRE-1 mirror {args.git_ref}@{commit[:12]}"
+                                       + (f" batch {len(changesets) + 1}" if rest else ""),
+                        },
+                        "change_id": secrets.token_hex(16),
                     },
-                    "change_id": secrets.token_hex(16),
-                },
-                "ref": "main",
-                "mode": "land",
-            }
-        )
-        report["changeset"] = push["changeset"]["id"]
-        report["target"] = push["ref"]["target"]
-        report["ref_version"] = push["ref"]["version"]
+                    "ref": "main",
+                    "mode": "land",
+                }
+            )
+            changesets.append(push["changeset"]["id"])
+            current_target = push["ref"]["target"]
+            report["ref_version"] = push["ref"]["version"]
+            pending = rest
+        report["changesets"] = changesets
+        report["changeset"] = changesets[-1] if changesets else None
+        report["target"] = current_target
     else:
         report["target"] = current_target
     verification = verify(client, report["target"], git_entries)
@@ -415,6 +444,10 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--base", default=os.environ.get("FORGEVCS_BASE_URL", "http://127.0.0.1:3000"))
     parser.add_argument("--repo", default=os.environ.get("FORGEVCS_REPO", "forgevcs"))
     parser.add_argument("--token", default=os.environ.get("FORGEVCS_TOKEN", ""))
+    parser.add_argument("--bypass", default=os.environ.get("FORGEVCS_BYPASS", ""),
+                        help="Vercel protection-bypass header for hosted deployments")
+    parser.add_argument("--max-push-bytes", type=int, default=3_000_000,
+                        help="max encoded object bytes per changeset push (Vercel body limit)")
     parser.add_argument("--dry-run", action="store_true", help="print the delta/would-do, no write")
     parser.add_argument("--json", action="store_true", help="print the report JSON")
     parser.add_argument("--json-report", help="write the report JSON to this file")
