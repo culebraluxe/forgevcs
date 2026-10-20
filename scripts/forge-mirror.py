@@ -353,7 +353,7 @@ def mirror(args: argparse.Namespace) -> dict[str, Any]:
     if args.check and not unchanged:
         print(f"DRIFT  {args.repo}: {len(delta)} path(s) differ "
               f"(added={counts['added']} modified={counts['modified']} deleted={counts['deleted']})")
-        return 3
+        raise SystemExit(3)
     report: dict[str, Any] = {
         "repo": args.repo,
         "git_ref": args.git_ref,
