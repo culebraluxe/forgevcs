@@ -177,3 +177,13 @@ printed rollback line. ForgeVCS **reuses the conventions, not the project**:
   W5 §7.
 - **Rate limiting/load shedding** remain platform concerns until the gRPC layers are reused at
   the façade (W4 §8.6).
+
+## Deployment receipt — 2026-10-22
+
+- Commit: `ef47e45` (P0 metrics lifecycle + P1 merge-engine/topology)
+- Project: `culebraluxe-forgevcs` (production alias `https://culebraluxe-forgevcs.vercel.app`)
+- Deployment: `https://culebraluxe-forgevcs-c7654gpvw-culebraluxe-4460s-projects.vercel.app`
+- `/health` 200, `/ready` ready, `/version` reports `merge_engine=exact-rename-v1` and upstream `e0ffadf9…`
+- `/metrics` live: `scion_storage_access` non-zero, single storage family; conflict counters exposed
+- W8 hosted acceptance: W4 20/20 PASS, W5 17/17 PASS
+- Rollback: promote the previous ready deployment in the Vercel project.

@@ -170,3 +170,23 @@ prototype prefix returned **no objects**, and no production database was written
 - No N-agent soak was run (that is B2's work, not a documentation claim).
 - Lane Q's read-only findings are folded as findings, not re-audited line by line.
 - Culebraluxe-repo documents (X-2/X-3 material) are flagged, not edited from this checkout.
+
+## Update — 2026-10-22 execution
+
+The stale snapshot above is superseded by these committed/deployed facts:
+
+- **B1 service fix:** shared `MetricsHub` is live; `/metrics` exposes one storage family and
+  land/conflict counters (commits `ba3fe9a`, `ef47e45`). **Hosted scrape/dashboard/alerts remain
+  open** (TD-6), so the observability blocker is no longer the endpoint.
+- **B2 soak:** 10-agent, 10-repo, 11-process soak **PASS** — 712 attempts, 0 lost refs, 0 partial
+  writes, p99 25.81 ms (`7f1831a`, `docs/SOAK-2026-10-22.md`). The soak also found the
+  second-engine duplicate-metrics 503, fixed in `ef47e45` with a live two-engine test.
+  Multi-repo-per-process boot is safe; a full 10-repo single-process soak was not rerun.
+- **Deployment:** `ef47e45` is live with `FORGEVCS_MERGE_ENGINE=exact-rename-v1`; W8 hosted
+  acceptance passed W4 20/20 and W5 17/17 (`docs/W7-vercel-deployment.md` receipt).
+- **P1-A** docs truth pass done; **P1-B** validation/reporting done, history recording still
+  upstream-blocked; **P1-C** squash-only memo done; **P1-D** X-2 close-out plan done, execution
+  pending.
+- **Primary verdict:** ForgeVCS is deployable and proven for the process-per-repo agent-lane
+  topology. It is not yet the sole production VCS until hosted observability alerts exist and the
+  optional single-process 10-agent soak is run.
