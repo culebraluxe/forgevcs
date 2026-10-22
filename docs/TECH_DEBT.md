@@ -132,6 +132,16 @@ were added in `crates/forgevcs-service/src/metrics.rs` (`forgevcs_conflict_pause
 Prometheus scrape, dashboard or alert rule, and no distributed traces. The endpoint is now truthful
 but nobody consumes it in production.
 
+**Multi-repo registration lifecycle (2026-10-22, Lane X).** Sharing one registry briefly made a
+second engine boot in the same process fail (`storage metrics: Duplicate metrics collector
+registration attempted`, Lane V soak §7). Fixed in the shared worktree: `MetricsHub` registers
+upstream's `scion_storage_access`/`scion_storage_bytes` snapshot collectors once per process,
+aggregates every live engine, and hands each engine a `Metrics` view whose built-in series handles
+are shared but whose registration registry is private. See `docs/OBSERVABILITY.md` §1a and
+`docs/SOAK-2026-10-22.md` §7. Residual: `scion_storage_*` is a process-wide aggregate (no per-repo
+label), and `engine_view` is constructed field-by-field against the vendored `Metrics` struct (a
+baseline bump that adds a field fails the build until updated — deliberate).
+
 **Closing it (packet P0-6 hosted half).** Scrape `/metrics` from a hosted collector, add an operator
 dashboard and alert rules for readiness/error rate/land latency/conflict rate (and DB saturation),
 prove alerts fire on an induced failure, and record a load call with non-zero series. Delete this
@@ -175,3 +185,26 @@ proves a multi-instance rollout applied the same set (R6 doc: "no migration runn
 
 **Closing it.** A ledger table + ordered apply step before readiness, with the runtime DDL reduced
 to a bootstrap/no-op and parity tests between the files and the applied schema.
+
+## TD-11 — Multi-repo-per-process metrics registration (2026-10-22, Lane X) — RESOLVED
+
+**Was (P0, found by Lane V's soak on `ba3fe9a`).** A process that had booted one repository answered
+`POST /repos/<new>/init` with `503 UNAVAILABLE: building the engine: UNAVAILABLE: storage metrics:
+Duplicate metrics collector registration attempted`. The Lane U shared `scion_obs::Metrics` was
+passed to every engine, and each upstream `ServerApp::build` registers the
+`scion_storage_access`/`scion_storage_bytes` snapshot collectors into it.
+
+**Fix (shared worktree, not committed at report time).** `MetricsHub` in
+`crates/forgevcs-service/src/metrics.rs`: one rendered registry; the storage snapshots are registered
+into it exactly once and aggregate all live engines (`attach_storage` on boot,
+`detach_storage` on repository delete); each engine receives `engine_view()` — shared built-in
+series handles plus a private scratch registration registry. Live before/after evidence in
+`docs/SOAK-2026-10-22.md` §7; hermetic tests in `metrics::tests`; live gated test
+`crates/forgevcs-service/tests/two_engine_boot.rs` (real PostgreSQL + S3, two engines, one storage
+family, land counters from both).
+
+**Residual.** One process-wide storage aggregate (per-repo storage use is a billing/capacity
+question, not a health signal); `engine_view` is field-by-field against the vendored `Metrics`
+struct, so a vendored-baseline bump adding a metric field is a compile-time prompt to update it
+(deliberate); the 10-agent workload was not re-run with 10 repos in one process — the boot path and
+metrics wiring are covered, soak-scale behaviour is not re-measured.

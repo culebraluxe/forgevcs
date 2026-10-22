@@ -428,13 +428,14 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::config::Config;
+    use crate::metrics::MetricsHub;
 
-    /// Build the exact state the binary builds, but with an injected registry so a test can
-    /// observe what an engine recorded through the same `Arc` that `/metrics` renders.
-    async fn state_with(config: Config, metrics: Arc<Metrics>) -> Arc<AppState> {
-        let engines = Arc::new(Engines::boot(&config, Arc::clone(&metrics)).await);
+    /// Build the exact state the binary builds, but with an injected hub so a test can observe
+    /// what an engine recorded through the same registry `/metrics` renders.
+    async fn state_with(config: Config, hub: Arc<MetricsHub>) -> Arc<AppState> {
+        let engines = Arc::new(Engines::boot(&config, Arc::clone(&hub)).await);
         let forge_metrics = Arc::new(
-            ForgeMetrics::register(&metrics)
+            ForgeMetrics::register(hub.metrics())
                 .expect("ForgeVCS metrics register in a fresh registry"),
         );
         Arc::new(AppState {
@@ -449,15 +450,19 @@ mod tests {
             humans: Arc::new(HumanPrincipals::from_config(&config)),
             paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
-            metrics,
+            metrics: Arc::clone(hub.metrics()),
             forge_metrics,
         })
+    }
+
+    fn hub() -> Arc<MetricsHub> {
+        Arc::new(MetricsHub::new().expect("fresh metrics hub"))
     }
 
     /// Router-level tests must not depend on Neon: with no `FORGEVCS_DATABASE_URL` the registry
     /// boots empty, which is exactly the "engine is down" state /ready and the façade report.
     async fn app_with(config: Config) -> Router {
-        router(state_with(config, Metrics::new()).await)
+        router(state_with(config, hub()).await)
     }
 
     async fn app() -> Router {
@@ -577,8 +582,8 @@ mod tests {
     #[tokio::test]
     async fn ready_is_503_when_no_engine_is_configured() {
         let config = Config::from_lookup(|_| None);
-        let metrics = Metrics::new();
-        let engines = Arc::new(Engines::boot(&config, Arc::clone(&metrics)).await);
+        let hub = hub();
+        let engines = Arc::new(Engines::boot(&config, Arc::clone(&hub)).await);
         let ready = crate::engine::EngineHealth::start(config.clone(), Arc::clone(&engines)).await;
         let router = router(Arc::new(AppState {
             ready,
@@ -592,8 +597,10 @@ mod tests {
             humans: Arc::new(HumanPrincipals::default()),
             paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
-            forge_metrics: Arc::new(ForgeMetrics::register(&metrics).expect("fresh test registry")),
-            metrics,
+            forge_metrics: Arc::new(
+                ForgeMetrics::register(hub.metrics()).expect("fresh test registry"),
+            ),
+            metrics: Arc::clone(hub.metrics()),
         }));
         let (status, _, body) = send(
             router,
@@ -635,8 +642,8 @@ mod tests {
     /// handle `Engines` injects into `Engine::connect` and asserts the value appears in a scrape.
     #[tokio::test]
     async fn metrics_endpoint_reflects_engine_operations() {
-        let metrics = Metrics::new();
-        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&metrics)).await;
+        let hub = hub();
+        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&hub)).await;
         assert!(
             Arc::ptr_eq(state.engines.metrics(), &state.metrics),
             "the engine registry and /metrics must be the same Arc"
@@ -681,12 +688,12 @@ mod tests {
     /// with a fresh handle does not (that was the defect).
     #[tokio::test]
     async fn two_engines_share_one_metrics_registry() {
-        let metrics = Metrics::new();
+        let shared_hub = hub();
         let config = Config::from_lookup(|_| None);
-        let first = Engines::boot(&config, Arc::clone(&metrics)).await;
-        let second = Engines::boot(&config, Arc::clone(&metrics)).await;
+        let first = Engines::boot(&config, Arc::clone(&shared_hub)).await;
+        let second = Engines::boot(&config, Arc::clone(&shared_hub)).await;
         assert!(Arc::ptr_eq(first.metrics(), second.metrics()));
-        assert!(Arc::ptr_eq(first.metrics(), &metrics));
+        assert!(Arc::ptr_eq(first.metrics(), shared_hub.metrics()));
 
         first
             .metrics()
@@ -701,8 +708,8 @@ mod tests {
             "an operation recorded through one engine must be visible in the shared registry"
         );
 
-        let isolated = Engines::boot(&config, Metrics::new()).await;
-        assert!(!Arc::ptr_eq(isolated.metrics(), &metrics));
+        let isolated = Engines::boot(&config, hub()).await;
+        assert!(!Arc::ptr_eq(isolated.metrics(), shared_hub.metrics()));
         assert!(
             !isolated
                 .metrics()
@@ -715,8 +722,8 @@ mod tests {
     /// Lane U: the ForgeVCS conflict counters are registered in the shared registry and served.
     #[tokio::test]
     async fn conflict_metrics_are_registered_and_served() {
-        let metrics = Metrics::new();
-        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&metrics)).await;
+        let hub = hub();
+        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&hub)).await;
         state.forge_metrics.record_conflict_pause("land");
         state.forge_metrics.record_conflict_pause("merge-land");
         state.forge_metrics.record_conflict_resolved();
