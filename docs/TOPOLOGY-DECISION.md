@@ -32,6 +32,7 @@ review (2026-10-22).
 | Agent workflow | `merge-land`/paused continue; integration is a squash | agents must choose merge vs squash; review/PR surfaces need topology UI | full lane topology; heaviest |
 | Engine work | none | upstream `land`/`merge` semantics + SPEC engine version + tests | B + recursive base engine work + differential tests |
 | Risk | simplest, proven by pilots; topology lost | new failure modes (stale merge, merge-in-stack relaxation, policy on two parents) | largest; only justified by real imported-merge/lane-topology need |
+| Merge-aware policy | **fail-closed for writable-but-unreadable conflicts** (task-87 local patch): a caller can no longer be handed a conflict it cannot read; it gets a typed refusal instead | same patch applies; two-parent results may widen the write set, so re-check the invariant | same; recursive-base conflicts can span more paths |
 | Status | **shipped and used** | conditional, deferred (`M1-merge-analysis.md:173`) | conditional, deferred (`:175`) |
 
 ## Recommendation

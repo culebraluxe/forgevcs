@@ -78,6 +78,10 @@ of authority.
      both the rebase/land path and the explicit `Merge(a, b)` path. Enabled only when
      `FORGEVCS_MERGE_ENGINE=exact-rename-v1`; with the variable unset (the default, including the
      vendored gate) the behaviour is unchanged, and the module tests cover the safe fallbacks.
+ 11. `crates/scion-server/src/handlers/write.rs` (task-87) — conflict payloads fail closed when a
+     conflicting path is writable but unreadable, instead of returning a filtered partial report.
+     Local policy patch; see `docs/TECH_DEBT.md` TD-12. It must be carried or upstreamed at the
+     next vendored-pin bump.
 
   No SQL statement's logic changed; only its dialect spelling. Proof is the suite, not
   inspection: 20/20 cases of `meta_store_suite` pass against Neon.

@@ -66,6 +66,16 @@ pub(crate) fn require_repo_read(ctx: &AppContext, who: &Principal) -> Result<(),
 /// repository reader rebasing someone else's changeset never learns restricted path names or
 /// object ids. Other errors pass through unchanged. When entries are removed the message is
 /// rewritten so it does not reveal the unfiltered conflict count.
+///
+/// **Local ForgeVCS patch (task-87, 2026-10-22):** land/merge require WRITE on the paths they
+/// publish, so a principal can be granted write on a path it cannot read. Returning a filtered
+/// report in that case hands the caller a conflict it must decide but cannot see (and a partial
+/// report it cannot trust). When *any conflicting path* is writable but unreadable, fail closed
+/// with a generic PERMISSION_DENIED that names neither path nor content. Clean entries and
+/// read-only hidden paths keep the omission behaviour above: a reader that cannot write the
+/// hidden conflict could not resolve it anyway, and clean entries need no decision. SPEC 12.6
+/// itself does not define conflict-payload filtering; this is an implementation policy change
+/// recorded in ForgeVCS `docs/TECH_DEBT.md` TD-11 and `docs/M1-merge-analysis.md` row 5.
 pub(crate) fn filter_conflict_payload(
     ctx: &AppContext,
     who: &Principal,
@@ -78,6 +88,19 @@ pub(crate) fn filter_conflict_payload(
         return e;
     };
     let policy = ctx.policy.current();
+    let writes_hidden_conflict = report
+        .conflicts
+        .iter()
+        .any(|c| !policy.can_read_bytes(who, &c.path) && policy.can_write_bytes(who, &c.path));
+    if writes_hidden_conflict {
+        tracing::debug!(
+            "merge conflict payload would hide a writable-but-unreadable path; failing closed"
+        );
+        return ScionError::permission_denied(
+            "merge conflict includes a path this principal may write but not read; refusing to \
+             return a partial conflict report",
+        );
+    }
     let (conflicts, clean) = (report.conflicts.len(), report.clean_entries.len());
     report
         .conflicts

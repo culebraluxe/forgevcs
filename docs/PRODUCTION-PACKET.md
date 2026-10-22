@@ -71,7 +71,10 @@ output, not a new long-lived service). Depends on P0-6 so the run has real metri
    default. Merge-aware policy must not hide conflicts on write-but-not-read paths (a ref visible to
    an agent while the conflict material is not); decide the topology and test the policy surface.
    Recommendation and migration path: [`docs/TOPOLOGY-DECISION.md`](TOPOLOGY-DECISION.md)
-   (squash-only now, reopen on a concrete topology trigger).
+   (squash-only now, reopen on a concrete topology trigger). **Working tree 2026-10-22 (Lane Y):**
+   the write-but-not-read conflict case is now fail-closed in the vendored filter (typed
+   `permission_denied`, no partial report/path leak); read-only omissions and clean entries keep
+   the old behaviour — see `docs/TECH_DEBT.md` TD-12.
 4. **X-2 cut** — dependency-complete (`cargo tree` has no `forge` in the app) but the parity/
    transition test was skipped; Culebraluxe tests pin Forge `v0.2.2` while the Forge checkout is
    `v0.2.5`; the app still owns/writes Forge schema (X-3). Close-out plan (golden payload/audit

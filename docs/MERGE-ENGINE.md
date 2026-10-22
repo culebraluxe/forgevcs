@@ -65,6 +65,34 @@ Options for a future change: move env into the deploy script via `vercel env add
 Vercel token in CI) or attach a project configuration export to the deploy receipt. Until then this
 is an explicit operator step + `/version` verification, documented in `docs/W7-vercel-deployment.md`.
 
+## Should production fail `/ready` when `FORGEVCS_MERGE_ENGINE` is unset? (evaluation, 2026-10-22)
+
+**Recommendation: no — keep `/ready` a dependency probe; enforce the deployment declaration in the
+release path instead.** Reasons:
+
+1. **Unset is a supported engine, not an error.** It is exactly `default` (upstream delete+add), and
+   that engine is a legitimate choice (compatibility with old history, deliberately conservative
+   merges). Failing readiness would turn a valid configuration into a 503.
+2. **`/ready` has a defined meaning** (ADR-0002 D5): can this instance serve requests (policy
+   loaded, DB/bucket reachable)? Coupling it to a merge-policy choice conflates dependency health
+   with deployment intent, and would take every instance out of rotation on a config omission
+   instead of surfacing the wrong engine while serving.
+3. **Local/CI/preview environments intentionally run the default.** A hard-required variable would
+   force every test harness and preview deployment to set it or fail readiness, for no safety gain
+   (test repos are disposable).
+4. **The real risk is silent semantic drift, and it is now visible**: `/version` reports
+   `merge_engine`, the startup log records it, and every land logs it; the operator checklist
+   (`docs/W7-vercel-deployment.md`) requires `exact-rename-v1` in the Vercel project and verifies
+   `/version`. A release that cannot show the expected value should not be promoted.
+5. **If the principal wants strictness later**, add a deploy-policy check (CI/deploy script asserts
+   `/version.merge_engine` before promotion) or an explicit opt-in
+   `FORGEVCS_REQUIRE_EXPLICIT_MERGE_ENGINE=1` that fails readiness only in production; do not make
+   the unset default itself fatal.
+
+**Status:** documented decision only; no `/ready` code change in task-87. This is still a principal
+decision if they want the hard-required variant; the recommended default is to require it in the
+release checklist, not in readiness.
+
 ## Recording the engine version in repository history — exact upstream blocker
 
 The façade cannot stamp the engine version into the changesets that land writes, because those

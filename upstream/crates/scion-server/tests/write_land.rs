@@ -544,15 +544,28 @@ async fn max_attempts_exhaustion_is_retryable_and_leaves_ref_unchanged() {
     assert_eq!(resp.version, 3);
 }
 
-/// SPEC 12.6 applied to conflict reports: a lander that cannot read a conflicting or clean
-/// path does not see it in the MERGE_CONFLICT payload.
+/// SPEC 12.6 applied to conflict reports, local ForgeVCS patch (task-87): a lander that can
+/// WRITE a conflicting path but cannot READ it must not receive a partial MERGE_CONFLICT report
+/// (it could not resolve what it cannot see), so the operation fails closed with a generic
+/// PERMISSION_DENIED that names neither path nor content. A principal that can read everything
+/// still gets the complete report.
 #[tokio::test(flavor = "multi_thread")]
-async fn land_conflict_payload_omits_unreadable_paths() {
-    // Write on /secrets for alice, read only for admin.
-    let acl = RESTRICTED_ACL.replace(
-        "prefix = \"/secrets\"\nread = [\"github:admin\"]\nwrite = [\"github:admin\"]",
-        "prefix = \"/secrets\"\nread = [\"github:admin\"]\nwrite = [\"github:admin\", \"github:alice\"]",
-    );
+async fn land_conflict_fails_closed_when_a_writable_path_is_unreadable() {
+    // Write on /secrets for alice, read only for admin; additionally let admin read/write root
+    // so the read-all assertion below sees the complete report.
+    let acl = RESTRICTED_ACL
+        .replace(
+            "prefix = \"/secrets\"\nread = [\"github:admin\"]\nwrite = [\"github:admin\"]",
+            "prefix = \"/secrets\"\nread = [\"github:admin\"]\nwrite = [\"github:admin\", \"github:alice\"]",
+        )
+        .replace(
+            "prefix = \"/\"\nread = [\"group:readers\"]\nwrite = [\"group:eng\"]",
+            "prefix = \"/\"\nread = [\"group:readers\", \"github:admin\"]\nwrite = [\"group:eng\", \"github:admin\"]",
+        )
+        .replace(
+            "[refs.\"main\"]\nupdate = [\"group:eng\"]\nforce = []",
+            "[refs.\"main\"]\nupdate = [\"group:eng\", \"github:admin\"]\nforce = []",
+        );
     assert_ne!(acl, RESTRICTED_ACL);
     let srv = InProcessServer::start(opts_with_acl(&acl)).await;
     let r = root(&srv).await;
@@ -580,13 +593,30 @@ async fn land_conflict_payload_omits_unreadable_paths() {
         2,
     )
     .await;
+    // Alice may write /secrets but not read it: fail closed, no partial report, no path leak.
     let e = land(&alice_c, "main", &mine, false).await.unwrap_err();
-    let got = expect_err(&e, ErrorCode::MergeConflict, None);
+    let got = expect_err(&e, ErrorCode::PermissionDenied, None);
     assert!(
-        got.message.contains("1 readable conflicting"),
-        "the message must not reveal the unfiltered count: {}",
+        got.message.contains("write but not read"),
+        "the refusal explains the policy problem: {}",
         got.message
     );
+    for leaked in ["secrets", "pub", "clean", "mine"] {
+        assert!(
+            !got.message.contains(leaked),
+            "the refusal must not reveal the hidden path/entry {leaked:?}: {}",
+            got.message
+        );
+    }
+    assert!(
+        matches!(got.payload, ErrorPayload::None),
+        "the refusal carries no conflict payload: {:?}",
+        got.payload
+    );
+
+    // A principal that can read the whole tree still sees the complete conflict report.
+    let e = land(&admin_c, "main", &mine, false).await.unwrap_err();
+    let got = expect_err(&e, ErrorCode::MergeConflict, None);
     let ErrorPayload::MergeConflict(report) = got.payload else {
         panic!("expected MergeConflict payload");
     };
@@ -596,6 +626,9 @@ async fn land_conflict_payload_omits_unreadable_paths() {
         .iter()
         .map(|c| c.path.clone())
         .collect();
-    assert_eq!(conflict_paths, vec![b"pub".to_vec()]);
-    assert_eq!(clean_paths, vec![b"clean".to_vec()]);
+    assert_eq!(conflict_paths, vec![b"pub".to_vec(), b"secrets/k".to_vec()]);
+    assert_eq!(
+        clean_paths,
+        vec![b"clean".to_vec(), b"secrets/new".to_vec()]
+    );
 }

@@ -210,3 +210,37 @@ question, not a health signal); `engine_view` is field-by-field against the vend
 struct, so a vendored-baseline bump adding a metric field is a compile-time prompt to update it
 (deliberate); the 10-agent workload was not re-run with 10 repos in one process — the boot path and
 metrics wiring are covered, soak-scale behaviour is not re-measured.
+
+## TD-12 — Local vendored patch: fail-closed filtered conflict payloads (2026-10-22)
+
+**What changed (task-87, Grok/Lane Q finding).** `filter_conflict_payload`
+(`upstream/crates/scion-server/src/handlers/write.rs`) used to omit conflict/clean entries at
+paths the caller cannot read. Land/merge require **write** on every published path, so a principal
+could hold write-but-not-read on a conflicting path, receive a filtered `MERGE_CONFLICT`, and be
+unable to resolve what it could not see. The local patch checks whether any *conflicting* path is
+writable-but-unreadable and, if so, returns a generic `PERMISSION_DENIED` that names neither path
+nor content (fail closed). Clean entries and read-only hidden paths keep the omission behaviour
+(they need no decision / cannot be resolved by that caller). SPEC 12.6 defines history filtering
+(changesets/trees/log/diff), not conflict-payload filtering, so this is an implementation-policy
+change, documented here rather than a silent SPEC change.
+
+**Tests.** `upstream/crates/scion-server/tests/write_land.rs`
+`land_conflict_fails_closed_when_a_writable_path_is_unreadable` (write-not-read → 403, no leak, no
+conflict payload; read-all principal → full conflict/clean report). The existing
+`rebase_conflict_payload_omits_unreadable_paths` still passes (a read-only hidden conflict is
+omitted as before). Upstream gate covers both.
+
+**Why this is debt (pin impact).** The patch lives in the **vendored** `upstream/` tree, so
+`docs/BASELINE.md`'s pinned upstream SHA no longer describes the local source exactly.
+**Before the next rebase/upstream bump:** add this change to the vendored-modifications list in
+`README.md` ("Modifications to vendored code", item 9+) and either upstream the fail-closed rule or
+carry the patch forward with the gate evidence. Reverting it silently would reopen Grok/Lane Q's
+finding (write-but-not-read caller gets a partial conflict report). Closing it: upstream the rule
+(or a SPEC-defined conflict-policy section) and drop the local divergence.
+
+**Residual (not debt, an open decision).** Option B (enforce write⇒read as a policy invariant at
+load time) was rejected: it would change policy semantics for every deployment/principal and still
+would not cover dynamic grants; option C (an `omitted_conflicts` count/escalation field) was
+rejected for now: it needs a wire/proto change, still leaves the caller unable to resolve, and
+leaks that a hidden conflict exists. A `read` grant for the hidden path (or a dedicated resolver
+principal) is the documented resolution path.
