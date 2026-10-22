@@ -103,7 +103,12 @@ impl Engine {
     ///
     /// `CrdbMetaStore::connect` applies the migrations and ensures the `repos` row, so a
     /// successful return means the schema exists on this database (W2).
-    pub async fn connect(config: &Config, repo: &str) -> Result<Self> {
+    ///
+    /// `metrics` is the **process-wide** Scion registry (one per process), shared by every engine
+    /// and by `/metrics`. Creating a per-engine registry here would make every scrape of
+    /// `/metrics` read a different, empty registry — the P0 `Lane U` defect this signature
+    /// removes the possibility of.
+    pub async fn connect(config: &Config, repo: &str, metrics: Arc<Metrics>) -> Result<Self> {
         let server = server_config(config, repo)?;
         let policy = PolicyHandle::load(&server.policy.path)
             .map_err(|e| anyhow::anyhow!("loading policy {}: {e}", server.policy.path.display()))?;
@@ -137,7 +142,8 @@ impl Engine {
             keyring,
             github: GitHubClient::new(DEFAULT_GITHUB_API),
             clock: Arc::new(SystemClock),
-            metrics: Metrics::new(),
+            // The one process-wide registry: the same Arc is served by `/metrics`.
+            metrics,
             registry: None,
         })
         .await
@@ -303,22 +309,49 @@ fn signing_keyring(config: &Config) -> Result<Keyring> {
 }
 
 /// The process-wide registry of engines, keyed by repository name (D3).
-#[derive(Default)]
 pub struct Engines {
     repos: RwLock<BTreeMap<String, Arc<Engine>>>,
     boot_error: RwLock<Option<String>>,
     /// Serializes on-demand boots. Two concurrent `init` calls for the same new repo would
     /// otherwise both run the migrations and the policy/bootstrap work before either insert.
     boot_lock: tokio::sync::Mutex<()>,
+    /// The one process-wide Scion registry. Every engine booted by this registry receives a clone
+    /// of this `Arc`, and `/metrics` serves it, so engine operations are observable.
+    metrics: Arc<Metrics>,
+}
+
+impl Default for Engines {
+    /// An empty registry with its own metrics handle. Tests that do not scrape can use this; the
+    /// process binary always creates one [`Metrics`] in `main` and passes it to [`Engines::boot`]
+    /// *and* to the router, so there is exactly one registry per process.
+    fn default() -> Self {
+        Self::new(Metrics::new())
+    }
 }
 
 impl Engines {
+    /// An empty engine registry that records into `metrics`.
+    pub fn new(metrics: Arc<Metrics>) -> Self {
+        Self {
+            repos: RwLock::new(BTreeMap::new()),
+            boot_error: RwLock::new(None),
+            boot_lock: tokio::sync::Mutex::new(()),
+            metrics,
+        }
+    }
+
+    /// The process-wide metrics handle shared by every engine this registry boots and by
+    /// `/metrics`. Two registries built with the same handle render the same series.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
     /// Boot the repository named by `$FORGEVCS_REPO`.
     ///
     /// A failure is recorded rather than fatal (D5): a container that cannot reach Neon stays up
     /// and reports `/ready` 503 with this reason until the dependency recovers.
-    pub async fn boot(config: &Config) -> Self {
-        let engines = Self::default();
+    pub async fn boot(config: &Config, metrics: Arc<Metrics>) -> Self {
+        let engines = Self::new(metrics);
         if config.database_url.is_none() || !config.has_object_storage() {
             engines.record_error(
                 "FORGEVCS_DATABASE_URL and object storage (FORGEVCS_BUCKET + endpoint) are \
@@ -327,7 +360,7 @@ impl Engines {
             );
             return engines;
         }
-        match Engine::connect(config, config.repo()).await {
+        match Engine::connect(config, config.repo(), Arc::clone(engines.metrics())).await {
             Ok(engine) => {
                 tracing::info!(repo = engine.repo(), "engine ready");
                 engines.record(engine);
@@ -364,7 +397,7 @@ impl Engines {
         if let Some(engine) = self.get(repo) {
             return Ok(engine);
         }
-        let engine = Arc::new(Engine::connect(config, repo).await?);
+        let engine = Arc::new(Engine::connect(config, repo, Arc::clone(&self.metrics)).await?);
         tracing::info!(repo, "engine ready");
         let mut repos = self.repos_write();
         if let Some(existing) = repos.get(repo) {

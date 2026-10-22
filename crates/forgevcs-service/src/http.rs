@@ -28,6 +28,7 @@ use crate::config::{self, Config};
 use crate::engine::{Engine, Engines};
 use crate::facade;
 use crate::human::HumanPrincipals;
+use crate::metrics::ForgeMetrics;
 use crate::paused_conflicts::PausedConflicts;
 
 /// Service name reported by every probe and façade response.
@@ -52,6 +53,11 @@ pub struct AppState {
     pub humans: Arc<HumanPrincipals>,
     /// Paused conflict state: a `409` conflict persisted so it can be resolved and continued.
     pub paused: Arc<PausedConflicts>,
+    /// The **process-wide** Scion metrics registry. Every engine records into this `Arc` and
+    /// `/metrics` renders it; a second registry here would make scrapes miss engine operations.
+    pub metrics: Arc<Metrics>,
+    /// ForgeVCS-owned conflict metrics registered in [`AppState::metrics`].
+    pub forge_metrics: Arc<ForgeMetrics>,
 }
 
 impl AppState {
@@ -119,7 +125,7 @@ async fn health() -> (StatusCode, Json<Value>) {
     (StatusCode::OK, Json(payload("ok")))
 }
 
-async fn version() -> (StatusCode, Json<Value>) {
+async fn version(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>) {
     (
         StatusCode::OK,
         Json(json!({
@@ -127,6 +133,9 @@ async fn version() -> (StatusCode, Json<Value>) {
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
             "upstream": config::UPSTREAM_COMMIT,
+            // The merge engine changes merge/rebase/land results; deployments and the push/land
+            // responses report the same value so a mismatch is visible rather than inferred.
+            "merge_engine": state.config.merge_engine(),
         })),
     )
 }
@@ -148,7 +157,9 @@ async fn ready_handler(State(state): State<Arc<AppState>>) -> (StatusCode, Json<
 
 /// Build the full router. Public so tests drive exactly the routes the container serves.
 pub fn router(state: Arc<AppState>) -> Router {
-    let metrics = Metrics::new();
+    // The registry is process-wide: engines hold the same `Arc` and record into it, so this is
+    // the one place `/metrics` reads. Never construct a fresh `Metrics::new()` here.
+    let metrics = Arc::clone(&state.metrics);
     let ready = Arc::clone(&state.ready);
 
     Router::new()
@@ -418,11 +429,15 @@ mod tests {
 
     use crate::config::Config;
 
-    /// Router-level tests must not depend on Neon: with no `FORGEVCS_DATABASE_URL` the registry
-    /// boots empty, which is exactly the "engine is down" state /ready and the façade report.
-    async fn app_with(config: Config) -> Router {
-        let engines = Arc::new(Engines::boot(&config).await);
-        router(Arc::new(AppState {
+    /// Build the exact state the binary builds, but with an injected registry so a test can
+    /// observe what an engine recorded through the same `Arc` that `/metrics` renders.
+    async fn state_with(config: Config, metrics: Arc<Metrics>) -> Arc<AppState> {
+        let engines = Arc::new(Engines::boot(&config, Arc::clone(&metrics)).await);
+        let forge_metrics = Arc::new(
+            ForgeMetrics::register(&metrics)
+                .expect("ForgeVCS metrics register in a fresh registry"),
+        );
+        Arc::new(AppState {
             ready: Arc::new(StubReadiness),
             engines,
             repo: config.repo().to_owned(),
@@ -434,7 +449,15 @@ mod tests {
             humans: Arc::new(HumanPrincipals::from_config(&config)),
             paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
-        }))
+            metrics,
+            forge_metrics,
+        })
+    }
+
+    /// Router-level tests must not depend on Neon: with no `FORGEVCS_DATABASE_URL` the registry
+    /// boots empty, which is exactly the "engine is down" state /ready and the façade report.
+    async fn app_with(config: Config) -> Router {
+        router(state_with(config, Metrics::new()).await)
     }
 
     async fn app() -> Router {
@@ -530,12 +553,32 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["service"], SERVICE);
         assert_eq!(body["upstream"], config::UPSTREAM_COMMIT);
+        assert_eq!(body["merge_engine"], "default");
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_configured_merge_engine() {
+        let config = Config::from_lookup(|key| {
+            (key == "FORGEVCS_MERGE_ENGINE").then(|| "exact-rename-v1".to_owned())
+        });
+        let (status, _, body) = send(
+            app_with(config).await,
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["merge_engine"], "exact-rename-v1");
     }
 
     #[tokio::test]
     async fn ready_is_503_when_no_engine_is_configured() {
         let config = Config::from_lookup(|_| None);
-        let engines = Arc::new(Engines::boot(&config).await);
+        let metrics = Metrics::new();
+        let engines = Arc::new(Engines::boot(&config, Arc::clone(&metrics)).await);
         let ready = crate::engine::EngineHealth::start(config.clone(), Arc::clone(&engines)).await;
         let router = router(Arc::new(AppState {
             ready,
@@ -549,6 +592,8 @@ mod tests {
             humans: Arc::new(HumanPrincipals::default()),
             paused: Arc::new(PausedConflicts::from_pool(None)),
             config,
+            forge_metrics: Arc::new(ForgeMetrics::register(&metrics).expect("fresh test registry")),
+            metrics,
         }));
         let (status, _, body) = send(
             router,
@@ -582,6 +627,118 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(content_type.starts_with("text/plain"));
         assert!(body.contains("scion_"));
+    }
+
+    /// Lane U P0 regression: `/metrics` must serve the **same** registry the engines record
+    /// into. Before the fix `router()` built a fresh `Metrics::new()` while each engine built its
+    /// own, so a scrape was all zeros even while land was running. This records through the
+    /// handle `Engines` injects into `Engine::connect` and asserts the value appears in a scrape.
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_engine_operations() {
+        let metrics = Metrics::new();
+        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&metrics)).await;
+        assert!(
+            Arc::ptr_eq(state.engines.metrics(), &state.metrics),
+            "the engine registry and /metrics must be the same Arc"
+        );
+        // The exact handle Engine::connect is given; an engine's land observer increments these.
+        let engine_metrics = Arc::clone(state.engines.metrics());
+        engine_metrics
+            .land_attempts
+            .with_label_values(&["committed"])
+            .inc();
+        engine_metrics
+            .ref_cas_failures
+            .with_label_values(&["main"])
+            .inc();
+        engine_metrics.land_duration.observe(0.25);
+
+        let (status, content_type, body) = send(
+            router(state),
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.starts_with("text/plain"));
+        assert!(
+            body.contains("scion_land_attempts{result=\"committed\"} 1"),
+            "engine land attempt missing from /metrics: {body}"
+        );
+        assert!(
+            body.contains("scion_ref_cas_failures_total{ref=\"main\"} 1"),
+            "engine ref-CAS failure missing from /metrics: {body}"
+        );
+        assert!(
+            body.contains("scion_land_duration_seconds_count 1"),
+            "engine land histogram missing from /metrics: {body}"
+        );
+    }
+
+    /// Lane U: two engine registries built with the same handle share one registry; one booted
+    /// with a fresh handle does not (that was the defect).
+    #[tokio::test]
+    async fn two_engines_share_one_metrics_registry() {
+        let metrics = Metrics::new();
+        let config = Config::from_lookup(|_| None);
+        let first = Engines::boot(&config, Arc::clone(&metrics)).await;
+        let second = Engines::boot(&config, Arc::clone(&metrics)).await;
+        assert!(Arc::ptr_eq(first.metrics(), second.metrics()));
+        assert!(Arc::ptr_eq(first.metrics(), &metrics));
+
+        first
+            .metrics()
+            .land_attempts
+            .with_label_values(&["idempotent"])
+            .inc();
+        assert!(
+            second
+                .metrics()
+                .render()
+                .contains("scion_land_attempts{result=\"idempotent\"} 1"),
+            "an operation recorded through one engine must be visible in the shared registry"
+        );
+
+        let isolated = Engines::boot(&config, Metrics::new()).await;
+        assert!(!Arc::ptr_eq(isolated.metrics(), &metrics));
+        assert!(
+            !isolated
+                .metrics()
+                .render()
+                .contains("result=\"idempotent\""),
+            "a separate handle must not see the shared registry's series"
+        );
+    }
+
+    /// Lane U: the ForgeVCS conflict counters are registered in the shared registry and served.
+    #[tokio::test]
+    async fn conflict_metrics_are_registered_and_served() {
+        let metrics = Metrics::new();
+        let state = state_with(Config::from_lookup(|_| None), Arc::clone(&metrics)).await;
+        state.forge_metrics.record_conflict_pause("land");
+        state.forge_metrics.record_conflict_pause("merge-land");
+        state.forge_metrics.record_conflict_resolved();
+        state.forge_metrics.record_conflict_continue("stale");
+
+        let (status, _, body) = send(
+            router(state),
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        for line in [
+            "forgevcs_conflict_pauses_total{operation=\"land\"} 1",
+            "forgevcs_conflict_pauses_total{operation=\"merge-land\"} 1",
+            "forgevcs_conflict_resolves_total 1",
+            "forgevcs_conflict_continues_total{result=\"stale\"} 1",
+        ] {
+            assert!(body.contains(line), "missing {line} from /metrics: {body}");
+        }
     }
 
     #[tokio::test]

@@ -149,8 +149,11 @@ identical, both file versions byte-identical; teardown deleted the repository an
 removed the leftover blobs. Metadata export uses psql, so backup/restore runs from an operator
 machine, not from a Vercel instance; recycle the hosted deployment after a restore.
 
-The hosted deployment runs `exact-rename-v1`; `scripts/hosted-rename-check.sh` proves it against
-the live service (create repo, land rename, land staged edit, edit follows the rename, delete).
+The hosted deployment is configured with `FORGEVCS_MERGE_ENGINE=exact-rename-v1` (Vercel project
+env; `docs/W7-vercel-deployment.md` §3), and `/version` reports the value the process is actually
+running — check `/version` before trusting the rename behaviour. `scripts/hosted-rename-check.sh`
+proves it against the live service (create repo, land rename, land staged edit, edit follows the
+rename, delete); configuration/evidence details are in `docs/MERGE-ENGINE.md`.
 
 ## Follow-ups
 

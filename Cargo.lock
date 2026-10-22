@@ -730,6 +730,7 @@ dependencies = [
  "deadpool-postgres",
  "futures",
  "hex",
+ "prometheus",
  "prost",
  "scion-auth",
  "scion-config",

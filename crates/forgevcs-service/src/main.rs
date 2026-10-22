@@ -12,12 +12,13 @@
 
 use std::sync::Arc;
 
-use scion_obs::{LogFormat, init_logging};
+use scion_obs::{LogFormat, Metrics, init_logging};
 
 use forgevcs_service::authz::AuthorizationService;
 use forgevcs_service::config::{self, Config};
 use forgevcs_service::engine::{EngineHealth, Engines};
 use forgevcs_service::http::{AppState, SERVICE, router};
+use forgevcs_service::metrics::ForgeMetrics;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -26,9 +27,17 @@ async fn main() -> anyhow::Result<()> {
     let port = config.port;
     let repo = config.repo().to_owned();
 
+    // One metrics registry for the whole process: every engine records into it and `/metrics`
+    // serves it. ForgeVCS's conflict counters are registered into the same registry.
+    let metrics = Metrics::new();
+    let forge_metrics = Arc::new(
+        ForgeMetrics::register(&metrics)
+            .map_err(|error| anyhow::anyhow!("registering ForgeVCS metrics: {error}"))?,
+    );
+
     // Boot the engine before binding: a failure is recorded and surfaced by /ready, so the
     // process stays up (ADR-0002 D5) but never claims to be ready without Neon.
-    let engines = Arc::new(Engines::boot(&config).await);
+    let engines = Arc::new(Engines::boot(&config, Arc::clone(&metrics)).await);
     let ready = EngineHealth::start(config.clone(), Arc::clone(&engines)).await;
     let authz = Arc::new(AuthorizationService::from_config(&config).await);
     let db = config
@@ -53,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
         repos = engines.all().len(),
         version = env!("CARGO_PKG_VERSION"),
         upstream = config::UPSTREAM_COMMIT,
+        merge_engine = config.merge_engine(),
         "forgevcs listening"
     );
 
@@ -68,6 +78,8 @@ async fn main() -> anyhow::Result<()> {
         db,
         humans,
         paused,
+        metrics,
+        forge_metrics,
     });
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown())

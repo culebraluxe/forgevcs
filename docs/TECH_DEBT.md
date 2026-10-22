@@ -62,13 +62,25 @@ copy** for ForgeVCS; Neon keeps its own database backups. Delivered:
   (default 600; drill 900) by a watchdog that the TERM trap turns into a failed status + alert,
   instead of launchd silently keeping one instance alive and skipping the next day.
 
-**Accepted residual risk.** The archive directory lives on the same Mac as the operator: losing the
-laptop loses the zip copy (Neon history is the other copy). There is still no object-storage/Neon-
-branch archive copy, and the drill evidence is written locally rather than attached to a release
-artifact. The archive covers the 13 repository-scoped metadata tables plus object bytes; the
-service-owned tables (`forgevcs_auth_decisions`, `forgevcs_repo_acl`) are re-created at boot and a
-repository's ACL owner is re-claimed on `init` after a restore rather than restored from the zip. If offsite is revisited, ship the verified zips to object storage or a Neon branch and
-wire `.backup-status.json` into the daily digest.
+**Accepted residual risk (updated 2026-10-22).** The archive directory lives on the same Mac as the
+operator: losing the laptop loses the locally-written copy. The principal's decision on 2026-10-22
+re-scopes the offsite copy to **a local zip pushed to iCloud**, with a **Neon object-storage backup
+branch as the fallback**; no offsite-upload code is required or integrated for that decision. What
+remains accepted, not automated:
+
+- the iCloud push is an operator step, and the weekly drill proves the local archive, not the iCloud
+  copy; evidence is still written locally rather than attached to a release artifact;
+- a Neon object-storage backup branch is the documented fallback (branch copy + restore), not an
+  in-job step;
+- if automated offsite is reopened by a later decision, the safe shape is: verified local zip →
+  object/branch copy → fetched-and-restored proof → delete the proof object. (An offsite prototype
+  was built and proven against the dev branch during Lane R and then stopped by the principal; it is
+  uncommitted and unintegrated — do not wire it in without a new decision.)
+
+The archive covers the 13 repository-scoped metadata tables plus object bytes; the service-owned
+tables (`forgevcs_auth_decisions`, `forgevcs_repo_acl`) are re-created at boot and a repository's ACL
+owner is re-claimed on `init` after a restore rather than restored from the zip. Wire
+`.backup-status.json` into the daily digest when the digest work lands.
 
 ## Owned by DevOps, not debt — default repository is re-created on boot
 
@@ -88,3 +100,78 @@ ceremony without a real cost driver. The operational proxy now is wall time:
 **Reopen when.** Paid models return, multiple tenants share the service, or a real connection-pool
 incident occurs. Closing requires token bucket per principal, 429 + Retry-After, observable quotas,
 burst tests.
+
+## TD-5 — Merge engine version not recorded in history (2026-10-22)
+
+**Gap.** `FORGEVCS_MERGE_ENGINE` selects the rename-aware engine, but merge/rebase identity is a
+function of `(a, b, merge engine version)` (`docs/M1-merge-analysis.md` §1) and nothing in the
+repository records which engine produced an existing changeset. Two deployments with different
+values can create different changeset ids for the same operation.
+
+**State.** The value is now validated (`FORGEVCS_MERGE_ENGINE=default|exact-rename-v1`, invalid
+fails `/ready`), reported by `/version`, included in push/land/merge-land responses, and logged on
+every successful landing (`docs/MERGE-ENGINE.md`). Recording it inside generated changesets is
+blocked upstream: `History::rebase` copies the source meta (`upstream/crates/scion-history/src/
+rebase.rs:104-108`) and `History::merge` takes caller meta (`merge.rs:46,143`); a Meta extension
+tag would need a SPEC tag definition and a vendored-engine change.
+
+**Closing it.** Add an ignorable Meta extension tag (or a land/ref-ledger field) stamped by the
+engine for every generated changeset, exposed by the façade, with tests proving a changed engine
+value is visible on the resulting change/land record.
+
+## TD-6 — Hosted metrics consumption: scrape/dashboards/alerts (2026-10-22, Lane U)
+
+**Service half resolved in the shared worktree (2026-10-22, Lane U, not committed at report time).**
+One process-wide `scion_obs::Metrics` is created in `main`, injected into every engine
+(`Engine::connect(…, Arc<Metrics>)`) and served by `/metrics`, so `scion_land_attempts{result}`,
+`scion_land_duration_seconds` and ref-CAS counters reflect real traffic; conflict-workflow counters
+were added in `crates/forgevcs-service/src/metrics.rs` (`forgevcs_conflict_pauses_total{operation}`,
+`..._resolves_total`, `..._continues_total{result}`). Names/labels: `docs/OBSERVABILITY.md`.
+
+**Remaining gap (why this entry stays open).** Vercel does not scrape `/metrics`: there is no hosted
+Prometheus scrape, dashboard or alert rule, and no distributed traces. The endpoint is now truthful
+but nobody consumes it in production.
+
+**Closing it (packet P0-6 hosted half).** Scrape `/metrics` from a hosted collector, add an operator
+dashboard and alert rules for readiness/error rate/land latency/conflict rate (and DB saturation),
+prove alerts fire on an induced failure, and record a load call with non-zero series. Delete this
+entry only after the Lane U change is committed and reviewed together with that evidence.
+
+## TD-7 — Paused-conflict retention (2026-10-22, R2)
+
+**Gap.** `forgevcs_paused_conflicts` has no TTL, pagination or standalone delete; rows accumulate
+(open/resolved/continued) until the repository is deleted. The list endpoint returns every match for
+a status.
+
+**Why accepted today.** The workflow is new and volume is low; repository deletion (which removes
+the rows in the same transaction) is the cleanup path.
+
+**Closing it.** Add an operator prune script/window (cf. TD-4's auth-decision retention), paginate
+the list, and decide whether resolved/continued rows may be deleted independently.
+
+## TD-8 — Lease/audit-row retention (2026-10-22, R4)
+
+**Gap.** `forgevcs_workspace_lease_events` keeps an audit row per acquire/renew-release/takeover;
+there is no GC. Lease rows themselves are removed with the workspace (and on delete), but the event
+history is unbounded.
+
+**Closing it.** Retention window + prune script tied to the same housekeeping job as TD-7/TD-4.
+
+## TD-9 — Mirror commit identity is not preserved (WIRE-3)
+
+**Gap.** The git→ForgeVCS mirror verifies content/tree ids, not commit-to-changeset identity
+(`docs/MIRRORING.md` "Known limits"): a mirrored tree does not reproduce the source commit id or
+authorship/order exactly. The mirror is read-only while git remains the source.
+
+**Closing it.** A WIRE-3 importer that maps git commit metadata (author/committer, timestamps,
+parents, message) to changesets and records the mapping, or an explicit decision that content
+identity is sufficient for the mirror's purpose.
+
+## TD-10 — No ordered migration runner (2026-10-22)
+
+**Gap.** The service applies its own tables with runtime `CREATE TABLE IF NOT EXISTS` DDL and
+duplicates some of it as files under `migrations/` (`0001`–`0004`). There is no ordered ledger that
+proves a multi-instance rollout applied the same set (R6 doc: "no migration runner yet").
+
+**Closing it.** A ledger table + ordered apply step before readiness, with the runtime DDL reduced
+to a bootstrap/no-op and parity tests between the files and the applied schema.

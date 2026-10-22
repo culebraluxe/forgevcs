@@ -67,6 +67,13 @@ pub struct Config {
     pub service_principals: Option<String>,
     /// Authorization A/B mode (`$FORGEVCS_AUTH_MODE`; `SCION_ONLY` by default).
     pub auth_mode: Option<String>,
+    /// Merge engine selected for the in-process `scion-history` merge/rebase/land code
+    /// (`FORGEVCS_MERGE_ENGINE`). Unset means the upstream default (delete + add rename
+    /// handling); `exact-rename-v1` enables the opt-in rename-aware engine. The vendored engine
+    /// reads this environment variable directly at merge time, so the process environment and
+    /// this validated value must agree — `/version` reports the value the process was configured
+    /// with and deployment verification compares it.
+    pub merge_engine: Option<String>,
     /// Operator-configured repository ACLs (`FORGEVCS_REPO_ACLS`), JSON
     /// `repository -> {owner, readers?, writers?}`. Repository identity is not part of the
     /// vendored `acl.toml` policy; this value is how a pilot pre-assigns a repository to an
@@ -113,11 +120,18 @@ impl Config {
             github_client_id: get(&["FORGEVCS_GITHUB_CLIENT_ID"]),
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
+            merge_engine: get(&["FORGEVCS_MERGE_ENGINE"]),
             repo_acls: get(&["FORGEVCS_REPO_ACLS"]),
             human_principals: get(&["FORGEVCS_HUMAN_PRINCIPALS"]),
             workspace_lease_ttl_secs: get(&["FORGEVCS_WORKSPACE_LEASE_TTL_SECS"])
                 .and_then(|raw| raw.parse::<u64>().ok()),
         }
+    }
+
+    /// The selected merge engine: `default` when unset, else the validated name. The vendored
+    /// engine reads the environment variable itself; this is the single reported spelling.
+    pub fn merge_engine(&self) -> &str {
+        self.merge_engine.as_deref().unwrap_or("default")
     }
 
     /// The repository this process serves (ADR-0002 D3).
@@ -178,6 +192,13 @@ impl Config {
         }
         if self.workspace_lease_ttl_secs == Some(0) {
             return Err("FORGEVCS_WORKSPACE_LEASE_TTL_SECS must be at least 1 second".to_owned());
+        }
+        if let Some(engine) = &self.merge_engine
+            && !matches!(engine.as_str(), "default" | "exact-rename-v1")
+        {
+            return Err(format!(
+                "FORGEVCS_MERGE_ENGINE must be 'default' or 'exact-rename-v1', got {engine:?}"
+            ));
         }
         if let Some(mode) = &self.auth_mode
             && !matches!(
@@ -342,6 +363,34 @@ mod tests {
             ("AWS_ENDPOINT_URL_S3", "https://s3.example"),
         ]);
         assert_eq!(cfg.s3_config().expect("configured").key_prefix, "");
+    }
+
+    #[test]
+    fn merge_engine_is_validated_and_reported() {
+        let unset = config(&[]);
+        assert_eq!(unset.merge_engine(), "default");
+        assert_eq!(unset.validate(), Ok(()));
+
+        for engine in ["default", "exact-rename-v1"] {
+            let cfg = config(&[("FORGEVCS_MERGE_ENGINE", engine)]);
+            assert_eq!(cfg.merge_engine(), engine);
+            assert_eq!(cfg.validate(), Ok(()), "{engine}");
+        }
+
+        let cfg = config(&[("FORGEVCS_MERGE_ENGINE", "exact-rename")]);
+        assert!(
+            cfg.validate().is_err(),
+            "a typo must fail readiness instead of silently using the default engine"
+        );
+        assert!(
+            cfg.validate()
+                .err()
+                .is_some_and(|error| error.contains("FORGEVCS_MERGE_ENGINE")),
+            "the error names the variable an operator must fix"
+        );
+        let empty = config(&[("FORGEVCS_MERGE_ENGINE", "  ")]);
+        assert_eq!(empty.merge_engine(), "default");
+        assert_eq!(empty.validate(), Ok(()));
     }
 
     #[test]

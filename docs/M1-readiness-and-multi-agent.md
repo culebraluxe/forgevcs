@@ -2,6 +2,15 @@
 
 **Date:** 2026-10-17 · **Tree:** `c69408a` (`m0`, `w7-local-build`)
 
+> **Status note (2026-10-22):** this is the 2026-10-17 snapshot and several gaps below have since
+> shipped — repository-scoped ACL and path-prefix scopes (P0-1/P0-2), conflict `resolve`/`continue`
+> (R2), lane-prefix policy (R3), workspace write lease (R4), the real-work merge pilot (R5), human
+> CLI and the three-repo mirror. The remaining top blockers are **operational metrics (P0-6)** and
+> the **N-agent soak (P0-4)**. Current truth: [`docs/PRIMARY-VCS-DOCKET.md`](PRIMARY-VCS-DOCKET.md);
+> ordered list: [`docs/PRODUCTION-PACKET.md`](PRODUCTION-PACKET.md). Merge-engine configuration,
+> evidence and the upstream history blocker: [`docs/MERGE-ENGINE.md`](MERGE-ENGINE.md); topology
+> decision: [`docs/TOPOLOGY-DECISION.md`](TOPOLOGY-DECISION.md).
+
 ## Verdict
 
 **ForgeVCS is M0-complete and suitable for a controlled pilot. It is not prime-time / primary-VCS

@@ -1207,6 +1207,14 @@ pub(crate) async fn push(
                         "version": response.version,
                     });
                     landed = json!(landed_json(&response.landed));
+                    tracing::info!(
+                        repo = %repo,
+                        ref_name = %ref_name,
+                        target = %id_text(&response.target),
+                        version = response.version,
+                        merge_engine = state.config.merge_engine(),
+                        "landed"
+                    );
                 }
                 Err(status) => {
                     let base = first_parent(&app, &caller, &changeset_id).await;
@@ -1255,6 +1263,7 @@ pub(crate) async fn push(
                 "root_tree": root_tree,
                 "meta": meta,
             },
+            "merge_engine": state.config.merge_engine(),
             "uploads": uploads_json(&upload_results),
             "ref": ref_value,
             "landed": landed,
@@ -1532,12 +1541,21 @@ pub(crate) async fn land(
     match handlers::write::land(&engine.context(), caller_request(request, &caller)).await {
         Ok(response) => {
             let response = response.into_inner();
+            tracing::info!(
+                repo = %repo,
+                ref_name = %body.ref_name,
+                target = %id_text(&response.target),
+                version = response.version,
+                merge_engine = state.config.merge_engine(),
+                "landed"
+            );
             (
                 StatusCode::OK,
                 Json(json!({
                     "service": SERVICE,
                     "status": "ok",
                     "repo": repo,
+                    "merge_engine": state.config.merge_engine(),
                     "ref": {
                         "name": body.ref_name,
                         "target": id_text(&response.target),
@@ -1786,12 +1804,21 @@ pub(crate) async fn merge_land(
         Err(status) => return ApiError::from(status).into_response(),
     };
 
+    tracing::info!(
+        repo = %repo,
+        ref_name = %body.ref_name,
+        target = %id_text(&landed.target),
+        version = landed.version,
+        merge_engine = state.config.merge_engine(),
+        "landed"
+    );
     (
         StatusCode::OK,
         Json(json!({
             "service": SERVICE,
             "status": "ok",
             "repo": repo,
+            "merge_engine": state.config.merge_engine(),
             "merge_changeset": { "id": merged_id.to_text() },
             "changeset": { "id": linear_id.to_text() },
             "ref": {
@@ -2298,9 +2325,12 @@ async fn pause_conflict(
         },
         None => (None, None),
     };
+    // `operation` is a `&'static str` from the closed set {push, land, merge_land, merge,
+    // rebase}; the metric normalises anything else to `other`.
+    let operation = request.operation;
     let new = NewConflict {
         repo: repo.to_owned(),
-        operation: request.operation.to_owned(),
+        operation: operation.to_owned(),
         ref_name: request.ref_name,
         ref_version,
         ref_target,
@@ -2314,7 +2344,12 @@ async fn pause_conflict(
         created_by: caller.principal.id_string(),
     };
     match state.paused.open(new).await {
-        Ok(record) => Some(paused_error_response(status, &record)),
+        Ok(record) => {
+            // Observability: the pause is the "agent hit a conflict" signal, labelled by the
+            // operation that produced it (closed set, see crate::metrics).
+            state.forge_metrics.record_conflict_pause(operation);
+            Some(paused_error_response(status, &record))
+        }
         Err(error) => {
             tracing::warn!(%error, "could not persist paused conflict");
             None
@@ -2794,16 +2829,19 @@ async fn resolve_paused_conflict(
         )
         .await
     {
-        Ok(ResolveOutcome::Resolved(record)) => (
-            StatusCode::OK,
-            Json(json!({
-                "service": SERVICE,
-                "status": "ok",
-                "repo": repo,
-                "conflict": paused_conflicts::record_json(&record),
-            })),
-        )
-            .into_response(),
+        Ok(ResolveOutcome::Resolved(record)) => {
+            state.forge_metrics.record_conflict_resolved();
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "service": SERVICE,
+                    "status": "ok",
+                    "repo": repo,
+                    "conflict": paused_conflicts::record_json(&record),
+                })),
+            )
+                .into_response()
+        }
         Ok(ResolveOutcome::NotFound) => {
             ApiError::not_found(format!("paused conflict {} not found", record.id)).into_response()
         }
@@ -2855,6 +2893,7 @@ pub(crate) async fn continue_conflict(
         .into_response();
     }
     if record.status != "resolved" {
+        state.forge_metrics.record_conflict_continue("invalid");
         return ApiError::conflict(format!(
             "conflict {} is not resolved (status={}); resolve it before continuing",
             record.id, record.status
@@ -2884,6 +2923,7 @@ pub(crate) async fn continue_conflict(
         Err(status) => return ApiError::from(status).into_response(),
     };
     if stale_ref(&record, current_version) {
+        state.forge_metrics.record_conflict_continue("stale");
         return stale_response(&record, current_version, &current_target);
     }
     let app = engine.context();
@@ -2907,36 +2947,49 @@ pub(crate) async fn continue_conflict(
                 )
                 .await
             {
-                Ok(ContinueOutcome::Continued(record)) => (
-                    StatusCode::OK,
-                    Json(json!({
-                        "service": SERVICE,
-                        "status": "ok",
-                        "repo": repo,
-                        "conflict": paused_conflicts::record_json(&record),
-                        "ref": {
-                            "name": ref_name,
-                            "target": id_text(&response.target),
-                            "version": response.version,
-                        },
-                        "landed": landed_json(&response.landed),
-                    })),
-                )
-                    .into_response(),
+                Ok(ContinueOutcome::Continued(record)) => {
+                    state.forge_metrics.record_conflict_continue("ok");
+                    (
+                        StatusCode::OK,
+                        Json(json!({
+                            "service": SERVICE,
+                            "status": "ok",
+                            "repo": repo,
+                            "conflict": paused_conflicts::record_json(&record),
+                            "ref": {
+                                "name": ref_name,
+                                "target": id_text(&response.target),
+                                "version": response.version,
+                            },
+                            "landed": landed_json(&response.landed),
+                        })),
+                    )
+                        .into_response()
+                }
                 Ok(ContinueOutcome::NotFound) => {
+                    state.forge_metrics.record_conflict_continue("invalid");
                     ApiError::not_found(format!("paused conflict {} not found", record.id))
                         .into_response()
                 }
-                Ok(ContinueOutcome::NotResolved(record)) => ApiError::conflict(format!(
-                    "conflict {} is no longer resolved (status={})",
-                    record.id, record.status
-                ))
-                .with_extra(json!({ "conflict": paused_conflicts::record_json(&record) }))
-                .into_response(),
-                Err(error) => ApiError::internal(error).into_response(),
+                Ok(ContinueOutcome::NotResolved(record)) => {
+                    state.forge_metrics.record_conflict_continue("invalid");
+                    ApiError::conflict(format!(
+                        "conflict {} is no longer resolved (status={})",
+                        record.id, record.status
+                    ))
+                    .with_extra(json!({ "conflict": paused_conflicts::record_json(&record) }))
+                    .into_response()
+                }
+                Err(error) => {
+                    state.forge_metrics.record_conflict_continue("error");
+                    ApiError::internal(error).into_response()
+                }
             }
         }
-        Err(status) => continue_land_failure(status, &record).into_response(),
+        Err(status) => {
+            state.forge_metrics.record_conflict_continue("land_failed");
+            continue_land_failure(status, &record).into_response()
+        }
     }
 }
 

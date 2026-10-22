@@ -3,6 +3,14 @@
 **Date:** 2026-10-17 · **Tree:** `4b8ca94` + the merge-land, conflict-payload and pilot changes
 in this commit
 
+> **Status note (2026-10-22):** the design proposals below are not all open work. The conflict
+> `resolve`/`continue` workflow (R2) and `merge-land` shipped after this analysis; the real-work
+> merge pilot (R5) is done. Still open: the merge-engine determinism gap (env-only engine not
+> recorded in history), and the two-parent/lane-to-lane topology decision — both tracked in
+> [`docs/PRIMARY-VCS-DOCKET.md`](PRIMARY-VCS-DOCKET.md) (P1-B/P1-C). Engine config/evidence and
+> the exact upstream blocker: [`docs/MERGE-ENGINE.md`](MERGE-ENGINE.md). Topology recommendation:
+> [`docs/TOPOLOGY-DECISION.md`](TOPOLOGY-DECISION.md).
+
 Merge is the top of the mountain for the migration: git's merge/index/worktree behaviour is what
 broke at three bots, and the replacement has to be *better*, not merely different. This document
 records what Scion actually implements, what the pilot observed, and the ordered work to make it
@@ -173,14 +181,16 @@ Postgres+moto harness (QA evidence, not in the hermetic gate).
 | 1 | No two-parent landing | `merge-land` squashes the merge result into one linear commit | **conditional**: only if merge-commit topology is wanted; trunk-linear landing never needs it | upstream `land.rs` / façade policy |
 | 2 | Resolution workflow | **shipped (R2)**: `conflict-context` (§2b) plus persisted paused conflicts with `resolve`/`continue` (§2c) | none for the simple model; an agent still chooses the bytes | façade + client contract |
 | 3 | Criss-cross histories | `AMBIGUOUS_MERGE_BASE` (SPEC line 1479, future row line 1757) | **conditional**: only if merges exist (lane-to-lane or imported Git); trunk-linear history cannot criss-cross | merge engine version bump |
-| 4 | No rename/copy detection | renames are delete + add; merge treats them as such (SPEC line 1756, future row) | **bites the simple model**: a rename in one lane plus an edit in another is a false `modify_delete` conflict during land's rebase | derived type + merge engine version bump |
+| 4 | Rename engine: shipped opt-in, default off | `exact-rename-v1` (exact + similarity) is implemented for land/rebase and `Merge` behind `FORGEVCS_MERGE_ENGINE` (`upstream/crates/scion-history/src/rename.rs:34-40`, `merge.rs:122`, `rebase.rs:80`; TD-1 resolved). The default process runs the old delete+add behaviour, so a deployment that forgets the env silently gets false `modify_delete` conflicts; the engine version is not recorded in history | **managed config + recording**: validated/reported by `/version` and land evidence (2026-10-22), history recording blocked upstream (`docs/MERGE-ENGINE.md`); residual directory identity / both-sides-rename / threshold tuning is TD-1 | merge engine config + upstream engine-version mechanism |
 | 5 | Merge-aware policy | merge needs `write` on every delta path; conflict payload is filtered by `read` (write.rs:69) | a path an agent may write but not read produces a filtered/hidden conflict — the agent cannot see what it must decide | policy model |
-| 6 | No merge observability | no conflict/land metrics, no traces; only logs | cannot answer "how often do agents conflict, on what, and how long does it take" during the migration | server + Vercel |
+| 6 | Merge observability: registry wired, hosted scrape/alerting missing | **Lane U (2026-10-22)**: one process-wide `scion_obs::Metrics` is created in `main`, injected into every engine (`engine.rs` `Engine::connect(…, Arc<Metrics>)`) and served by `/metrics` (`http.rs`), so `scion_land_attempts{result}`, `scion_land_duration_seconds` and `scion_ref_cas_failures_total{ref}` reflect real land/CAS traffic instead of an all-zero registry. Conflict-workflow counters added in `crates/forgevcs-service/src/metrics.rs`: `forgevcs_conflict_pauses_total{operation}`, `forgevcs_conflict_resolves_total`, `forgevcs_conflict_continues_total{result}` (names/labels in `docs/OBSERVABILITY.md`). | questions like "how often do agents conflict, on what, how long does land take" are answerable from one scrape; **remaining**: no hosted scrape, dashboard or alert rule consumes `/metrics` (Vercel does not scrape), and there are still no distributed traces | service registry (done) + hosted Prometheus scrape/dashboards/alerts |
 | 7 | Large/binary content | `merge_max_text_bytes` turns large text into `binary` conflict; binary = whole-file ours/theirs | agent must resolve whole files by hand | engine limits / UX |
 | 8 | Scale evidence | single-process pilot, 6 repos, seconds | no error-rate/latency data for ten agents | soak + hosted |
 
 Rows 1 and 3 are conditional on the topology decision in §2a; row 4 is the one the simple
-sequential model needs. Row 2 is resolved by this commit.
+sequential model needs. Row 2 is resolved by this commit. Row 6's **service** half is resolved by
+Lane U (one shared registry, real land/CAS series, conflict counters); its **hosted** half (scrape,
+dashboards, alert rules — see `docs/OBSERVABILITY.md` §4) is still open.
 
 ## 4. Adapt at the edges, or grow the engine?
 
@@ -223,11 +233,13 @@ renames alone remove most agent-move conflicts.
 ## 6. Recommended order
 
 1. **Resolution contract — shipped** (gap 2): `conflict-context` plus the recipe in §2b.
-2. **Rename detection** (gap 4) — the one engine fix the simple sequential model needs; it
-   removes the false `modify_delete` conflicts that rebase-on-land creates after a file move.
-   Approved as Option A: a vendored-engine patch behind an opt-in merge-engine version, so the
-   default engine and the upstream gate keep their current behaviour.
-3. **Merge/conflict metrics and the N-agent soak** (gaps 6, 8): run real DeepSeek agents and
+2. **Rename detection — shipped opt-in, config now managed** (gap 4): `exact-rename-v1` removes
+   most false `modify_delete` conflicts on land/rebase and `Merge`; the deployment must set
+   `FORGEVCS_MERGE_ENGINE=exact-rename-v1` (validated, `/version`-reported, land evidence
+   recorded — `docs/MERGE-ENGINE.md`). Remaining: record the engine version in generated history
+   (upstream blocker) and the TD-1 residual limits.
+3. **Merge/conflict metrics and the N-agent soak** (gaps 6, 8): first connect the service metrics
+   registry to the engines and add conflict counters (packet P0-6), then run real agents and
    record conflict rate, land retries, and latency.
 4. **Two-parent land** (gap 1) only if merge-commit topology is wanted; then `merge-land` can
    choose merge-commit vs squash explicitly.

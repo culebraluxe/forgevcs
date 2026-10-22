@@ -63,6 +63,7 @@ All values are Vercel Production secrets; none are in the repository.
 | `FORGEVCS_AWS_ACCESS_KEY_ID` / `FORGEVCS_AWS_SECRET_ACCESS_KEY` | Branch-scoped object credentials |
 | `FORGEVCS_POLICY_PATH` | `/etc/forgevcs/acl.toml` |
 | `FORGEVCS_AUTH_MODE` | `SCION_ONLY` for the first hosted deployment |
+| `FORGEVCS_MERGE_ENGINE` | `exact-rename-v1` — rename-aware merge engine (validated; invalid values fail `/ready`; reported by `/version`). Set it in the **Vercel project**, not in this repo: the container deploy from a staging dir does not read `vercel.json` |
 | `FORGEVCS_SERVICE_PRINCIPALS` | `maestro=<sha256>` for the hosted smoke principal |
 | `FORGEVCS_SIGNING_KEY_PEM` | PKCS#8 Ed25519 PEM; the engine writes it to a private temp file, loads it, then deletes it |
 | `FORGEVCS_REPO` | `forgevcs` |
@@ -96,6 +97,13 @@ Observed:
 `/ready` is 200 only after the container has loaded the policy, connected to Neon, run/checked
 the schema and answered the bucket `HEAD`; it is the deployment's real dependency check, not a
 platform "successful" message.
+
+**Merge engine check (required).** `/version` must report `"merge_engine":"exact-rename-v1"`; a
+missing/other value means the deployment is running the default delete+add engine and hosted merge
+behaviour differs from the documented contract (`docs/MERGE-ENGINE.md`). This is a project-level
+Vercel env setting (the deploy script stages a prebuilt container and does not read repo
+`vercel.json`), so treat it as part of the release checklist and record the observed value in the
+deploy receipt.
 
 ## 5. Findings
 
