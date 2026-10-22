@@ -143,3 +143,32 @@ The public router serves Scion's `health_router` unchanged at `/metrics`, `/heal
    aggregated (`sum(rate(...))` across instances), and a counter is not a lifetime total. A
    scraper must tolerate target churn/`up` gaps; use `rate`/`increase` over a window, not raw
    counter values, for alerting.
+
+## 5. Hosted collection, dashboard and alerts — built 2026-10-22
+
+The collector/dashboard layer is now in [`observability/`](../observability/README.md): a local
+Docker Compose stack with Prometheus, Blackbox exporter, Alertmanager, a small alert relay and
+Grafana. It scrapes the production `/metrics` and `/ready`/`/health` directly; no Rust service
+change is required.
+
+- Prometheus: 30s scrape, 30d retention, seven ForgeVCS alert rules.
+- Blackbox: readiness/health probes.
+- Grafana: auto-provisioned `ForgeVCS — Overview` dashboard (land outcomes, p95/p99 latency,
+  conflict pauses/continues, ref-CAS contention, RPC latency, storage, up/ready).
+- Alert relay: posts Slack/Discord-compatible messages when `ALERT_WEBHOOK_URL` is set; otherwise
+  logs alerts.
+- Verified live: all three scrape targets `up`; rules loaded; synthetic Alertmanager alert reached
+  the relay.
+
+Start it with:
+
+```bash
+cd observability && cp .env.example .env && ./scripts/start.sh
+```
+
+Grafana: `http://127.0.0.1:3002/d/forgevcs-overview` · Prometheus: `http://127.0.0.1:9090` ·
+Alertmanager: `http://127.0.0.1:9093`.
+
+**Residual:** this runs on the machine that starts Compose. For production, run the same stack on an
+always-on host/VPS; a sleeping laptop creates scrape gaps. Traces are still out of scope, and
+`/metrics` remains public at the edge.

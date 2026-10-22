@@ -128,9 +128,11 @@ One process-wide `scion_obs::Metrics` is created in `main`, injected into every 
 were added in `crates/forgevcs-service/src/metrics.rs` (`forgevcs_conflict_pauses_total{operation}`,
 `..._resolves_total`, `..._continues_total{result}`). Names/labels: `docs/OBSERVABILITY.md`.
 
-**Remaining gap (why this entry stays open).** Vercel does not scrape `/metrics`: there is no hosted
-Prometheus scrape, dashboard or alert rule, and no distributed traces. The endpoint is now truthful
-but nobody consumes it in production.
+**Remaining gap (why this entry stays open).** Vercel does not scrape `/metrics`. A sidecar stack
+now exists in `observability/` (Prometheus + Blackbox + Alertmanager + Grafana, seven rules, dashboard,
+synthetic-alert verified), but it runs on the machine that starts Compose; an always-on host/VPS and
+a real `ALERT_WEBHOOK_URL` are still required for production notification. Distributed traces remain
+out of scope.
 
 **Multi-repo registration lifecycle (2026-10-22, Lane X).** Sharing one registry briefly made a
 second engine boot in the same process fail (`storage metrics: Duplicate metrics collector

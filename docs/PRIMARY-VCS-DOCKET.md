@@ -190,3 +190,11 @@ The stale snapshot above is superseded by these committed/deployed facts:
 - **Primary verdict:** ForgeVCS is deployable and proven for the process-per-repo agent-lane
   topology. It is not yet the sole production VCS until hosted observability alerts exist and the
   optional single-process 10-agent soak is run.
+
+## Update — hosted metrics stack
+
+The metrics collector/dashboard/alerts layer is built in `observability/` (Prometheus + Blackbox +
+Alertmanager + alert relay + Grafana), scraping production `/metrics` and `/ready`. It is verified
+locally with all scrape targets up and a synthetic alert delivered through the relay. For production
+it must run on an always-on host and `ALERT_WEBHOOK_URL` must be set for notifications; the laptop
+stack is the collector, not a hosted service.
