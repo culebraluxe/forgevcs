@@ -111,14 +111,7 @@ pub enum Command {
         onto: String,
     },
     /// `merge-land <repo> --head …` — merge a head into the ref tip and land the result.
-    MergeLand {
-        repo: String,
-        head: String,
-        ref_name: String,
-        author: Option<String>,
-        message: Option<String>,
-        change_id: Option<String>,
-    },
+    MergeLand(Box<MergeLandArgs>),
     /// `workspace create <repo>`.
     WorkspaceCreate {
         repo: String,
@@ -130,6 +123,21 @@ pub enum Command {
     WorkspaceStatus { repo: String, id: String },
     /// `workspace destroy <repo> <workspace-id>`.
     WorkspaceDestroy { repo: String, id: String },
+}
+
+/// Arguments for [`Command::MergeLand`], boxed in the variant so adding the opt-in topology
+/// cannot grow `Command` past clippy's large-enum-variant threshold.
+#[derive(Debug)]
+pub struct MergeLandArgs {
+    pub repo: String,
+    pub head: String,
+    pub ref_name: String,
+    pub author: Option<String>,
+    pub message: Option<String>,
+    pub change_id: Option<String>,
+    /// `squash` or `merge-commit`; unset uses the deployment default
+    /// (`FORGEVCS_MERGE_TOPOLOGY`, itself defaulting to `squash-only`).
+    pub topology: Option<String>,
 }
 
 /// The complete usage text.
@@ -211,7 +219,10 @@ COMMANDS:
         POST /repos/{repo}/rebase.
 
     merge-land <repo> --head <id> [--ref main] [--author "A <a@b>"] [--message M]
-        POST /repos/{repo}/merge-land.
+                [--topology squash|merge-commit]
+        POST /repos/{repo}/merge-land. `--topology merge-commit` publishes the clean,
+        tip-parented two-parent merge changeset itself (opt-in `merge-commit-v1`); unset uses
+        the deployment default, which is `squash-only`.
 
     workspace create <repo> [--ref main | --changeset <id>] [--sparse a,b]
     workspace status <repo> <workspace-id>
@@ -375,18 +386,26 @@ fn parse_command(command: &str, rest: &[String]) -> Result<Command> {
         "merge-land" => {
             let opts = Options::parse(
                 rest,
-                &["--head", "--ref", "--author", "--message", "--change-id"],
+                &[
+                    "--head",
+                    "--ref",
+                    "--author",
+                    "--message",
+                    "--change-id",
+                    "--topology",
+                ],
                 &[],
             )?;
             let repo = opts.one_positional("merge-land <repo>")?;
-            Ok(Command::MergeLand {
+            Ok(Command::MergeLand(Box::new(MergeLandArgs {
                 repo,
                 head: required(&opts, "--head", "merge-land needs --head <id>")?,
                 ref_name: opts.value("--ref").unwrap_or_else(|| "main".to_owned()),
                 author: opts.value("--author"),
                 message: opts.value("--message"),
                 change_id: opts.value("--change-id"),
-            })
+                topology: opts.value("--topology"),
+            })))
         }
         "workspace" => parse_workspace(rest),
         other => bail!("unknown command {other:?}\n\n{}", usage()),
@@ -705,7 +724,16 @@ mod tests {
         ));
         assert!(matches!(
             command(&["merge-land", "repo", "--head", "h"]),
-            Command::MergeLand { ref_name, .. } if ref_name == "main"
+            Command::MergeLand(args) if args.ref_name == "main"
+        ));
+        // The topology is opt-in: unset by default, carried verbatim when given.
+        assert!(matches!(
+            command(&["merge-land", "repo", "--head", "h"]),
+            Command::MergeLand(args) if args.topology.is_none()
+        ));
+        assert!(matches!(
+            command(&["merge-land", "repo", "--head", "h", "--topology", "merge-commit"]),
+            Command::MergeLand(args) if args.topology.as_deref() == Some("merge-commit")
         ));
         assert!(matches!(
             command(&["workspace", "create", "repo", "--sparse", "a,b"]),

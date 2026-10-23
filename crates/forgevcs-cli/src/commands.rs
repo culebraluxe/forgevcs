@@ -10,7 +10,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use crate::args::{Command, GlobalOptions};
+use crate::args::{Command, GlobalOptions, MergeLandArgs};
 use crate::client::Client;
 use crate::settings::Settings;
 use crate::token::{self, Session};
@@ -154,16 +154,18 @@ pub async fn execute(global: GlobalOptions, command: Command) -> Result<Value> {
                 )
                 .await
         }
-        Command::MergeLand {
-            repo,
-            head,
-            ref_name,
-            author,
-            message,
-            change_id,
-        } => {
+        Command::MergeLand(args) => {
+            let MergeLandArgs {
+                repo,
+                head,
+                ref_name,
+                author,
+                message,
+                change_id,
+                topology,
+            } = *args;
             merge_land(
-                &settings, &repo, &head, &ref_name, author, message, change_id,
+                &settings, &repo, &head, &ref_name, author, message, change_id, topology,
             )
             .await
         }
@@ -488,19 +490,24 @@ async fn merge_land(
     author: Option<String>,
     message: Option<String>,
     change_id: Option<String>,
+    topology: Option<String>,
 ) -> Result<Value> {
     let client = authenticated(settings)?;
+    // The service owns the accepted spellings (`squash`/`squash-only`,
+    // `merge-commit`/`merge-commit-v1`) and the deployment default, so the flag is passed
+    // through unvalidated rather than duplicating that truth here.
+    let mut body = json!({
+        "ref": ref_name,
+        "head": head,
+        "author": author.unwrap_or_else(|| default_author(settings)),
+        "message": message,
+        "change_id": change_id,
+    });
+    if let Some(topology) = topology {
+        body["topology"] = Value::String(topology);
+    }
     client
-        .post(
-            &format!("/repos/{repo}/merge-land"),
-            &json!({
-                "ref": ref_name,
-                "head": head,
-                "author": author.unwrap_or_else(|| default_author(settings)),
-                "message": message,
-                "change_id": change_id,
-            }),
-        )
+        .post(&format!("/repos/{repo}/merge-land"), &body)
         .await
 }
 
