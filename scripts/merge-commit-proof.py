@@ -140,10 +140,20 @@ def run(base: str, token: str, repo: str) -> int:
     lane = client.call(
         "POST",
         prefix + "/push",
-        push_body(main_tip, "lane/proof", "lane.txt", BLOB_B, CONTENT_B, "update"),
+        push_body(main_tip, "lane/proof", "lane.txt", BLOB_B, CONTENT_B, "none"),
     )
     lane_tip = lane["changeset"]["id"]
     print(f"  ..  lane at {lane_tip[:12]}")
+    # This run authenticates as the DevOps seat, which the policy denies on `lane/*` (correctly:
+    # only `group:agents` advances lane refs). The changeset is stored with mode `none` and the
+    # ref is provisioned through `admin.refs`, so the topology is proven without touching policy.
+    client.call(
+        "POST",
+        prefix + "/refs",
+        {"name": "lane/proof", "target": lane_tip, "reason": "merge-commit proof"},
+    )
+    provisioned, _ = ref_target(client, prefix, "lane/proof")
+    client.check("lane ref holds the lane changeset", provisioned == lane_tip, provisioned[:12])
 
     # 1. merge-commit: the endpoint mints Merge(main, lane) and publishes it as itself.
     published = client.call(
@@ -183,7 +193,7 @@ def run(base: str, token: str, repo: str) -> int:
     lane2 = client.call(
         "POST",
         prefix + "/push",
-        push_body(lane_tip, "lane/proof", "lane2.txt", BLOB_A, CONTENT_A, "update"),
+        push_body(lane_tip, "lane/proof", "lane2.txt", BLOB_A, CONTENT_A, "none"),
     )
     lane2_tip = lane2["changeset"]["id"]
     squashed = client.call(
