@@ -6,12 +6,17 @@ not change:
 
   1. `/version` still reports the deployment default `merge_topology=squash-only` and lists
      `merge-commit-v1-landing` in `vendor_patches`.
-  2. a lane changeset is merged and `merge-land` with `topology=merge-commit` publishes the
-     **two-parent merge changeset itself**: the ref tip *is* the merge, `parents == [main, lane]`.
-  3. the same shape without `topology` still squashes: the published changeset is single-parent
+  2. `merge-land` with `topology=merge-commit` publishes the **two-parent merge changeset
+     itself**: the ref tip *is* the merge and `parents == [main, lane]`.
+  3. the same call without `topology` still squashes: the published changeset is single-parent
      and distinct from the merge changeset, so the default contract is unchanged.
-  4. a stale merge (created against an older tip) is refused with
-     `details.kind = "ref_version_mismatch"` and the ref does not move.
+  4. re-landing a lane tip whose content is already merged is refused as an empty merge
+     (`409`), and the ref does not move.
+
+Staleness (`REF_VERSION_MISMATCH` for a merge whose first parent is no longer the tip) is an
+engine-level guarantee: the façade re-runs `Merge(tip, head)` inside the request, so a stale
+merge cannot be handed to it deterministically. That path is covered by
+`upstream/crates/scion-server/tests/write_land.rs` (`land_merge_stale_first_parent_is_a_typed_refusal`).
 
 Usage:
     python3 scripts/merge-commit-proof.py --base https://… --token <bearer> --repo <name>
@@ -72,21 +77,15 @@ class Client:
         print(f"  ok  {name}")
 
 
-def push_body(parent: str, ref: str, changes: list[tuple[str, str, bytes]], mode: str) -> dict:
-    """One changeset: `changes` is [(path, blob id, content)] in a single delta."""
-    objects = {}
-    delta = []
-    for path, blob, content in changes:
-        objects[blob] = base64.b64encode(content).decode()
-        delta.append({"path": path, "op": 1, "mode": 1, "id": blob, "size": len(content)})
+def push_body(parent: str, ref: str, path: str, blob: str, content: bytes, mode: str) -> dict:
     return {
-        "objects": [{"id": blob, "data": data} for blob, data in objects.items()],
+        "objects": [{"id": blob, "data": base64.b64encode(content).decode()}],
         "changeset": {
             "parents": [parent],
-            "delta": delta,
+            "delta": [{"path": path, "op": 1, "mode": 1, "id": blob, "size": len(content)}],
             "meta": {
                 "author": "ForgeVCS merge-commit proof <proof@example.test>",
-                "message": f"proof: {ref}",
+                "message": f"proof: {path}",
             },
             "change_id": secrets.token_hex(16),
         },
@@ -95,29 +94,16 @@ def push_body(parent: str, ref: str, changes: list[tuple[str, str, bytes]], mode
     }
 
 
-def merge(client: Client, prefix: str, a: str, b: str) -> str:
-    response = client.call(
-        "POST",
-        prefix + "/merge",
-        {
-            "a": a,
-            "b": b,
-            "meta": {
-                "author": "ForgeVCS merge-commit proof <proof@example.test>",
-                "message": "proof: merge lane into main",
-            },
-            "change_id": secrets.token_hex(16),
-        },
-    )
-    return response["changeset"]["id"]
-
-
 def ref_target(client: Client, prefix: str, name: str) -> tuple[str, int]:
     refs = client.call("GET", prefix + "/refs")["refs"]
     ref = next((entry for entry in refs if entry["name"] == name), None)
     if ref is None:
         raise ProofError(f"no {name!r} ref")
     return ref["target"], ref["version"]
+
+
+def changeset(client: Client, prefix: str, id: str) -> dict:
+    return client.call("GET", prefix + f"/changesets/{id}")["changeset"]
 
 
 def run(base: str, token: str, repo: str) -> int:
@@ -140,16 +126,12 @@ def run(base: str, token: str, repo: str) -> int:
     client.call("POST", prefix + "/init", {})
     main_tip, _ = ref_target(client, prefix, "main")
 
-    # main: one changeset.
     landed = client.call(
-        "POST",
-        prefix + "/push",
-        push_body(main_tip, "main", [("main.txt", BLOB_A, CONTENT_A)], "land"),
+        "POST", prefix + "/push", push_body(main_tip, "main", "main.txt", BLOB_A, CONTENT_A, "land")
     )
     main_tip = landed["changeset"]["id"]
     print(f"  ..  main at {main_tip[:12]}")
 
-    # lane/proof from that tip, with a different path so the merge has a real delta.
     client.call(
         "POST",
         prefix + "/refs",
@@ -158,56 +140,56 @@ def run(base: str, token: str, repo: str) -> int:
     lane = client.call(
         "POST",
         prefix + "/push",
-        push_body(main_tip, "lane/proof", [("lane.txt", BLOB_B, CONTENT_B)], "update"),
+        push_body(main_tip, "lane/proof", "lane.txt", BLOB_B, CONTENT_B, "update"),
     )
     lane_tip = lane["changeset"]["id"]
     print(f"  ..  lane at {lane_tip[:12]}")
 
-    # 2. merge-commit: the published changeset is the two-parent merge itself.
-    merge_id = merge(client, prefix, main_tip, lane_tip)
-    changeset = client.call("GET", prefix + f"/changesets/{merge_id}")["changeset"]
-    client.check(
-        "merge changeset has both parents in order",
-        changeset["parents"] == [main_tip, lane_tip],
-        str(changeset["parents"]),
-    )
+    # 1. merge-commit: the endpoint mints Merge(main, lane) and publishes it as itself.
     published = client.call(
         "POST",
         prefix + "/merge-land",
         {
             "ref": "main",
-            "head": merge_id,
+            "head": lane_tip,
             "message": "proof: land merge commit",
             "topology": "merge-commit",
         },
     )
+    merge_id = published["changeset"]["id"]
     client.check("topology reported", published.get("topology") == "merge-commit-v1")
     client.check(
         "published changeset is the merge itself",
-        published["changeset"]["id"] == merge_id and published["merge_changeset"]["id"] == merge_id,
-        f"{published['changeset']['id'][:12]} vs {merge_id[:12]}",
+        published["changeset"]["id"] == published["merge_changeset"]["id"],
+        f"{published['changeset']['id'][:12]} vs {published['merge_changeset']['id'][:12]}",
+    )
+    merge = changeset(client, prefix, merge_id)
+    client.check(
+        "merge changeset has both parents in order",
+        merge["parents"] == [main_tip, lane_tip],
+        str(merge["parents"]),
     )
     client.check(
         "landed row is source=result=merge",
-        published["landed"] == [{"change_id": changeset["change_id"], "source": merge_id, "result": merge_id}]
-        or (len(published["landed"]) == 1 and published["landed"][0]["source"] == merge_id),
+        len(published["landed"]) == 1
+        and published["landed"][0]["source"] == merge_id
+        and published["landed"][0]["result"] == merge_id,
         str(published["landed"]),
     )
     tip, _ = ref_target(client, prefix, "main")
     client.check("main tip is the merge commit", tip == merge_id, tip[:12])
 
-    # 3. default unchanged: the same shape without topology still squashes.
+    # 2. default unchanged: the same call without topology still squashes.
     lane2 = client.call(
         "POST",
         prefix + "/push",
-        push_body(lane_tip, "lane/proof", [("lane2.txt", BLOB_A, CONTENT_A)], "update"),
+        push_body(lane_tip, "lane/proof", "lane2.txt", BLOB_A, CONTENT_A, "update"),
     )
     lane2_tip = lane2["changeset"]["id"]
-    squash_merge = merge(client, prefix, merge_id, lane2_tip)
     squashed = client.call(
         "POST",
         prefix + "/merge-land",
-        {"ref": "main", "head": squash_merge, "message": "proof: default squash"},
+        {"ref": "main", "head": lane2_tip, "message": "proof: default squash"},
     )
     client.check(
         "default topology is squash-only",
@@ -215,35 +197,29 @@ def run(base: str, token: str, repo: str) -> int:
         str(squashed.get("topology")),
     )
     client.check(
-        "squash publishes a different, single-parent changeset",
-        squashed["changeset"]["id"] != squash_merge,
+        "squash publishes a different changeset than the merge",
+        squashed["changeset"]["id"] != squashed["merge_changeset"]["id"],
         squashed["changeset"]["id"][:12],
     )
-    squashed_tip = client.call("GET", prefix + f"/changesets/{squashed['changeset']['id']}")["changeset"]
+    squashed_changeset = changeset(client, prefix, squashed["changeset"]["id"])
     client.check(
-        "squashed changeset has one parent",
-        squashed_tip["parents"] == [merge_id],
-        str(squashed_tip["parents"]),
+        "squashed changeset has exactly one parent (the previous tip)",
+        squashed_changeset["parents"] == [merge_id],
+        str(squashed_changeset["parents"]),
     )
 
-    # 4. a stale merge is refused, typed, and the ref does not move.
-    lane3 = client.call(
-        "POST",
-        prefix + "/push",
-        push_body(lane2_tip, "lane/proof", [("lane3.txt", BLOB_B, CONTENT_B)], "update"),
-    )
-    stale_merge = merge(client, prefix, lane2_tip, lane3["changeset"]["id"])
+    # 3. an already-merged lane tip is refused as an empty merge, and the ref stays put.
     before, before_version = ref_target(client, prefix, "main")
     refusal = client.call(
         "POST",
         prefix + "/merge-land",
-        {"ref": "main", "head": stale_merge, "topology": "merge-commit"},
+        {"ref": "main", "head": lane2_tip, "topology": "merge-commit"},
         expect=409,
     )
     client.check(
-        "stale merge is a typed refusal",
-        refusal.get("details", {}).get("kind") == "ref_version_mismatch",
-        json.dumps(refusal.get("details"))[:200],
+        "re-merging a merged lane is refused",
+        "empty delta" in json.dumps(refusal),
+        json.dumps(refusal)[:200],
     )
     after, after_version = ref_target(client, prefix, "main")
     client.check(
