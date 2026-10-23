@@ -198,3 +198,9 @@ Alertmanager + alert relay + Grafana), scraping production `/metrics` and `/read
 locally with all scrape targets up and a synthetic alert delivered through the relay. For production
 it must run on an always-on host and `ALERT_WEBHOOK_URL` must be set for notifications; the laptop
 stack is the collector, not a hosted service.
+
+## Update — vendor patch visibility
+
+`/version` now reports `vendor_patches: ["td-12-conflict-fail-closed"]`, and the production deploy
+script asserts both that patch id and `merge_engine=exact-rename-v1`. The patch is carried as
+`upstream/patches/td-12-conflict-fail-closed.patch` for the next Scion bump.

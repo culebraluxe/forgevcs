@@ -14,6 +14,11 @@ use scion_store_s3::S3Config;
 /// The vendored Scion commit this build was assembled from (`docs/BASELINE.md`).
 pub const UPSTREAM_COMMIT: &str = "e0ffadf9c755f1b99812df5beffcabdebcb38c19";
 
+/// Local patches carried on top of [`UPSTREAM_COMMIT`]. `/version` exposes this so an operator
+/// can see that the binary is not pristine upstream, not just which upstream SHA it started from.
+/// Keep this in sync with `README.md` "Modifications to vendored code" and `docs/TECH_DEBT.md`.
+pub const VENDOR_PATCHES: &[&str] = &["td-12-conflict-fail-closed"];
+
 /// Default listen port; Vercel supplies `$PORT`.
 const DEFAULT_PORT: u16 = 3000;
 

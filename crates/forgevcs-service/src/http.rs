@@ -133,6 +133,9 @@ async fn version(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>
             "status": "ok",
             "version": env!("CARGO_PKG_VERSION"),
             "upstream": config::UPSTREAM_COMMIT,
+            // The vendored tree is not pristine: make the local patch visible to operators and
+            // release checks instead of reporting only the upstream SHA.
+            "vendor_patches": config::VENDOR_PATCHES,
             // The merge engine changes merge/rebase/land results; deployments and the push/land
             // responses report the same value so a mismatch is visible rather than inferred.
             "merge_engine": state.config.merge_engine(),
@@ -558,6 +561,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["service"], SERVICE);
         assert_eq!(body["upstream"], config::UPSTREAM_COMMIT);
+        assert_eq!(body["vendor_patches"][0], "td-12-conflict-fail-closed");
         assert_eq!(body["merge_engine"], "default");
     }
 
@@ -577,6 +581,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["merge_engine"], "exact-rename-v1");
+        assert_eq!(body["vendor_patches"][0], "td-12-conflict-fail-closed");
     }
 
     #[tokio::test]

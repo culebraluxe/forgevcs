@@ -196,3 +196,10 @@ printed rollback line. ForgeVCS **reuses the conventions, not the project**:
 - `/health` 200, `/ready` ready, `/version` `merge_engine=exact-rename-v1`
 - `/metrics` live with storage counters; W8 hosted smoke PASS (W4 + W5)
 - Rollback: promote the prior ready deployment in Vercel.
+
+### Release guard (2026-10-22)
+
+`/version` now reports `vendor_patches` in addition to `upstream` and `merge_engine`. The deploy
+script asserts both `merge_engine=exact-rename-v1` (overridable with
+`FORGEVCS_EXPECTED_MERGE_ENGINE`) and the presence of `td-12-conflict-fail-closed`, so a deploy
+cannot silently drop the local conflict-policy patch or change merge semantics.

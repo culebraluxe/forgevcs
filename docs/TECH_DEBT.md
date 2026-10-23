@@ -244,3 +244,7 @@ would not cover dynamic grants; option C (an `omitted_conflicts` count/escalatio
 rejected for now: it needs a wire/proto change, still leaves the caller unable to resolve, and
 leaks that a hidden conflict exists. A `read` grant for the hidden path (or a dedicated resolver
 principal) is the documented resolution path.
+
+**Carry artifact:** `upstream/patches/td-12-conflict-fail-closed.patch` (plus
+`upstream/patches/README.md`). Apply it after replacing `upstream/` at the next Scion pin bump;
+`/version.vendor_patches` and the production deploy guard make the divergence visible.

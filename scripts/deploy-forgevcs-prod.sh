@@ -84,6 +84,15 @@ for path in /health /ready /version; do
     || fail "Live check failed for ${path}."
 done
 
+# Release guard: a deploy must not silently change merge semantics or drop the local
+# vendored patch that closes the writable-but-unreadable conflict case.
+VERSION_BODY="$(vc curl "${URL%/}/version" 2>/dev/null || true)"
+EXPECTED_MERGE_ENGINE="${FORGEVCS_EXPECTED_MERGE_ENGINE:-exact-rename-v1}"
+printf '%s' "$VERSION_BODY" | grep -q "\"merge_engine\":\"${EXPECTED_MERGE_ENGINE}\"" \
+  || fail "Live /version does not report merge_engine=${EXPECTED_MERGE_ENGINE}."
+printf '%s' "$VERSION_BODY" | grep -q '"td-12-conflict-fail-closed"' \
+  || fail "Live /version is missing the TD-12 conflict-policy vendor patch."
+
 printf '\nFORGEVCS DEPLOY COMPLETE — %s is ready.\n' "$URL"
 printf 'Vercel built the runtime image only; the Rust workspace was compiled on this Mac.\n'
 printf 'Rollback: Vercel -> %s -> Deployments -> promote the previous ready deployment.\n' "$PROJECT"
