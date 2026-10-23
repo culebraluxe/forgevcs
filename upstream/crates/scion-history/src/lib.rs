@@ -33,6 +33,6 @@ pub use hooks::{
     LandObserver, NoEager, NoopLandObserver, Rebaser, WriteAuthorizer,
 };
 pub use types::{
-    Applied, ChangesetRecord, CreateRequest, Created, FileChange, LandRequest, LandResult,
-    MetaFields, MetaSource, UpdateRefRequest,
+    Applied, ChangesetRecord, CreateRequest, Created, FileChange, LandMergeRequest, LandRequest,
+    LandResult, MetaFields, MetaSource, UpdateRefRequest,
 };

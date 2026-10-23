@@ -4,8 +4,12 @@
 mod write_support;
 
 use scion_core::{ErrorCode, ErrorPayload, FaultAction, ObjectId, points, subcode};
+use scion_history::{LandMergeRequest, LandResult};
 use scion_object::RefName;
 use scion_proto::{ScionClient, v1};
+use scion_server::CallerCtx;
+use scion_server::authz::PolicyLandAuthzSource;
+use scion_server::handlers;
 use scion_server::testing::{InProcessServer, ServerTestOpts};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -631,4 +635,410 @@ async fn land_conflict_fails_closed_when_a_writable_path_is_unreadable() {
         clean_paths,
         vec![b"clean".to_vec(), b"secrets/new".to_vec()]
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ForgeVCS merge-commit topology (Lane Z, local patch task-88): tip-parented merge landing.
+//
+// These exercise `History::land_merge` and the narrow public handler. The topology is opt-in and
+// only publishes a clean two-parent merge changeset; a stale first parent is a typed refusal and
+// nothing is rebased, squashed or paused.
+// ---------------------------------------------------------------------------------------------
+
+/// `Merge(a, b)` over the RPC; the caller keeps the changeset id.
+async fn make_merge(
+    c: &ScionClient,
+    a: &ObjectId,
+    b: &ObjectId,
+    change_id: u32,
+) -> Result<ObjectId, tonic::Status> {
+    c.write()
+        .merge(v1::MergeRequest {
+            a: a.as_bytes().to_vec(),
+            b: b.as_bytes().to_vec(),
+            meta_fields: Some(meta("merge")),
+            change_id: cid(change_id),
+        })
+        .await
+        .map(|r| id(&r.into_inner().changeset_id))
+}
+
+/// `History::land_merge` with the live policy adapter, as the handler calls it.
+async fn land_merge(
+    srv: &InProcessServer,
+    r: &str,
+    merge: &ObjectId,
+    who: &scion_core::Principal,
+) -> scion_core::Result<LandResult> {
+    let ctx = srv.ctx();
+    let source = PolicyLandAuthzSource::new(ctx.policy.clone(), who.clone());
+    ctx.history
+        .land_merge(
+            LandMergeRequest {
+                ref_name: RefName::parse(r).unwrap(),
+                merge: *merge,
+            },
+            who,
+            &source,
+        )
+        .await
+}
+
+/// Land the base commit so `main` is at version 2, returning the tip.
+async fn main_at_base(srv: &InProcessServer, c: &ScionClient) -> (ObjectId, ObjectId) {
+    let r = root(srv).await;
+    let base = commit(srv, c, &r, &[("one", b"1\n")], 1).await;
+    let resp = land(c, "main", &base, false).await.unwrap();
+    assert_eq!(resp.version, 2);
+    assert_eq!(id(&resp.target), base);
+    (r, base)
+}
+
+/// Clean tip-parented merge lands as itself: ref target is the merge changeset, exactly one
+/// landed row maps its change id to itself, parents stay `[tip, side]`, and both trees are
+/// visible. Nothing is rebased or squashed.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_publishes_the_tip_parented_merge_changeset() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let m = make_merge(&c, &tip, &side, 3).await.unwrap();
+
+    let result = land_merge(&srv, "main", &m, &alice()).await.unwrap();
+    assert_eq!(result.target, m, "the merge changeset is the new target");
+    assert_eq!(result.version, 3);
+    assert_eq!(result.landed.len(), 1, "one landed row for the merge");
+    assert_eq!(result.landed[0].source, m);
+    assert_eq!(result.landed[0].result, m);
+    assert_eq!(
+        result.landed[0].change_id,
+        srv.ctx()
+            .history
+            .changeset(&m)
+            .await
+            .unwrap()
+            .changeset
+            .change_id
+    );
+
+    assert_eq!(ref_state(&srv, "main").await, (m, 3));
+    let rec = srv.ctx().history.changeset(&m).await.unwrap();
+    assert_eq!(
+        rec.changeset.parents,
+        vec![tip, side],
+        "parents are [tip, side]"
+    );
+    for path in ["one", "two"] {
+        let path = scion_object::RepoPath::parse(path.as_bytes()).unwrap();
+        assert!(
+            srv.ctx()
+                .history
+                .lookup(&rec.changeset.root_tree, &path)
+                .await
+                .unwrap()
+                .is_some(),
+            "{path:?} must be in the merge tree"
+        );
+    }
+
+    // The landed index has the row `(main, change_id) -> (merge, merge)`, version 3.
+    let landed = srv
+        .ctx()
+        .storage
+        .meta
+        .get_landed(&RefName::main(), &rec.changeset.change_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(landed.source, m);
+    assert_eq!(landed.result, m);
+    assert_eq!(landed.version, 3);
+
+    // One ref-log entry (the land), carrying the single landed row.
+    let log = srv
+        .ctx()
+        .history
+        .ref_log(&RefName::main(), 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(log.len(), 3, "bootstrap + base land + merge land");
+    assert_eq!(log[2].version, 3);
+    assert_eq!(log[2].new_target, Some(m));
+    assert_eq!(log[2].landed.len(), 1);
+}
+
+/// A merge whose first parent is no longer the tip is refused as stale: typed
+/// REF_VERSION_MISMATCH with the current target/version, ref unchanged, no landed row. The
+/// caller must re-merge; the merge changeset is never rewritten or force-landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_stale_first_parent_is_a_typed_refusal() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let stale_merge = make_merge(&c, &tip, &side, 3).await.unwrap();
+
+    // Another writer advances main after the merge was created.
+    let newer = commit(&srv, &c, &tip, &[("three", b"3\n")], 4).await;
+    let resp = land(&c, "main", &newer, false).await.unwrap();
+    assert_eq!(resp.version, 3);
+    let new_tip = id(&resp.target);
+
+    let error = land_merge(&srv, "main", &stale_merge, &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::RefVersionMismatch);
+    match error.payload {
+        ErrorPayload::RefMismatch {
+            current_version,
+            current_target,
+        } => {
+            assert_eq!(current_version, 3);
+            assert_eq!(current_target, Some(new_tip));
+        }
+        other => panic!("expected RefMismatch, got {other:?}"),
+    }
+    assert_eq!(ref_state(&srv, "main").await, (new_tip, 3));
+    let change_id = srv
+        .ctx()
+        .history
+        .changeset(&stale_merge)
+        .await
+        .unwrap()
+        .changeset
+        .change_id;
+    assert!(
+        srv.ctx()
+            .storage
+            .meta
+            .get_landed(&RefName::main(), &change_id)
+            .await
+            .unwrap()
+            .is_none(),
+        "a stale merge must not be recorded in the landed index"
+    );
+}
+
+/// Lost-response retry: the CAS committed, the response was lost, and the retry sees the merge
+/// already landed. It returns the recorded result idempotently and creates no second ref version.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_retry_after_lost_response_is_idempotent() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let m = make_merge(&c, &tip, &side, 3).await.unwrap();
+
+    srv.storage
+        .faults
+        .arm("meta.cas_ref.after", FaultAction::FailAfter, Some(1));
+    let error = land_merge(&srv, "main", &m, &alice()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Unavailable, "{error:?}");
+    assert_eq!(error.subcode(), Some(subcode::INJECTED), "{error:?}");
+    assert!(error.retryable());
+    srv.storage.faults.disarm_all();
+    assert_eq!(ref_state(&srv, "main").await, (m, 3), "the CAS committed");
+
+    let retry = land_merge(&srv, "main", &m, &alice()).await.unwrap();
+    assert_eq!(retry.target, m);
+    assert_eq!(retry.version, 3);
+    assert_eq!(retry.landed.len(), 1);
+    assert_eq!(retry.landed[0].source, m);
+    assert_eq!(ref_state(&srv, "main").await, (m, 3), "no second version");
+    let log = srv
+        .ctx()
+        .history
+        .ref_log(&RefName::main(), 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        log.len(),
+        3,
+        "bootstrap + land + merge; the retry writes no ref-log row"
+    );
+}
+
+/// The topology gate: only a two-parent changeset may be merge-landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_rejects_non_merge_changesets() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, _tip) = main_at_base(&srv, &c).await;
+    let single_parent = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let error = land_merge(&srv, "main", &single_parent, &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(ref_state(&srv, "main").await.1, 2, "ref unchanged");
+}
+
+/// A change id already landed from another merge is ALREADY_LANDED, not a second landing and not
+/// an idempotent success for the wrong source.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_same_change_id_from_another_merge_is_already_landed() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let first = make_merge(&c, &tip, &side, 3).await.unwrap();
+    land_merge(&srv, "main", &first, &alice()).await.unwrap();
+
+    // Same change id, different changeset (merged onto the new tip with another side commit).
+    let side2 = commit(&srv, &c, &r, &[("three", b"3\n")], 4).await;
+    let second = make_merge(&c, &first, &side2, 3).await.unwrap();
+    assert_ne!(first, second);
+    let error = land_merge(&srv, "main", &second, &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::AlreadyLanded);
+    match error.payload {
+        ErrorPayload::AlreadyLanded { source, result, .. } => {
+            assert_eq!(source, first);
+            assert_eq!(result, first);
+        }
+        other => panic!("expected AlreadyLanded, got {other:?}"),
+    }
+    assert_eq!(ref_state(&srv, "main").await.0, first);
+}
+
+/// Policy: `update` on the ref is required (the same adapter as `Land`), and `write` on every
+/// published merge delta path; denial leaves the ref unchanged and writes nothing to `landed`.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_enforces_ref_and_path_policy() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let m = make_merge(&c, &tip, &side, 3).await.unwrap();
+
+    // bob cannot update main.
+    let error = land_merge(&srv, "main", &m, &mallory()).await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(ref_state(&srv, "main").await, (tip, 2));
+
+    // alice may update main but not write /secrets; a merge that publishes /secrets is refused.
+    let restricted = InProcessServer::start(opts_with_acl(RESTRICTED_ACL)).await;
+    let admin_c = restricted.client(Some(&admin())).await;
+    let rr = root(&restricted).await;
+    let base = commit(&restricted, &admin_c, &rr, &[("pub", b"p\n")], 10).await;
+    land(&admin_c, "main", &base, false).await.unwrap();
+    let tip_r = base;
+    let (secret_blob, size) = blob(&restricted, b"secret\n").await;
+    let secret_change = admin_c
+        .write()
+        .create_changeset(create_req(
+            &[rr],
+            vec![put_entry("secrets/k", &secret_blob, size)],
+            11,
+        ))
+        .await
+        .unwrap()
+        .into_inner();
+    let secret_side = id(&secret_change.changeset_id);
+    let merge = admin_c
+        .write()
+        .merge(v1::MergeRequest {
+            a: tip_r.as_bytes().to_vec(),
+            b: secret_side.as_bytes().to_vec(),
+            meta_fields: Some(meta("merge secrets")),
+            change_id: cid(12),
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    let merge_id = id(&merge.changeset_id);
+    let error = land_merge(&restricted, "main", &merge_id, &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::PermissionDenied);
+    assert_eq!(ref_state(&restricted, "main").await.1, 2);
+}
+
+/// A conflicting merge is refused explicitly at merge creation — no merge changeset exists to
+/// land, and the merge-commit path never turns a conflict into a squash or a paused conflict.
+#[tokio::test(flavor = "multi_thread")]
+async fn conflicting_merge_is_refused_and_publishes_nothing() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let ours = commit(&srv, &c, &tip, &[("same", b"ours\n")], 2).await;
+    let theirs = commit(&srv, &c, &r, &[("same", b"theirs\n")], 3).await;
+    let error = make_merge(&c, &ours, &theirs, 4).await.unwrap_err();
+    let got = expect_err(&error, ErrorCode::MergeConflict, None);
+    let ErrorPayload::MergeConflict(report) = got.payload else {
+        panic!("expected MergeConflict payload");
+    };
+    assert_eq!(report.conflicts[0].path, b"same".to_vec());
+    // Nothing was published: the ref is untouched and no landed row exists for the refused
+    // change id (there is no merge changeset at all).
+    assert_eq!(ref_state(&srv, "main").await, (tip, 2));
+    let rows = srv
+        .ctx()
+        .history
+        .ref_log(&RefName::main(), 0, 100)
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 2, "bootstrap + base land only");
+}
+
+/// The narrow public handler is the façade's entry point: it authorizes through the request's
+/// `CallerCtx`, records the attempt/log fields and returns the merge as the landed target.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_public_handler_publishes_the_merge() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let m = make_merge(&c, &tip, &side, 3).await.unwrap();
+
+    let ctx = srv.ctx();
+    let (_, claims) = ctx
+        .keyring
+        .issue(&alice(), Duration::from_secs(60), ctx.clock.now())
+        .unwrap();
+    let caller = CallerCtx {
+        principal: claims.sub.clone(),
+        claims,
+        request_id: "test-land-merge".to_owned(),
+    };
+    let mut request = tonic::Request::new(v1::LandRequest {
+        r#ref: "main".into(),
+        head: m.as_bytes().to_vec(),
+        allow_empty: false,
+    });
+    request.extensions_mut().insert(caller);
+    let resp = handlers::write::land_merge(&ctx, request)
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(id(&resp.target), m);
+    assert_eq!(resp.version, 3);
+    assert_eq!(resp.landed.len(), 1);
+    assert_eq!(id(&resp.landed[0].source), m);
+}
+
+/// A merge whose delta is empty (its side is already contained in the ref) is refused rather than
+/// publishing a no-op merge commit; a re-merge of an already-merged side is not a second landing.
+#[tokio::test(flavor = "multi_thread")]
+async fn land_merge_refuses_an_empty_merge_delta() {
+    let srv = start().await;
+    let c = srv.client(Some(&alice())).await;
+    let (r, tip) = main_at_base(&srv, &c).await;
+    let side = commit(&srv, &c, &r, &[("two", b"2\n")], 2).await;
+    let first = make_merge(&c, &tip, &side, 3).await.unwrap();
+    land_merge(&srv, "main", &first, &alice()).await.unwrap();
+
+    // Re-merge the same side on the new tip: the tree already contains it, so the delta is empty.
+    let redundant = make_merge(&c, &first, &side, 4).await.unwrap();
+    let record = srv.ctx().history.changeset(&redundant).await.unwrap();
+    assert!(
+        record.changeset.delta.is_empty(),
+        "expected an empty merge delta"
+    );
+    let error = land_merge(&srv, "main", &redundant, &alice())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::EmptyChange, "{error:?}");
+    assert_eq!(ref_state(&srv, "main").await, (first, 3), "ref unchanged");
 }

@@ -12,7 +12,7 @@
 use crate::history::History;
 use crate::hooks::{LandAttemptOutcome, LandAuthorizer, LandAuthorizerSource, Rebaser};
 use crate::refs::ref_not_found;
-use crate::types::{ChangesetRecord, LandRequest, LandResult};
+use crate::types::{ChangesetRecord, LandMergeRequest, LandRequest, LandResult};
 use futures::future::try_join_all;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -337,6 +337,275 @@ impl History {
                 Err(ScionError::unavailable(
                     subcode::STORE_UNAVAILABLE,
                     "unexpected cas_ref outcome: land committed a deletion",
+                ))
+            }
+            CasOutcome::VersionMismatch { .. } => Ok(Step::Retry(LandAttemptOutcome::CasMismatch)),
+            CasOutcome::LandedConflict { .. } => {
+                Ok(Step::Retry(LandAttemptOutcome::LandedConflict))
+            }
+        }
+    }
+
+    /// Land a two-parent merge changeset (ForgeVCS `merge-commit-v1` topology; local patch).
+    ///
+    /// The merge is published **as itself**: nothing is rebased, squashed or rewritten. Per
+    /// attempt:
+    /// 1. `Resolving`: strong read of the ref `(tip, v)`, `authz.current()`, `update` on the ref.
+    /// 2. Load `merge`. If a `landed` row exists for this ref and the merge's change id:
+    ///    same source → idempotent (the lost-response retry path; returns the current ref and the
+    ///    recorded entry), different source → ALREADY_LANDED.
+    /// 3. Topology gate: the changeset must have **exactly two parents** (INVALID_ARGUMENT) and
+    ///    `parents[0]` must be the current ref tip. If the ref moved, fail with a typed
+    ///    REF_VERSION_MISMATCH carrying the current target/version: the caller re-merges. A stale
+    ///    merge head is never force-landed and its changeset is never rewritten.
+    /// 4. `Checking`: `write` on every delta path of the merge (PERMISSION_DENIED). The merge's
+    ///    delta is relative to the first parent (the tip it was merged on), so these are exactly
+    ///    the paths it publishes.
+    /// 5. `Committing`: one `cas_ref(Version(v))` writing the ref, the `ref_log` row and one
+    ///    `landed` row (`change_id → source = merge, result = merge`). A lost CAS retries with
+    ///    full jitter; the next attempt re-reads the tip and either lands (first parent still the
+    ///    tip) or returns the typed stale error.
+    ///
+    /// The side commit (`parents[1]`) is deliberately **not** recorded in `landed`: it is not
+    /// published as its own changeset of this ref, and marking it landed would hide a genuine
+    /// later double-land attempt. Landing the lane stack after a merge-commit land therefore
+    /// fails EMPTY_CHANGE (its changes are already in the merged tree) — the safe outcome. Land
+    /// lane tips through this path, not their ancestors.
+    pub async fn land_merge(
+        &self,
+        req: LandMergeRequest,
+        who: &Principal,
+        authz: &dyn LandAuthorizerSource,
+    ) -> Result<LandResult> {
+        let cfg = &self.cfg.land;
+        let max_attempts = cfg.max_attempts.max(1);
+        let mut rng =
+            ChaCha8Rng::seed_from_u64(backoff_seed(cfg.rng_seed, self.clock.now(), &req.merge));
+        for attempt in 1..=max_attempts {
+            let started = tokio::time::Instant::now();
+            let step = self.land_merge_attempt(&req, who, authz).await;
+            let elapsed = started.elapsed();
+            match step {
+                Ok(Step::Done(result, outcome)) => {
+                    self.land_observer
+                        .attempt(&req.ref_name, attempt, &outcome, elapsed);
+                    tracing::info!(
+                        ref_name = req.ref_name.as_str(),
+                        attempt,
+                        version = result.version,
+                        landed = result.landed.len(),
+                        merge = %req.merge,
+                        outcome = ?outcome,
+                        "land_merge finished"
+                    );
+                    return Ok(result);
+                }
+                Ok(Step::Retry(outcome)) => {
+                    self.land_observer
+                        .attempt(&req.ref_name, attempt, &outcome, elapsed);
+                    tracing::debug!(
+                        ref_name = req.ref_name.as_str(),
+                        attempt,
+                        outcome = ?outcome,
+                        "land_merge attempt lost the CAS race; retrying"
+                    );
+                    if attempt < max_attempts {
+                        let delay =
+                            full_jitter(&mut rng, cfg.backoff_base, cfg.backoff_max, attempt);
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+                Err(e) => {
+                    self.land_observer.attempt(
+                        &req.ref_name,
+                        attempt,
+                        &LandAttemptOutcome::Failed(e.code),
+                        elapsed,
+                    );
+                    tracing::debug!(
+                        ref_name = req.ref_name.as_str(),
+                        code = e.code.as_str(),
+                        "land_merge failed"
+                    );
+                    return Err(e);
+                }
+            }
+        }
+        tracing::warn!(
+            ref_name = req.ref_name.as_str(),
+            max_attempts,
+            "land_merge gave up after max_attempts"
+        );
+        Err(ScionError::unavailable(
+            subcode::LAND_CONTENTION,
+            format!(
+                "land_merge onto {} lost the ref CAS {max_attempts} times",
+                req.ref_name.as_str()
+            ),
+        ))
+    }
+
+    /// One `land_merge` attempt (`Resolving` through `Committing`); no rebase step.
+    async fn land_merge_attempt(
+        &self,
+        req: &LandMergeRequest,
+        who: &Principal,
+        authz: &dyn LandAuthorizerSource,
+    ) -> Result<Step> {
+        let name = &req.ref_name;
+
+        // 1. Resolving.
+        let tip_row = self
+            .meta()
+            .get_ref(name)
+            .await?
+            .ok_or_else(|| ref_not_found(name))?;
+        let (tip, version) = (tip_row.target, tip_row.version);
+        let az: Arc<dyn LandAuthorizer> = authz.current();
+        if !az.can_update(name) {
+            return Err(ScionError::permission_denied(format!(
+                "update on ref {} denied",
+                name.as_str()
+            )));
+        }
+
+        // 2. Landing record first: after a lost CAS/response the retry sees the merge already in
+        // `landed` (and the ref already at the merge), so idempotency wins over the topology gate.
+        let record = self.changeset(&req.merge).await?;
+        let change_id = record.changeset.change_id;
+        if let Some(landed) = self.meta().get_landed(name, &change_id).await? {
+            let entry = LandedEntry {
+                change_id: landed.change_id,
+                source: landed.source,
+                result: landed.result,
+            };
+            if landed.source == req.merge {
+                return Ok(Step::Done(
+                    LandResult {
+                        target: tip,
+                        version,
+                        landed: vec![entry],
+                    },
+                    LandAttemptOutcome::Idempotent,
+                ));
+            }
+            return Err(ScionError::new(
+                ErrorCode::AlreadyLanded,
+                format!(
+                    "change {} already landed on {} from {} (merge {})",
+                    landed.change_id.to_hex(),
+                    name.as_str(),
+                    landed.source,
+                    req.merge
+                ),
+            )
+            .with_payload(ErrorPayload::AlreadyLanded {
+                source: landed.source,
+                result: landed.result,
+                version: landed.version,
+            }));
+        }
+
+        // 3. Topology gate: two parents, first parent must still be the ref tip.
+        let parents = &record.changeset.parents;
+        let [first, _side] = parents.as_slice() else {
+            return Err(ScionError::new(
+                ErrorCode::InvalidArgument,
+                format!(
+                    "land_merge needs a two-parent merge changeset; {} has {} parents",
+                    req.merge,
+                    parents.len()
+                ),
+            ));
+        };
+        if *first != tip {
+            return Err(ScionError::new(
+                ErrorCode::RefVersionMismatch,
+                format!(
+                    "merge {} is parented on {}, but {} is at {} (version {}); re-merge {} onto \
+                     the new tip",
+                    req.merge,
+                    first.to_text(),
+                    name.as_str(),
+                    tip.to_text(),
+                    version,
+                    req.merge
+                ),
+            )
+            .with_payload(ErrorPayload::RefMismatch {
+                current_version: version,
+                current_target: Some(tip),
+            }));
+        }
+
+        // A merge whose delta is empty changes no tree relative to the tip: its side is already
+        // contained in the ref (e.g. a re-merge of a side that was just merged). Publishing it
+        // would add a no-op merge commit and could be mistaken for a second landing, so refuse it
+        // — the linear land path refuses EMPTY_CHANGE for the same reason.
+        if record.changeset.delta.is_empty() {
+            return Err(ScionError::new(
+                ErrorCode::EmptyChange,
+                format!(
+                    "merge {} has an empty delta: its side is already contained in {}",
+                    req.merge,
+                    name.as_str()
+                ),
+            ));
+        }
+
+        // 4. Checking: write on every published delta path (the merge delta is relative to the
+        // first parent, which is the current tip).
+        if record
+            .changeset
+            .delta
+            .iter()
+            .any(|e| !az.can_write(&e.path))
+        {
+            return Err(ScionError::permission_denied(format!(
+                "write denied on a path changed by merge {}",
+                req.merge
+            )));
+        }
+
+        // 5. Committing: the merge itself is the new ref target; one landed row.
+        let entry = LandedEntry {
+            change_id,
+            source: req.merge,
+            result: req.merge,
+        };
+        let outcome = self
+            .meta()
+            .cas_ref(RefCas {
+                name: name.clone(),
+                expect: RefExpect::Version(version),
+                new_target: Some(req.merge),
+                principal: who.id_string(),
+                at: self.clock.now(),
+                landed: vec![entry.clone()],
+                audit: None,
+            })
+            .await?;
+        match outcome {
+            CasOutcome::Committed(Some(row)) => {
+                self.objects
+                    .storage()
+                    .faults
+                    .check(points::LAND_AFTER_COMMIT)
+                    .await?;
+                Ok(Step::Done(
+                    LandResult {
+                        target: row.target,
+                        version: row.version,
+                        landed: vec![entry],
+                    },
+                    LandAttemptOutcome::Committed,
+                ))
+            }
+            CasOutcome::Committed(None) => {
+                tracing::error!("land_merge cas_ref committed a deletion");
+                Err(ScionError::unavailable(
+                    subcode::STORE_UNAVAILABLE,
+                    "unexpected cas_ref outcome: land_merge committed a deletion",
                 ))
             }
             CasOutcome::VersionMismatch { .. } => Ok(Step::Retry(LandAttemptOutcome::CasMismatch)),

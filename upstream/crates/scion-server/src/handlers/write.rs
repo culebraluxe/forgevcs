@@ -25,7 +25,9 @@ use crate::context::caller;
 use crate::errors::{StatusExt, to_status};
 use crate::logging::{LogFields, LogSlot};
 use scion_core::{ErrorCode, ErrorPayload, ObjectId, Principal, ScionError};
-use scion_history::{CreateRequest, LandAuthorizer, LandAuthorizerSource, LandRequest, MetaFields};
+use scion_history::{
+    CreateRequest, LandAuthorizer, LandAuthorizerSource, LandMergeRequest, LandRequest, MetaFields,
+};
 use scion_object::{RefName, RepoPath};
 use scion_proto::convert::{
     self, CreateChangesetParts, MergeParts, MetaFieldsParts, change_id_bytes, id_bytes, required_id,
@@ -310,6 +312,53 @@ pub async fn land(
             &who,
             &source,
         )
+        .await;
+    let attempts = source.attempts.load(Ordering::Relaxed);
+    note(&slot, |f| f.land_attempt = Some(attempts.max(1)));
+    let result = result
+        .map_err(|e| filter_conflict_payload(ctx, &who, e))
+        .map_status()?;
+    note(&slot, |f| {
+        f.ref_version = Some(result.version);
+        f.changeset_id = Some(result.target.to_text());
+    });
+    Ok(Response::new(v1::LandResponse {
+        target: id_bytes(&result.target),
+        version: result.version,
+        landed: result.landed.iter().map(landed_to_proto).collect(),
+    }))
+}
+
+/// Land one two-parent merge changeset as itself (ForgeVCS `merge-commit-v1` topology; local
+/// patch task-88 — deliberately no proto route, the ForgeVCS façade calls this in-process).
+///
+/// `head` of the [`v1::LandRequest`] is the merge changeset `Merge(tip, side)`. The history layer
+/// requires exactly two parents, a first parent equal to the current ref tip, `write` on every
+/// merge delta path and `update` on the ref (re-read per attempt, like `Land`). Nothing is
+/// rebased or squashed: a stale first parent returns REF_VERSION_MISMATCH (with the current
+/// target/version) so the caller re-merges, a wrong parent shape returns INVALID_ARGUMENT, and a
+/// change id already landed from a different changeset returns ALREADY_LANDED. Idempotent retries
+/// after a lost CAS response return the recorded result.
+pub async fn land_merge(
+    ctx: &Arc<AppContext>,
+    req: Request<v1::LandRequest>,
+) -> Result<Response<v1::LandResponse>, Status> {
+    let who = caller(&req)?.principal;
+    let slot = log_slot(&req);
+    let m = req.get_ref();
+    let ref_name = required_ref(&m.r#ref, "ref")?;
+    let merge: ObjectId = required_id(&m.head, "head").map_status()?;
+    note(&slot, |f| {
+        f.ref_name = Some(ref_name.as_str().to_owned());
+        f.changeset_id = Some(merge.to_text());
+    });
+    let source = CountingSource {
+        inner: PolicyLandAuthzSource::new(ctx.policy.clone(), who.clone()),
+        attempts: AtomicU32::new(0),
+    };
+    let result = ctx
+        .history
+        .land_merge(LandMergeRequest { ref_name, merge }, &who, &source)
         .await;
     let attempts = source.attempts.load(Ordering::Relaxed);
     note(&slot, |f| f.land_attempt = Some(attempts.max(1)));

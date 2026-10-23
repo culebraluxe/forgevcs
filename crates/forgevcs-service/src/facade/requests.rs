@@ -369,6 +369,10 @@ pub(crate) struct MergeLandBody {
     pub(crate) message: Option<String>,
     #[serde(default)]
     pub(crate) change_id: Option<String>,
+    /// `squash` (default from `FORGEVCS_MERGE_TOPOLOGY`) or `merge-commit` (opt-in
+    /// `merge-commit-v1`: publish the clean tip-parented two-parent merge changeset itself).
+    #[serde(default)]
+    pub(crate) topology: Option<String>,
 }
 
 /// `POST /repos/{repo}/conflict-context` — the three readable sides of a refused merge/rebase.

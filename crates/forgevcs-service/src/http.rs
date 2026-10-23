@@ -139,6 +139,10 @@ async fn version(State(state): State<Arc<AppState>>) -> (StatusCode, Json<Value>
             // The merge engine changes merge/rebase/land results; deployments and the push/land
             // responses report the same value so a mismatch is visible rather than inferred.
             "merge_engine": state.config.merge_engine(),
+            // The default topology for `merge-land`: `squash-only` (legacy) or the opt-in
+            // `merge-commit-v1` (Lane Z). A request can override it per call; this is what an
+            // unconfigured request gets, so deployment verification can see it.
+            "merge_topology": state.config.merge_topology(),
         })),
     )
 }
@@ -562,7 +566,16 @@ mod tests {
         assert_eq!(body["service"], SERVICE);
         assert_eq!(body["upstream"], config::UPSTREAM_COMMIT);
         assert_eq!(body["vendor_patches"][0], "td-12-conflict-fail-closed");
+        assert!(
+            body["vendor_patches"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|patch| patch == "merge-commit-v1-landing"),
+            "the merge-commit topology patch must be visible on /version: {body}"
+        );
         assert_eq!(body["merge_engine"], "default");
+        assert_eq!(body["merge_topology"], "squash-only");
     }
 
     #[tokio::test]
@@ -582,6 +595,28 @@ mod tests {
         let body: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(body["merge_engine"], "exact-rename-v1");
         assert_eq!(body["vendor_patches"][0], "td-12-conflict-fail-closed");
+    }
+
+    #[tokio::test]
+    async fn version_reports_the_configured_merge_topology() {
+        let config = Config::from_lookup(|key| {
+            (key == "FORGEVCS_MERGE_TOPOLOGY").then(|| "merge-commit-v1".to_owned())
+        });
+        let (status, _, body) = send(
+            app_with(config).await,
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["merge_topology"], "merge-commit-v1");
+        assert_eq!(
+            body["merge_engine"], "default",
+            "topology is independent of the merge engine"
+        );
     }
 
     #[tokio::test]

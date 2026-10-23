@@ -120,6 +120,19 @@ pub struct LandRequest {
     pub allow_empty: bool,
 }
 
+/// Land one tip-parented merge changeset (ForgeVCS merge-commit topology, local patch task-88).
+///
+/// `merge` is `Merge(tip, head)`: exactly two parents, first parent the ref tip at merge time.
+/// Unlike [`LandRequest`] nothing is rebased: the merge is published as itself only while its
+/// first parent is still the ref tip.
+#[derive(Clone, Debug)]
+pub struct LandMergeRequest {
+    /// Target ref.
+    pub ref_name: RefName,
+    /// The two-parent merge changeset to publish.
+    pub merge: ObjectId,
+}
+
 /// SPEC 8.4 Land result.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LandResult {

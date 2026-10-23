@@ -1627,6 +1627,11 @@ pub(crate) async fn merge_land(
         Ok(body) => body,
         Err(rejection) => return ApiError::from(rejection).into_response(),
     };
+    // Lane Z: a request `topology` overrides the deployment default (`FORGEVCS_MERGE_TOPOLOGY`).
+    let topology = match resolve_merge_topology(&state.config, body.topology.as_deref()) {
+        Ok(topology) => topology,
+        Err(error) => return error.into_response(),
+    };
     if let Err(error) = require_trunk(&engine, &caller, &body.ref_name) {
         return error.into_response();
     }
@@ -1692,6 +1697,14 @@ pub(crate) async fn merge_land(
     {
         Ok(response) => response.into_inner(),
         Err(status) => {
+            // `merge-commit-v1` refuses an unclean merge explicitly. There is no paused-then-
+            // continue path for this topology (that path lands a linear resolution changeset) and
+            // no silent squash; the caller gets the typed conflict and must retry.
+            if topology == crate::config::MERGE_TOPOLOGY_MERGE_COMMIT {
+                return ApiError::from(status)
+                    .with_extra(json!({ "topology": topology }))
+                    .into_response();
+            }
             let base = merge_base_id(&app, &caller, &tip, &head).await;
             match pause_conflict(
                 &state,
@@ -1712,6 +1725,61 @@ pub(crate) async fn merge_land(
         Ok(id) => id,
         Err(error) => return ApiError::from(&error).into_response(),
     };
+
+    // Lane Z: tip-parented merge-commit landing. The merge changeset itself becomes the ref
+    // target when its first parent is still the tip; the history layer returns a typed
+    // REF_VERSION_MISMATCH (stale: re-merge) or ALREADY_LANDED rather than rebasing/squashing.
+    if topology == crate::config::MERGE_TOPOLOGY_MERGE_COMMIT {
+        let landed = match handlers::write::land_merge(
+            &app,
+            caller_request(
+                v1::LandRequest {
+                    r#ref: body.ref_name.clone(),
+                    head: convert::id_bytes(&merged_id),
+                    allow_empty: true,
+                },
+                &caller,
+            ),
+        )
+        .await
+        {
+            Ok(response) => response.into_inner(),
+            Err(status) => {
+                return ApiError::from(status)
+                    .with_extra(json!({ "topology": topology }))
+                    .into_response();
+            }
+        };
+        tracing::info!(
+            repo = %repo,
+            ref_name = %body.ref_name,
+            target = %id_text(&landed.target),
+            version = landed.version,
+            merge_engine = state.config.merge_engine(),
+            merge_topology = topology,
+            "landed merge commit"
+        );
+        return (
+            StatusCode::OK,
+            Json(json!({
+                "service": SERVICE,
+                "status": "ok",
+                "repo": repo,
+                "merge_engine": state.config.merge_engine(),
+                "merge_topology": topology,
+                "topology": topology,
+                "merge_changeset": { "id": merged_id.to_text() },
+                "changeset": { "id": merged_id.to_text() },
+                "ref": {
+                    "name": body.ref_name,
+                    "target": id_text(&landed.target),
+                    "version": landed.version,
+                },
+                "landed": landed_json(&landed.landed),
+            })),
+        )
+            .into_response();
+    }
 
     let changesets = match handlers::query::get_changesets(
         &app,
@@ -1810,6 +1878,7 @@ pub(crate) async fn merge_land(
         target = %id_text(&landed.target),
         version = landed.version,
         merge_engine = state.config.merge_engine(),
+        merge_topology = topology,
         "landed"
     );
     (
@@ -1819,6 +1888,8 @@ pub(crate) async fn merge_land(
             "status": "ok",
             "repo": repo,
             "merge_engine": state.config.merge_engine(),
+            "merge_topology": topology,
+            "topology": topology,
             "merge_changeset": { "id": merged_id.to_text() },
             "changeset": { "id": linear_id.to_text() },
             "ref": {
@@ -1830,6 +1901,30 @@ pub(crate) async fn merge_land(
         })),
     )
         .into_response()
+}
+
+/// Resolve the requested `merge-land` topology against the deployment default.
+///
+/// `squash`/`squash-only` is the legacy squash path; `merge-commit`/`merge-commit-v1` publishes
+/// the clean tip-parented merge changeset (Lane Z). A request may opt into `merge-commit` even
+/// when the deployment default is `squash-only`; any other value is a 400, never a silent
+/// fallback to the other topology.
+fn resolve_merge_topology(
+    config: &crate::config::Config,
+    requested: Option<&str>,
+) -> ApiResult<&'static str> {
+    use crate::config::{MERGE_TOPOLOGY_MERGE_COMMIT, MERGE_TOPOLOGY_SQUASH_ONLY};
+    match requested.map(str::trim).filter(|value| !value.is_empty()) {
+        None => match config.merge_topology() {
+            MERGE_TOPOLOGY_MERGE_COMMIT => Ok(MERGE_TOPOLOGY_MERGE_COMMIT),
+            _ => Ok(MERGE_TOPOLOGY_SQUASH_ONLY),
+        },
+        Some("squash") | Some("squash-only") => Ok(MERGE_TOPOLOGY_SQUASH_ONLY),
+        Some("merge-commit") | Some("merge-commit-v1") => Ok(MERGE_TOPOLOGY_MERGE_COMMIT),
+        Some(other) => Err(ApiError::invalid_argument(format!(
+            "topology must be 'squash' or 'merge-commit', got {other:?}"
+        ))),
+    }
 }
 
 /// Read one path at one changeset; `None` when the path is not in that tree.
@@ -4248,5 +4343,57 @@ mod tests {
             push_delta_paths(&body.changeset),
             vec!["lane/a/one.rs".to_owned(), "lane/a/two.rs".to_owned()]
         );
+    }
+
+    /// Lane Z: the request `topology` maps onto the two topologies; the deployment default is
+    /// used only when the request omits the field, and a typo is a 400 — never a silent fallback
+    /// to the other topology.
+    #[test]
+    fn merge_land_topology_request_maps_or_rejects() {
+        use crate::config::{Config, MERGE_TOPOLOGY_MERGE_COMMIT, MERGE_TOPOLOGY_SQUASH_ONLY};
+
+        let squash_default = Config::from_lookup(|_| None);
+        assert_eq!(
+            resolve_merge_topology(&squash_default, None).unwrap(),
+            MERGE_TOPOLOGY_SQUASH_ONLY
+        );
+        assert_eq!(
+            resolve_merge_topology(&squash_default, Some("")).unwrap(),
+            MERGE_TOPOLOGY_SQUASH_ONLY
+        );
+        assert_eq!(
+            resolve_merge_topology(&squash_default, Some("squash")).unwrap(),
+            MERGE_TOPOLOGY_SQUASH_ONLY
+        );
+        assert_eq!(
+            resolve_merge_topology(&squash_default, Some("merge-commit")).unwrap(),
+            MERGE_TOPOLOGY_MERGE_COMMIT
+        );
+        assert_eq!(
+            resolve_merge_topology(&squash_default, Some("merge-commit-v1")).unwrap(),
+            MERGE_TOPOLOGY_MERGE_COMMIT
+        );
+
+        let merge_commit_default = Config::from_lookup(|key| {
+            (key == "FORGEVCS_MERGE_TOPOLOGY").then(|| "merge-commit-v1".to_owned())
+        });
+        assert_eq!(
+            resolve_merge_topology(&merge_commit_default, None).unwrap(),
+            MERGE_TOPOLOGY_MERGE_COMMIT
+        );
+        assert_eq!(
+            resolve_merge_topology(&merge_commit_default, Some("squash")).unwrap(),
+            MERGE_TOPOLOGY_SQUASH_ONLY
+        );
+
+        for bad in ["merge", "dag", "merge_commit", "SQUASH"] {
+            assert!(
+                matches!(
+                    resolve_merge_topology(&squash_default, Some(bad)),
+                    Err(ApiError::InvalidArgument(_))
+                ),
+                "{bad} must be refused"
+            );
+        }
     }
 }

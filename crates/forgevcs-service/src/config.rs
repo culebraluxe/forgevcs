@@ -17,7 +17,14 @@ pub const UPSTREAM_COMMIT: &str = "e0ffadf9c755f1b99812df5beffcabdebcb38c19";
 /// Local patches carried on top of [`UPSTREAM_COMMIT`]. `/version` exposes this so an operator
 /// can see that the binary is not pristine upstream, not just which upstream SHA it started from.
 /// Keep this in sync with `README.md` "Modifications to vendored code" and `docs/TECH_DEBT.md`.
-pub const VENDOR_PATCHES: &[&str] = &["td-12-conflict-fail-closed"];
+pub const VENDOR_PATCHES: &[&str] = &["td-12-conflict-fail-closed", "merge-commit-v1-landing"];
+
+/// `merge-land` topology: squash the merge result into one linear changeset (default, legacy).
+pub const MERGE_TOPOLOGY_SQUASH_ONLY: &str = "squash-only";
+/// `merge-land` topology: publish the clean tip-parented two-parent merge changeset itself.
+pub const MERGE_TOPOLOGY_MERGE_COMMIT: &str = "merge-commit-v1";
+/// Every topology `FORGEVCS_MERGE_TOPOLOGY` accepts.
+pub const MERGE_TOPOLOGIES: [&str; 2] = [MERGE_TOPOLOGY_SQUASH_ONLY, MERGE_TOPOLOGY_MERGE_COMMIT];
 
 /// Default listen port; Vercel supplies `$PORT`.
 const DEFAULT_PORT: u16 = 3000;
@@ -79,6 +86,12 @@ pub struct Config {
     /// this validated value must agree — `/version` reports the value the process was configured
     /// with and deployment verification compares it.
     pub merge_engine: Option<String>,
+    /// Merge topology default for `merge-land` (`FORGEVCS_MERGE_TOPOLOGY`): `squash-only`
+    /// (default) or `merge-commit-v1`. The legacy `merge-land` behaviour squashes the merge into
+    /// one linear changeset; `merge-commit-v1` publishes the two-parent merge changeset itself
+    /// when it is cleanly parented on the current tip. A request may override the default with
+    /// its `topology` field; this value is the deployment's default and `/version` reports it.
+    pub merge_topology: Option<String>,
     /// Operator-configured repository ACLs (`FORGEVCS_REPO_ACLS`), JSON
     /// `repository -> {owner, readers?, writers?}`. Repository identity is not part of the
     /// vendored `acl.toml` policy; this value is how a pilot pre-assigns a repository to an
@@ -126,6 +139,7 @@ impl Config {
             service_principals: get(&["FORGEVCS_SERVICE_PRINCIPALS"]),
             auth_mode: get(&["FORGEVCS_AUTH_MODE"]),
             merge_engine: get(&["FORGEVCS_MERGE_ENGINE"]),
+            merge_topology: get(&["FORGEVCS_MERGE_TOPOLOGY"]),
             repo_acls: get(&["FORGEVCS_REPO_ACLS"]),
             human_principals: get(&["FORGEVCS_HUMAN_PRINCIPALS"]),
             workspace_lease_ttl_secs: get(&["FORGEVCS_WORKSPACE_LEASE_TTL_SECS"])
@@ -137,6 +151,13 @@ impl Config {
     /// engine reads the environment variable itself; this is the single reported spelling.
     pub fn merge_engine(&self) -> &str {
         self.merge_engine.as_deref().unwrap_or("default")
+    }
+
+    /// The configured default merge topology: `squash-only` when unset, else the validated name.
+    pub fn merge_topology(&self) -> &str {
+        self.merge_topology
+            .as_deref()
+            .unwrap_or(MERGE_TOPOLOGY_SQUASH_ONLY)
     }
 
     /// The repository this process serves (ADR-0002 D3).
@@ -203,6 +224,13 @@ impl Config {
         {
             return Err(format!(
                 "FORGEVCS_MERGE_ENGINE must be 'default' or 'exact-rename-v1', got {engine:?}"
+            ));
+        }
+        if let Some(topology) = &self.merge_topology
+            && !MERGE_TOPOLOGIES.contains(&topology.as_str())
+        {
+            return Err(format!(
+                "FORGEVCS_MERGE_TOPOLOGY must be one of {MERGE_TOPOLOGIES:?}, got {topology:?}"
             ));
         }
         if let Some(mode) = &self.auth_mode
@@ -395,6 +423,37 @@ mod tests {
         );
         let empty = config(&[("FORGEVCS_MERGE_ENGINE", "  ")]);
         assert_eq!(empty.merge_engine(), "default");
+        assert_eq!(empty.validate(), Ok(()));
+    }
+
+    /// Lane Z: the merge topology default is squash-only; `merge-commit-v1` is the only opt-in
+    /// value, and a typo must fail readiness rather than silently landing the wrong topology.
+    #[test]
+    fn merge_topology_defaults_to_squash_only_and_is_validated() {
+        let unset = config(&[]);
+        assert_eq!(unset.merge_topology(), MERGE_TOPOLOGY_SQUASH_ONLY);
+        assert_eq!(unset.validate(), Ok(()));
+
+        let squash = config(&[("FORGEVCS_MERGE_TOPOLOGY", "squash-only")]);
+        assert_eq!(squash.merge_topology(), MERGE_TOPOLOGY_SQUASH_ONLY);
+        assert_eq!(squash.validate(), Ok(()));
+
+        let merge = config(&[("FORGEVCS_MERGE_TOPOLOGY", "merge-commit-v1")]);
+        assert_eq!(merge.merge_topology(), MERGE_TOPOLOGY_MERGE_COMMIT);
+        assert_eq!(merge.validate(), Ok(()));
+
+        for bad in ["merge-commit", "merge", "squash", "dag"] {
+            let cfg = config(&[("FORGEVCS_MERGE_TOPOLOGY", bad)]);
+            assert!(cfg.validate().is_err(), "{bad}");
+            assert!(
+                cfg.validate()
+                    .err()
+                    .is_some_and(|error| error.contains("FORGEVCS_MERGE_TOPOLOGY")),
+                "the error names the variable an operator must fix"
+            );
+        }
+        let empty = config(&[("FORGEVCS_MERGE_TOPOLOGY", "  ")]);
+        assert_eq!(empty.merge_topology(), MERGE_TOPOLOGY_SQUASH_ONLY);
         assert_eq!(empty.validate(), Ok(()));
     }
 

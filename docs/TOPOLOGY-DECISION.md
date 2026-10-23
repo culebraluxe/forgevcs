@@ -3,6 +3,10 @@
 **Date:** 2026-10-22 · **Status:** recommendation for principal sign-off; no engine change in this
 work order. Inputs: `docs/M1-merge-analysis.md` §2a/§5, `docs/PRODUCTION-PACKET.md` P1-3, Lane Q
 review (2026-10-22).
+**Update 2026-10-22 (Lane Z):** mode **B is shipped as an opt-in alternate path**
+(`merge-commit-v1`, `docs/MERGE-TOPOLOGY.md`): clean tip-parented two-parent merges land as
+themselves when requested/deployed; the default stays A (squash-only). Criss-cross/recursive-base
+mode C remains deferred.
 
 ## The current contract
 
@@ -33,7 +37,7 @@ review (2026-10-22).
 | Engine work | none | upstream `land`/`merge` semantics + SPEC engine version + tests | B + recursive base engine work + differential tests |
 | Risk | simplest, proven by pilots; topology lost | new failure modes (stale merge, merge-in-stack relaxation, policy on two parents) | largest; only justified by real imported-merge/lane-topology need |
 | Merge-aware policy | **fail-closed for writable-but-unreadable conflicts** (task-87 local patch): a caller can no longer be handed a conflict it cannot read; it gets a typed refusal instead | same patch applies; two-parent results may widen the write set, so re-check the invariant | same; recursive-base conflicts can span more paths |
-| Status | **shipped and used** | conditional, deferred (`M1-merge-analysis.md:173`) | conditional, deferred (`:175`) |
+| Status | **shipped and used (default)** | **shipped opt-in 2026-10-22 (Lane Z, `merge-commit-v1`)** | conditional, deferred |
 
 ## Recommendation
 

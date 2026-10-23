@@ -179,7 +179,7 @@ Postgres+moto harness (QA evidence, not in the hermetic gate).
 
 | # | Gap | Today | Impact at 10 agents × 8 h | Where it lives |
 | --- | --- | --- | --- | --- |
-| 1 | No two-parent landing | `merge-land` squashes the merge result into one linear commit | **conditional**: only if merge-commit topology is wanted; trunk-linear landing never needs it | upstream `land.rs` / façade policy |
+| 1 | Two-parent landing | **shipped opt-in (Lane Z, `merge-commit-v1`)**: `History::land_merge` publishes a clean tip-parented `Merge(tip, head)` as itself (parents `[tip, head]`, one landed row); stale tip → typed `REF_VERSION_MISMATCH` (re-merge), conflict → explicit `MERGE_CONFLICT` refusal, no squash/pause. Default stays squash-only | **conditional**: only when merge-commit topology is wanted; trunk-linear landing never needs it | upstream `land.rs` + narrow handler (vendor patch), façade `merge-land` topology |
 | 2 | Resolution workflow | **shipped (R2)**: `conflict-context` (§2b) plus persisted paused conflicts with `resolve`/`continue` (§2c) | none for the simple model; an agent still chooses the bytes | façade + client contract |
 | 3 | Criss-cross histories | `AMBIGUOUS_MERGE_BASE` (SPEC line 1479, future row line 1757) | **conditional**: only if merges exist (lane-to-lane or imported Git); trunk-linear history cannot criss-cross | merge engine version bump |
 | 4 | Rename engine: shipped opt-in, default off | `exact-rename-v1` (exact + similarity) is implemented for land/rebase and `Merge` behind `FORGEVCS_MERGE_ENGINE` (`upstream/crates/scion-history/src/rename.rs:34-40`, `merge.rs:122`, `rebase.rs:80`; TD-1 resolved). The default process runs the old delete+add behaviour, so a deployment that forgets the env silently gets false `modify_delete` conflicts; the engine version is not recorded in history | **managed config + recording**: validated/reported by `/version` and land evidence (2026-10-22), history recording blocked upstream (`docs/MERGE-ENGINE.md`); residual directory identity / both-sides-rename / threshold tuning is TD-1 | merge engine config + upstream engine-version mechanism |
@@ -189,7 +189,9 @@ Postgres+moto harness (QA evidence, not in the hermetic gate).
 | 8 | Scale evidence | single-process pilot, 6 repos, seconds | no error-rate/latency data for ten agents | soak + hosted |
 
 Rows 1 and 3 are conditional on the topology decision in §2a; row 4 is the one the simple
-sequential model needs. Row 2 is resolved by this commit. Row 6's **service** half is resolved by
+sequential model needs. Row 1's two-parent landing is now **shipped opt-in** (`merge-commit-v1`,
+Lane Z, `docs/MERGE-TOPOLOGY.md`); the default remains squash-only and recursive/criss-cross mode
+stays deferred. Row 2 is resolved by this commit. Row 6's **service** half is resolved by
 Lane U (one shared registry, real land/CAS series, conflict counters); its **hosted** half (scrape,
 dashboards, alert rules — see `docs/OBSERVABILITY.md` §4) is still open.
 
