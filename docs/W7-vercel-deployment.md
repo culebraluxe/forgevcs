@@ -203,3 +203,10 @@ printed rollback line. ForgeVCS **reuses the conventions, not the project**:
 script asserts both `merge_engine=exact-rename-v1` (overridable with
 `FORGEVCS_EXPECTED_MERGE_ENGINE`) and the presence of `td-12-conflict-fail-closed`, so a deploy
 cannot silently drop the local conflict-policy patch or change merge semantics.
+
+## Redeploy receipt — 2026-10-22 (vendor patch visibility + guard)
+
+- Commit: `97bdcb7`
+- `/version` now includes `vendor_patches: ["td-12-conflict-fail-closed"]`
+- Deploy guard asserts `merge_engine=exact-rename-v1` and the TD-12 patch id
+- W8 hosted smoke PASS (W4 + W5)
