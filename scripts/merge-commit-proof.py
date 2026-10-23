@@ -132,11 +132,6 @@ def run(base: str, token: str, repo: str) -> int:
     main_tip = landed["changeset"]["id"]
     print(f"  ..  main at {main_tip[:12]}")
 
-    client.call(
-        "POST",
-        prefix + "/refs",
-        {"name": "lane/proof", "target": main_tip, "reason": "merge-commit proof"},
-    )
     lane = client.call(
         "POST",
         prefix + "/push",
