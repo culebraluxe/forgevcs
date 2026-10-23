@@ -187,3 +187,12 @@ printed rollback line. ForgeVCS **reuses the conventions, not the project**:
 - `/metrics` live: `scion_storage_access` non-zero, single storage family; conflict counters exposed
 - W8 hosted acceptance: W4 20/20 PASS, W5 17/17 PASS
 - Rollback: promote the previous ready deployment in the Vercel project.
+
+## Redeploy receipt — 2026-10-22 (fail-closed conflict policy)
+
+- Commit: `1b515ef` (local vendored conflict-payload fail-closed patch + docs)
+- Deployment: `https://culebraluxe-forgevcs-av48zx2vn-culebraluxe-4460s-projects.vercel.app`
+- Production alias: `https://culebraluxe-forgevcs.vercel.app`
+- `/health` 200, `/ready` ready, `/version` `merge_engine=exact-rename-v1`
+- `/metrics` live with storage counters; W8 hosted smoke PASS (W4 + W5)
+- Rollback: promote the prior ready deployment in Vercel.
